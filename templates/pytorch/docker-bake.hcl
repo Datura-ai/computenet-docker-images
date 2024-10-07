@@ -1,5 +1,5 @@
 variable "PUBLISHER" {
-    default = "computenet"
+    default = "daturaai"
 }
 
 group "default" {
