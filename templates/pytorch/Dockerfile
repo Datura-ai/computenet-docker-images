@@ -59,7 +59,7 @@ RUN chmod +x /start.sh
 # Welcome Message
 COPY --from=scripts computenet.txt /etc/computenet.txt
 RUN echo 'cat /etc/computenet.txt' >> /root/.bashrc
-# RUN echo 'echo -e "\nFor detailed documentation and guides"' >> /root/.bashrc
+RUN echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
 
 # Set the default command for the container
 CMD [ "/start.sh" ]
