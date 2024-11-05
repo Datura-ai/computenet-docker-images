@@ -22,7 +22,8 @@ RUN apt-get update --yes && \
     apt install --yes --no-install-recommends git wget curl bash libgl1 software-properties-common openssh-server && \
     if [ -n "${PYTHON_VERSION}" ]; then \
         add-apt-repository ppa:deadsnakes/ppa && \
-        apt install "python${PYTHON_VERSION}-dev" "python${PYTHON_VERSION}-venv" -y --no-install-recommends; \
+        apt-get update --yes && \
+        apt install "python${PYTHON_VERSION}" "python${PYTHON_VERSION}-dev" "python${PYTHON_VERSION}-venv" -y --no-install-recommends; \
     fi && \
     apt-get autoremove -y && \
     apt-get clean && \
