@@ -5,17 +5,17 @@ variable "PUBLISHER" {
 group "default" {
     targets = [
         # Ubuntu 24.10
-        "ubuntu2410-py313",
-        "ubuntu2410-py311",
+        # "ubuntu2410-py313",
+        # "ubuntu2410-py311",
 
         # Ubuntu 24.04
         "ubuntu2404-py313",
         "ubuntu2404-py311",
         
         # Ubuntu 22.04
-        "ubuntu2204-py313",
-        "ubuntu2204-py311",
-        "ubuntu2204-py39",
+        # "ubuntu2204-py313",
+        # "ubuntu2204-py311",
+        # "ubuntu2204-py39",
         
         # Ubuntu 20.04
         "ubuntu2004-py313",

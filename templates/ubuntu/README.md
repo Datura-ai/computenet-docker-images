@@ -6,7 +6,7 @@
 
 Example:
 ```bash
-docker buildx bake ubuntu2410-py312 --set ubuntu2410-py312.platform=linux/amd64
+docker buildx bake ubuntu2404-py313 --set ubuntu2404-py313.platform=linux/amd64
 ```
 
 ## Exposed Ports
