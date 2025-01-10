@@ -7,8 +7,10 @@ set -e  # Exit the script if any statement returns a non-true return value
 
 # Start nginx service
 start_nginx() {
-    echo "Starting Nginx service..."
-    service nginx start
+    if [[ $REQUIRE_NGINIX == "true" ]]; then
+        echo "Starting Nginx service..."
+        service nginx start
+    fi
 }
 
 # Execute script if exists
@@ -78,7 +80,7 @@ start_jupyter() {
 #                               Main Program                                   #
 # ---------------------------------------------------------------------------- #
 
-# start_nginx
+start_nginx
 
 execute_script "/pre_start.sh" "Running pre-start script..."
 

@@ -11,5 +11,6 @@ target "default" {
     tags = ["${IMAGE_NAME}:${RELEASE}"]
     contexts = {
         scripts = "../../scripts"
+        proxy = "../../scripts/proxy"
     }
 }

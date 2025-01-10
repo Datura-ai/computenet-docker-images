@@ -7,5 +7,6 @@ target "default" {
     tags = ["daturaai/stable-diffusion:invoke-${RELEASE}"]
     contexts = {
         scripts = "../../scripts"
+        proxy = "../../scripts/proxy"
     }
 }

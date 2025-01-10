@@ -1,10 +1,10 @@
 variable "RELEASE" {
-    default = "2.4.0"
+    default = "1.2.1"
 }
 
 target "default" {
     dockerfile = "Dockerfile"
-    tags = ["daturaai/stable-diffusion:fast-stable-diffusion-${RELEASE}"]
+    tags = ["daturaai/oobabooga:${RELEASE}"]
     contexts = {
         scripts = "../../scripts"
         proxy = "../../scripts/proxy"

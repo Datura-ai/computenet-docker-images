@@ -62,6 +62,13 @@ ADD jupyter_lab_config.py /root/.jupyter/jupyter_lab_config.py
 RUN wget https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors -O /auto-models/sd_xl_base_1.0.safetensors && \
     wget https://huggingface.co/stabilityai/stable-diffusion-xl-refiner-1.0/resolve/main/sd_xl_refiner_1.0.safetensors -O /auto-models/sd_xl_refiner_1.0.safetensors
 
+# NGINX Proxy
+ENV REQUIRE_NGINIX=true
+COPY --from=proxy nginx.conf /etc/nginx/nginx.conf
+COPY --from=proxy readme.html /usr/share/nginx/html/readme.html
+
+# Copy the README.md
+COPY README.md /usr/share/nginx/html/README.md
 
 # Start Scripts
 COPY pre_start.sh /pre_start.sh

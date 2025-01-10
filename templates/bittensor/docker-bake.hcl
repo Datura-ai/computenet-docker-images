@@ -7,6 +7,7 @@ target "default" {
     tags = ["daturaai/bittensor:${VERSION}"]
     contexts = {
         scripts = "../../scripts"
+        proxy = "../../scripts/proxy"
     }
     args = {
         VERSION = "${VERSION}"
