@@ -48,6 +48,8 @@ group "rocm" {
         "212-py310-rocm602-ubuntu2204",
         "212-py310-rocm61-ubuntu2204",
         "240-py310-rocm610-ubuntu2204",
+        "201-py39-rocm612-ubuntu2004",
+        "212-py310-rocm612-ubuntu2204",
     ]
 }
 
