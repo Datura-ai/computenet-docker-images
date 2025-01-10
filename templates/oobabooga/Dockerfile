@@ -1,6 +1,6 @@
 ARG BASE_IMAGE=runpod/pytorch:3.10-1.13.1-116
 
-FROM ${BASE_IMAGE} as dev-base
+FROM ${BASE_IMAGE} AS dev-base
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
