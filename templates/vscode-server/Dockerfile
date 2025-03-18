@@ -1,5 +1,5 @@
 # Base image
-FROM nvidia/cuda:11.7.1-cudnn8-devel-ubuntu20.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 # Set working directory
 WORKDIR /
