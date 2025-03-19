@@ -13,5 +13,5 @@ target "py310-cuda121" {
         TORCH = "torch==2.6.0+cu126 -f https://download.pytorch.org/whl/torch_stable.html",
         PYTHON_VERSION = "3.12"
     }
-    tags = ["daturaai/everydream2:cuda12.6"]
+    tags = ["daturaai/better-everydream2:cuda12.6"]
 }

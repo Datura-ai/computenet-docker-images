@@ -13,5 +13,5 @@ target "py312-cuda126" {
         TORCH = "torch==2.6.0+cu126 -f https://download.pytorch.org/whl/torch_stable.html",
         PYTHON_VERSION = "3.12"
     }
-    tags = ["daturaai/ollama:cuda12.6"]
+    tags = ["daturaai/better-ollama:cuda12.6"]
 }
