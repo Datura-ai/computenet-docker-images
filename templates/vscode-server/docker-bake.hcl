@@ -1,5 +1,5 @@
 variable "RELEASE" {
-    default = "0.1.2"
+    default = "0.1.3"
 }
 
 variable "IMAGE_NAME" {
