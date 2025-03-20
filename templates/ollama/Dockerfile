@@ -1,5 +1,6 @@
 # Base Image
-FROM daturaai/pytorch:2.6.0-py3.12-cuda12.6.0-devel-ubuntu22.04
+ARG BASE_IMAGE=daturaai/pytorch:2.6.0-py3.12-cuda12.6.0-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
 
 # Install necessary dependencies
 RUN apt-get update && \

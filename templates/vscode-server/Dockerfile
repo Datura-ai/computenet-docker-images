@@ -1,5 +1,6 @@
 # Base image
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+FROM ${BASE_IMAGE}
 
 # Set working directory
 WORKDIR /

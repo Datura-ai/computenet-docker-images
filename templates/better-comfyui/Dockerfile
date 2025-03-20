@@ -1,5 +1,6 @@
 # Stage 1: Base Image
-FROM daturaai/pytorch:2.6.0-py3.12-cuda12.6.0-devel-ubuntu22.04 as base
+ARG BASE_IMAGE=daturaai/pytorch:2.6.0-py3.12-cuda12.6.0-devel-ubuntu22.04
+FROM ${BASE_IMAGE} as base
 
 ARG PYTHON_VERSION1=3.12
 ARG TORCH=torch==2.6.0
