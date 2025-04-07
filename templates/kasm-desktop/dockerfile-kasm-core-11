@@ -240,6 +240,7 @@ EXPOSE $VNC_PORT \
        $UPLOAD_PORT \
        $AUDIO_PORT
 WORKDIR $HOME
+RUN sudo apt update && sudo apt install -y openssh-server
 
 ENTRYPOINT ["/dockerstartup/kasm_default_profile.sh", "/dockerstartup/vnc_startup.sh", "/dockerstartup/kasm_startup.sh"]
 CMD ["--wait"]
