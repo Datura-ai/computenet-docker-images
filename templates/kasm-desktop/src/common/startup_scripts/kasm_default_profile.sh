@@ -14,6 +14,7 @@ function verify_profile_config {
     echo "Verifying Uploads/Downloads Configurations"
 
     mkdir -p $HOME/Uploads
+    chown root:root $HOME/Uploads
 
     if [ -d "$HOME/Desktop/Uploads" ]; then
         echo "Uploads Desktop Symlink Exists"
@@ -24,6 +25,7 @@ function verify_profile_config {
 
 
     mkdir -p $HOME/Downloads
+    chown root:root $HOME/Downloads
 
     if [ -d "$HOME/Desktop/Downloads" ]; then
         echo "Downloads Desktop Symlink Exists"

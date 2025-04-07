@@ -7,7 +7,7 @@ apt-get install -y unison
 # FIXME move unison home dir out of profile
 
 mkdir -p /etc/unison/
-chown 1000:1000 /etc/unison/
+chown root:root /etc/unison/
 
 # FIXME Find and test Trash and other dirs
 # FIXME Test Browser only
@@ -40,4 +40,4 @@ batch = true
 EOL
 
 mkdir -p /var/log/unison/
-chown -R 1000:1000 /var/log/unison/
+chown -R root:root /var/log/unison/

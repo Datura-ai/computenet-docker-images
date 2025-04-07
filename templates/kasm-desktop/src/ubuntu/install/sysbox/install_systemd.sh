@@ -60,8 +60,8 @@ Description=Kasm Workspaces Init
 After=kasm-setup.service
 
 [Service]
-User=kasm-user
-Group=kasm-user
+User=root
+Group=root
 EnvironmentFile=/envdump
 Type=simple
 ExecStart=/bin/bash /dockerstartup/kasm_default_profile.sh /dockerstartup/vnc_startup.sh /dockerstartup/kasm_startup.sh
@@ -85,7 +85,7 @@ EOL
 cat >/kasm-sysbox-setup.sh<<EOL
 #!/bin/bash
 mkdir -p /var/run/pulse
-chown kasm-user:kasm-user /var/run/pulse
+chown root:root /var/run/pulse
 cat /proc/1/environ | xargs --null --max-args=1 > /envdump
 if [ -f /usr/sbin/policy-rc.d ]; then
   printf '#!/bin/sh\nexit 0' > /usr/sbin/policy-rc.d

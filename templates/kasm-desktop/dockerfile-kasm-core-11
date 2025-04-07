@@ -38,10 +38,6 @@ RUN bash $INST_SCRIPTS/package_rules/package_rules.sh && rm -rf $INST_SCRIPTS/pa
 COPY ./src/ubuntu/install/tools $INST_SCRIPTS/tools/
 RUN bash $INST_SCRIPTS/tools/install_tools.sh && rm -rf $INST_SCRIPTS/tools/
 
-# Install sudo and add kasm-user as a sudoer
-RUN apt-get update && apt-get install -y sudo && \
-    echo "kasm-user ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-
 ### Install prerequisites, add the PPA, and install Python 3.10
 RUN apt-get update && \
     apt-get install -y software-properties-common && \
@@ -148,12 +144,9 @@ COPY ./src/ubuntu/install/emblems $INST_SCRIPTS/emblems/
 RUN bash $INST_SCRIPTS/emblems/install_emblems.sh && rm -rf $INST_SCRIPTS/emblems/
 
 ### Create user and home directory for base images that don't already define it
-RUN (groupadd -g 1000 kasm-user \
-    && useradd -M -u 1000 -g 1000 kasm-user \
-    && usermod -a -G kasm-user kasm-user) ; exit 0
-ENV HOME=/home/kasm-user
+RUN mkdir -p /home/root && chown -R root:root /home/root
+ENV HOME=/home/root
 WORKDIR $HOME
-RUN mkdir -p $HOME && chown -R 1000:0 $HOME
 
 ### FIX PERMISSIONS ## Objective is to change the owner of non-home paths to root, remove write permissions, and set execute where required
 # these files are created on container first exec, by the default user, so we have to create them since default will not have write perm
@@ -162,6 +155,7 @@ RUN touch $STARTUPDIR/wm.log \
     && touch $STARTUPDIR/vnc_startup.log \
     && touch $STARTUPDIR/no_vnc_startup.log \
     && chown -R root:root $STARTUPDIR \
+    && chmod 755 $STARTUPDIR \
     && find $STARTUPDIR -type d -exec chmod 755 {} \; \
     && find $STARTUPDIR -type f -exec chmod 644 {} \; \
     && find $STARTUPDIR -type f -iname "*.sh" -exec chmod 755 {} \; \
@@ -188,7 +182,7 @@ COPY ./src/ubuntu/install/cleanup $INST_SCRIPTS/cleanup/
 RUN bash $INST_SCRIPTS/cleanup/cleanup.sh && rm -rf $INST_SCRIPTS/cleanup/
 
 #### Runtime Stage ####
-FROM scratch
+FROM ubuntu
 COPY --from=base_layer / /
 
 ### Labels
@@ -210,7 +204,7 @@ ENV AUDIO_PORT=4901 \
     DISPLAY=:1 \
     DISTRO=$DISTRO \
     GOMP_SPINCOUNT=0 \
-    HOME=/home/kasm-user \
+    HOME=/home/root \
     INST_SCRIPTS=/dockerstartup/install \
     KASMVNC_AUTO_RECOVER=true \
     KASM_VNC_PATH=/usr/share/kasmvnc \
@@ -246,7 +240,6 @@ EXPOSE $VNC_PORT \
        $UPLOAD_PORT \
        $AUDIO_PORT
 WORKDIR $HOME
-USER 1000
 
 ENTRYPOINT ["/dockerstartup/kasm_default_profile.sh", "/dockerstartup/vnc_startup.sh", "/dockerstartup/kasm_startup.sh"]
 CMD ["--wait"]
