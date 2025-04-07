@@ -37,6 +37,14 @@ group "default" {
         # ROCM 6.1.2
         "201-py39-rocm612-ubuntu2004",
         "212-py310-rocm612-ubuntu2204",
+        "240-py311-cuda1220-devel-ubuntu2204",
+        "240-py311-cuda1230-devel-ubuntu2204",
+        "240-py311-cuda1240-devel-ubuntu2204",
+        "240-py311-cuda1250-devel-ubuntu2204",
+        "240-py312-cuda1220-devel-ubuntu2204",
+        "240-py312-cuda1230-devel-ubuntu2204",
+        "240-py312-cuda1240-devel-ubuntu2204",
+        "240-py312-cuda1250-devel-ubuntu2204"
     ]
 }
 
@@ -307,3 +315,106 @@ target "240-py310-rocm610-ubuntu2204" {
     }
 }
 
+target "240-py311-cuda1220-devel-ubuntu2204" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.4.0-py3.11-cuda12.2.0-devel-ubuntu22.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:12.2.0-devel-ubuntu22.04"
+        PYTHON_VERSION = "3.11"
+        TORCH = "torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124"
+    }
+}
+
+target "240-py311-cuda1230-devel-ubuntu2204" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.4.0-py3.11-cuda12.3.0-devel-ubuntu22.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:12.3.0-devel-ubuntu22.04"
+        PYTHON_VERSION = "3.11"
+        TORCH = "torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124"
+    }
+}
+
+target "240-py311-cuda1240-devel-ubuntu2204" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.4.0-py3.11-cuda12.4.0-devel-ubuntu22.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:12.4.0-devel-ubuntu22.04"
+        PYTHON_VERSION = "3.11"
+        TORCH = "torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124"
+    }
+}
+
+target "240-py311-cuda1250-devel-ubuntu2204" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.4.0-py3.11-cuda12.5.0-devel-ubuntu22.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:12.5.0-devel-ubuntu22.04"
+        PYTHON_VERSION = "3.11"
+        TORCH = "torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124"
+    }
+}
+
+target "240-py312-cuda1220-devel-ubuntu2204" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.4.0-py3.12-cuda12.2.0-devel-ubuntu22.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:12.2.0-devel-ubuntu22.04"
+        PYTHON_VERSION = "3.12"
+        TORCH = "torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124"
+    }
+}
+
+target "240-py312-cuda1230-devel-ubuntu2204" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.4.0-py3.12-cuda12.3.0-devel-ubuntu22.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:12.3.0-devel-ubuntu22.04"
+        PYTHON_VERSION = "3.12"
+        TORCH = "torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124"
+    }
+}
+
+target "240-py312-cuda1240-devel-ubuntu2204" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.4.0-py3.12-cuda12.4.0-devel-ubuntu22.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:12.4.0-devel-ubuntu22.04"
+        PYTHON_VERSION = "3.12"
+        TORCH = "torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124"
+    }
+}
+
+target "240-py312-cuda1250-devel-ubuntu2204" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.4.0-py3.12-cuda12.5.0-devel-ubuntu22.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:12.5.0-devel-ubuntu22.04"
+        PYTHON_VERSION = "3.12"
+        TORCH = "torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124"
+    }
+}
