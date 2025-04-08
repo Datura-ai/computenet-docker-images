@@ -96,5 +96,5 @@ COPY comfyui_extras.ipynb /comfyui_extras.ipynb
 COPY install-flux.sh /install-flux.sh
 RUN chmod +x /install-flux.sh
 
-# CMD
-CMD [ "/start.sh" ]
+CMD ["tail", "-f", "/dev/null"]
+
