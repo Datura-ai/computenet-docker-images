@@ -1,9 +1,9 @@
 
 # Use the docker:dind image as the base
-FROM docker:dind
+FROM cruizba/ubuntu-dind:systemd-latest
 
-# Install OpenSSH server using apk
-RUN apk update && apk add --no-cache openssh
+# Install OpenSSH server using apt
+RUN apt-get update && apt-get install -y openssh-server
 
 # Configure SSH
 RUN mkdir /var/run/sshd && \
