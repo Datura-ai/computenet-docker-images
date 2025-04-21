@@ -1,4 +1,5 @@
-FROM nvidia/cuda:11.7.1-cudnn8-runtime-ubuntu20.04
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+FROM ${BASE_IMAGE}
 
 RUN apt-get update \
     && apt-get install -y \
