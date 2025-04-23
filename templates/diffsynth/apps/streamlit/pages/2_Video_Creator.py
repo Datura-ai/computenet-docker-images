@@ -38,6 +38,8 @@ def free_gpu_memory():
 
 def text_to_video(model_manager, prompt, seed, output_path, num_inference_steps):
     pipe = CogVideoPipeline.from_model_manager(model_manager)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipe.to(device)  # Ensure pipeline is moved to the correct device
     torch.manual_seed(seed)
     
     # Add progress bar
@@ -57,7 +59,9 @@ def text_to_video(model_manager, prompt, seed, output_path, num_inference_steps)
 
 def edit_video(model_manager, prompt, seed, input_path, output_path, num_inference_steps):
     pipe = CogVideoPipeline.from_model_manager(model_manager)
-    input_video = VideoData(video_file=input_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipe.to(device)  # Ensure pipeline is moved to the correct device
+    input_video = VideoData(video_file=input_path).to(device)
     torch.manual_seed(seed)
 
     progress_bar = st.progress(0)
@@ -77,6 +81,8 @@ def edit_video(model_manager, prompt, seed, input_path, output_path, num_inferen
 
 def interpolate_video(model_manager, input_path, output_path):
     rife = RIFEInterpolater.from_model_manager(model_manager)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    rife.to(device)  # Ensure RIFE interpolator is moved to the correct device
     video = VideoData(video_file=input_path).raw_data()
     
     # Convert video frames to PIL Images if necessary
