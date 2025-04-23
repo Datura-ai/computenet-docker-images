@@ -13,33 +13,17 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 from diffsynth import ModelManager, save_video, VideoData, download_models, CogVideoPipeline
 from diffsynth.extensions.RIFE import RIFEInterpolater
 
-# Verify model files
-def verify_model_files(model_paths):
-    """Verify that all model files exist and are non-empty."""
-    for path in model_paths:
-        if not os.path.exists(path) or os.path.getsize(path) == 0:
-            return False
-    return True
-
 # Initialize model manager and download required models
 @st.cache_resource(show_spinner="Loading models...")
 def load_model_manager():
-    model_paths = [
+    manager = ModelManager(torch_dtype=torch.bfloat16)
+    manager.load_models([
         "models/CogVideo/CogVideoX-5b/text_encoder",
         "models/CogVideo/CogVideoX-5b/transformer",
         "models/CogVideo/CogVideoX-5b/vae/diffusion_pytorch_model.safetensors",
         "models/RIFE/flownet.pkl",
-    ]
-    
-    if not verify_model_files(model_paths):
-        with st.spinner("Downloading models..."):
-            st.warning("Model files are missing or corrupted. Re-downloading models...")
-            download_models()  # Ensure models are downloaded
-            return None
-    else:
-        manager = ModelManager(torch_dtype=torch.bfloat16)
-        manager.load_models(model_paths)
-        return manager
+    ])
+    return manager
 
 # Use the cached model manager
 model_manager = load_model_manager()
