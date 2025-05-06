@@ -93,7 +93,30 @@ group "cuda" {
         "220-py310-cuda1211-devel-ubuntu2204",
         "221-py310-cuda1211-devel-ubuntu2204",
         "240-py311-cuda1241-devel-ubuntu2204",
+        
+        "240-py311-cuda1220-devel-ubuntu2204",
+        "240-py311-cuda1230-devel-ubuntu2204",
+        "240-py311-cuda1240-devel-ubuntu2204",
+        "240-py311-cuda1250-devel-ubuntu2204",
+        "240-py312-cuda1220-devel-ubuntu2204",
+        "240-py312-cuda1230-devel-ubuntu2204",
+        "240-py312-cuda1240-devel-ubuntu2204",
+        "240-py312-cuda1250-devel-ubuntu2204",
+
+        "260-py311-cuda1251-devel-ubuntu2204",
+        "260-py311-cuda1260-devel-ubuntu2204",
+        "260-py311-cuda1263-devel-ubuntu2204",
+        "270-py311-cuda1280-devel-ubuntu2204",
+
+        "260-py312-cuda1251-devel-ubuntu2204",
         "260-py312-cuda1260-devel-ubuntu2204",
+        "260-py312-cuda1263-devel-ubuntu2204",
+        "270-py312-cuda1280-devel-ubuntu2204",
+
+        "260-py311-cuda1251-devel-ubuntu2404",
+        "260-py311-cuda1260-devel-ubuntu2404",
+        "260-py311-cuda1263-devel-ubuntu2404",
+        "270-py311-cuda1280-devel-ubuntu2404",
     ]
 }
 
