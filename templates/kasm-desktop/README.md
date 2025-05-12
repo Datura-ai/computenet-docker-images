@@ -8,7 +8,7 @@ While these images are primarily built to run inside the Kasm platform, they can
 The container is now accessible via a browser : `https://<IP>:6901`
 
  - **User** : `kasm_user`
- - **Password**: `password`
+ - **Password**: `vncpassword`
 
  ### How to build:
 CUDA 11.8
