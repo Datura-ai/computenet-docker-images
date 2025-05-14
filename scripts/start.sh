@@ -93,4 +93,8 @@ execute_script "/post_start.sh" "Running post-start script..."
 
 echo "Start script(s) finished, pod is ready to use."
 
-sleep infinity
+if [[ $SKIP_SLEEP_INFINITY != "true" ]]; then
+    echo $SKIP_SLEEP_INFINITY
+    echo "Sleeping infinitely."
+    sleep infinity
+fi

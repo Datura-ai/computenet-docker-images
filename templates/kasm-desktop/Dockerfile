@@ -25,6 +25,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR $HOME
 RUN mkdir -p $HOME/Desktop
 
+RUN apt-get update --yes && \
+    apt-get upgrade --yes && \
+    apt install --yes --no-install-recommends git wget curl libgl1 software-properties-common openssh-server nginx
+
 ### Support NVIDIA gpus for graphics acceleration
 RUN echo "/usr/local/nvidia/lib" >> /etc/ld.so.conf.d/nvidia.conf && \
     echo "/usr/local/nvidia/lib64" >> /etc/ld.so.conf.d/nvidia.conf
@@ -242,5 +246,28 @@ EXPOSE $VNC_PORT \
 WORKDIR $HOME
 RUN sudo apt update && sudo apt install -y openssh-server
 
-ENTRYPOINT ["/dockerstartup/kasm_default_profile.sh", "/dockerstartup/vnc_startup.sh", "/dockerstartup/kasm_startup.sh"]
-CMD ["--wait"]
+# Welcome Message
+COPY --from=scripts computenet.txt /etc/computenet.txt
+RUN echo 'cat /etc/computenet.txt' >> /root/.bashrc
+RUN echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
+
+# NGINX Proxy
+ENV REQUIRE_NGINIX=true
+COPY --from=proxy nginx.conf /etc/nginx/nginx.conf
+COPY --from=proxy readme.html /usr/share/nginx/html/readme.html
+
+# Copy the README.md
+COPY README.md /usr/share/nginx/html/README.md
+
+RUN rm -f /etc/ssh/ssh_host_*
+
+COPY --from=scripts start.sh /dockerstartup/
+RUN chmod +x /dockerstartup/start.sh
+
+
+ENV SKIP_SLEEP_INFINITY=true
+#ENV PUBLIC_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCqAyGnR/dHKUrztRH53AUF4ACgohO6tmpPWdZssHymZxPkg1xd3xYiEUSR01nQbAXAwoxS4htjJMuqnq5iISsz9TRYUNIgm2x6w+EN0AC0iloJLqEwhbn9GcRZ6u4GtIWlXIOtw5+EDFKTVpLsZR2i752ROuEdYCa+E40xUxLN7XYw2Q+zjf+3VBr6bR+QUhP0RjEPiOScBdxXku2vpOHs2MF24T7mevQJFUHCwXSC7/23jgd/pJjX575DhsQ8hVer8uC1kscbCsshgMcRglJkhwnQVMAHcBXLnHgxggyvCvAB8w2n7axXi07ThoCjjpb5zaZ/xESFpkqCrhhL7YnnlG67Qz3QrDSqLdzqJh2QtDbBw3anUbS7VegASTcBtnE7rBRcVWW/hOlGEeNLrhJkCf4SFXj4GUNInTBYQZn5acSRlqNUiNPMF/WrKliSogjGk+0128AvBFniDk/9xy6Is7acpA4iI6/GL3/4BwB9Qr/6OntdXh6iPaI+W8U6SXk= zhongri@ZhongRis-Mini"
+# RUN echo 'export SKIP_SLEEP_INFINITY=true' >> /root/.bashrc
+# RUN export SKIP_SLEEP_INFINITY=true
+# ENTRYPOINT ["/dockerstartup/kasm_default_profile.sh",  "/dockerstartup/start.sh", "/dockerstartup/vnc_startup.sh" , "/dockerstartup/kasm_startup.sh"]
+ENTRYPOINT ["/bin/sh", "-c", "/dockerstartup/kasm_default_profile.sh && /dockerstartup/start.sh && /dockerstartup/vnc_startup.sh && /dockerstartup/kasm_startup.sh"]
