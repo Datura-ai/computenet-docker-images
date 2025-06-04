@@ -35,9 +35,9 @@ else
   locale-gen en_US.UTF-8
 fi
 
-if [ "$DISTRO" = "ubuntu" ]; then
-  #update mesa to latest
-  add-apt-repository ppa:kisak/turtle
-  apt-get update
-  apt full-upgrade -y
-fi
+# if [ "$DISTRO" = "ubuntu" ]; then
+#   #update mesa to latest
+#   add-apt-repository ppa:kisak/turtle
+#   apt-get update
+#   apt full-upgrade -y
+# fi

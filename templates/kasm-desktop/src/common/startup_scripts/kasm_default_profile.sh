@@ -2,7 +2,7 @@
 set -ex
 DEFAULT_PROFILE_HOME=/home/kasm-default-profile
 PROFILE_SYNC_DIR=/kasm_profile_sync
-
+HOME=/home/root
 
 function copy_default_profile_to_home {
     echo "Copying default profile to home directory"

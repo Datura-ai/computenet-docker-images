@@ -1,5 +1,5 @@
 #### Build Stage ####
-ARG BASE_IMAGE="nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04"
+ARG BASE_IMAGE="daturaai/pytorch:1.9.1-py3.10-cuda11.8.0-devel-ubuntu20.04"
 FROM $BASE_IMAGE AS base_layer
 
 ### Environment config
@@ -42,12 +42,7 @@ RUN bash $INST_SCRIPTS/package_rules/package_rules.sh && rm -rf $INST_SCRIPTS/pa
 COPY ./src/ubuntu/install/tools $INST_SCRIPTS/tools/
 RUN bash $INST_SCRIPTS/tools/install_tools.sh && rm -rf $INST_SCRIPTS/tools/
 
-### Install prerequisites, add the PPA, and install Python 3.10
-RUN apt-get update && \
-    apt-get install -y software-properties-common && \
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y python3.10 python3.10-venv python3.10-dev python3-apt  firefox libgl1 libglib2.0-0 google-perftools ffmpeg
+RUN    apt-get install -y firefox libgl1 libglib2.0-0 google-perftools ffmpeg
 
 ### Update the alternatives system to make Python 3.10 the default
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.8 1 && \
@@ -185,8 +180,7 @@ RUN touch $STARTUPDIR/wm.log \
 COPY ./src/ubuntu/install/cleanup $INST_SCRIPTS/cleanup/
 RUN bash $INST_SCRIPTS/cleanup/cleanup.sh && rm -rf $INST_SCRIPTS/cleanup/
 
-#### Runtime Stage ####
-FROM scratch
+FROM daturaai/ubuntu:20.04-py3.9
 COPY --from=base_layer / /
 
 ### Labels
@@ -205,10 +199,8 @@ ARG START_XFCE4=1
 ARG TZ='Etc/UTC'
 ENV AUDIO_PORT=4901 \
     DEBIAN_FRONTEND=noninteractive \
-    DISPLAY=:1 \
     DISTRO=$DISTRO \
     GOMP_SPINCOUNT=0 \
-    HOME=/home/root \
     INST_SCRIPTS=/dockerstartup/install \
     KASMVNC_AUTO_RECOVER=true \
     KASM_VNC_PATH=/usr/share/kasmvnc \
@@ -231,61 +223,30 @@ ENV AUDIO_PORT=4901 \
     VNC_COL_DEPTH=24 \
     VNCOPTIONS="-PreferBandwidth -DynamicQualityMin=4 -DynamicQualityMax=7 -DLP_ClipDelay=0" \
     VNC_PORT=5901 \
-    SSH_PORT=22 \
     VNC_PW=vncpassword \
     VNC_RESOLUTION=1280x1024 \
     VNC_RESOLUTION=1280x720 \
     VNC_VIEW_ONLY_PW=vncviewonlypassword \
     TZ=$TZ
 
-### Ports and user
+# ### Ports and user
 EXPOSE $VNC_PORT \
        $NO_VNC_PORT \
        $UPLOAD_PORT \
-       $AUDIO_PORT \
-       $SSH_PORT
-WORKDIR $HOME
-RUN sudo apt update && sudo apt install -y openssh-server
-
-# Configure SSH server for public key authentication only
-RUN awk '/^[[:space:]]*#*PubkeyAuthentication / { print "PubkeyAuthentication yes"; next } \
-    /^[[:space:]]*#*PasswordAuthentication / { print "PasswordAuthentication no"; next } \
-    /^[[:space:]]*#*PermitRootLogin / { print "PermitRootLogin yes"; next } \
-    { print }' /etc/ssh/sshd_config > /etc/ssh/sshd_config.new && mv /etc/ssh/sshd_config.new /etc/ssh/sshd_config
-
-# Verify sshd_config changes
-RUN echo "Verifying sshd_config:" && cat /etc/ssh/sshd_config
-
-# Welcome Message
-COPY --from=scripts computenet.txt /etc/computenet.txt
-RUN echo 'cat /etc/computenet.txt' >> /root/.bashrc
-RUN echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
+       $AUDIO_PORT
 
 # NGINX Proxy
 ENV REQUIRE_NGINIX=true
 COPY --from=proxy nginx.conf /etc/nginx/nginx.conf
 COPY --from=proxy readme.html /usr/share/nginx/html/readme.html
 
-# Copy the README.md
-COPY README.md /usr/share/nginx/html/README.md
-
 # Generate SSH host keys if they don't exist
-RUN dpkg-reconfigure openssh-server
-
 COPY --from=scripts start.sh /dockerstartup/
 RUN chmod +x /dockerstartup/start.sh
 
-# Add SSH public key to authorized_keys for root
-RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys && chmod 755 /root/.ssh/authorized_keys
-
-# Verify authorized_keys and permissions
-RUN echo "Verifying /root/.ssh permissions:" && ls -al /root/
-RUN echo "Verifying /root/.ssh/authorized_keys permissions:" && ls -al /root/.ssh/
-RUN echo "Verifying authorized_keys content:" && cat /root/.ssh/authorized_keys
-
-# Create the privilege separation directory for sshd
-RUN mkdir -p /run/sshd
-
 ENV SKIP_SLEEP_INFINITY=true
 
-ENTRYPOINT ["/bin/sh", "-c", "/usr/sbin/sshd && /dockerstartup/kasm_default_profile.sh && /dockerstartup/start.sh && /dockerstartup/vnc_startup.sh && /dockerstartup/kasm_startup.sh"]
+
+CMD ["tail", "-f", "/dev/null"]
+
+ENTRYPOINT ["/bin/sh", "-c", "/dockerstartup/kasm_default_profile.sh && /dockerstartup/vnc_startup.sh && /dockerstartup/kasm_startup.sh"]
