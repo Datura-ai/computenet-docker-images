@@ -231,7 +231,7 @@ ENV AUDIO_PORT=4901 \
     VNC_COL_DEPTH=24 \
     VNCOPTIONS="-PreferBandwidth -DynamicQualityMin=4 -DynamicQualityMax=7 -DLP_ClipDelay=0" \
     VNC_PORT=5901 \
-    VNC_PORT=5901 \
+    SSH_PORT=22 \
     VNC_PW=vncpassword \
     VNC_RESOLUTION=1280x1024 \
     VNC_RESOLUTION=1280x720 \
@@ -242,9 +242,19 @@ ENV AUDIO_PORT=4901 \
 EXPOSE $VNC_PORT \
        $NO_VNC_PORT \
        $UPLOAD_PORT \
-       $AUDIO_PORT
+       $AUDIO_PORT \
+       $SSH_PORT
 WORKDIR $HOME
 RUN sudo apt update && sudo apt install -y openssh-server
+
+# Configure SSH server for public key authentication only
+RUN awk '/^[[:space:]]*#*PubkeyAuthentication / { print "PubkeyAuthentication yes"; next } \
+    /^[[:space:]]*#*PasswordAuthentication / { print "PasswordAuthentication no"; next } \
+    /^[[:space:]]*#*PermitRootLogin / { print "PermitRootLogin yes"; next } \
+    { print }' /etc/ssh/sshd_config > /etc/ssh/sshd_config.new && mv /etc/ssh/sshd_config.new /etc/ssh/sshd_config
+
+# Verify sshd_config changes
+RUN echo "Verifying sshd_config:" && cat /etc/ssh/sshd_config
 
 # Welcome Message
 COPY --from=scripts computenet.txt /etc/computenet.txt
@@ -259,15 +269,23 @@ COPY --from=proxy readme.html /usr/share/nginx/html/readme.html
 # Copy the README.md
 COPY README.md /usr/share/nginx/html/README.md
 
-RUN rm -f /etc/ssh/ssh_host_*
+# Generate SSH host keys if they don't exist
+RUN dpkg-reconfigure openssh-server
 
 COPY --from=scripts start.sh /dockerstartup/
 RUN chmod +x /dockerstartup/start.sh
 
+# Add SSH public key to authorized_keys for root
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys && chmod 755 /root/.ssh/authorized_keys
+
+# Verify authorized_keys and permissions
+RUN echo "Verifying /root/.ssh permissions:" && ls -al /root/
+RUN echo "Verifying /root/.ssh/authorized_keys permissions:" && ls -al /root/.ssh/
+RUN echo "Verifying authorized_keys content:" && cat /root/.ssh/authorized_keys
+
+# Create the privilege separation directory for sshd
+RUN mkdir -p /run/sshd
 
 ENV SKIP_SLEEP_INFINITY=true
-#ENV PUBLIC_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCqAyGnR/dHKUrztRH53AUF4ACgohO6tmpPWdZssHymZxPkg1xd3xYiEUSR01nQbAXAwoxS4htjJMuqnq5iISsz9TRYUNIgm2x6w+EN0AC0iloJLqEwhbn9GcRZ6u4GtIWlXIOtw5+EDFKTVpLsZR2i752ROuEdYCa+E40xUxLN7XYw2Q+zjf+3VBr6bR+QUhP0RjEPiOScBdxXku2vpOHs2MF24T7mevQJFUHCwXSC7/23jgd/pJjX575DhsQ8hVer8uC1kscbCsshgMcRglJkhwnQVMAHcBXLnHgxggyvCvAB8w2n7axXi07ThoCjjpb5zaZ/xESFpkqCrhhL7YnnlG67Qz3QrDSqLdzqJh2QtDbBw3anUbS7VegASTcBtnE7rBRcVWW/hOlGEeNLrhJkCf4SFXj4GUNInTBYQZn5acSRlqNUiNPMF/WrKliSogjGk+0128AvBFniDk/9xy6Is7acpA4iI6/GL3/4BwB9Qr/6OntdXh6iPaI+W8U6SXk= zhongri@ZhongRis-Mini"
-# RUN echo 'export SKIP_SLEEP_INFINITY=true' >> /root/.bashrc
-# RUN export SKIP_SLEEP_INFINITY=true
-# ENTRYPOINT ["/dockerstartup/kasm_default_profile.sh",  "/dockerstartup/start.sh", "/dockerstartup/vnc_startup.sh" , "/dockerstartup/kasm_startup.sh"]
-ENTRYPOINT ["/bin/sh", "-c", "/dockerstartup/kasm_default_profile.sh && /dockerstartup/start.sh && /dockerstartup/vnc_startup.sh && /dockerstartup/kasm_startup.sh"]
+
+ENTRYPOINT ["/bin/sh", "-c", "/usr/sbin/sshd && /dockerstartup/kasm_default_profile.sh && /dockerstartup/start.sh && /dockerstartup/vnc_startup.sh && /dockerstartup/kasm_startup.sh"]

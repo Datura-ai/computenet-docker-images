@@ -12,7 +12,7 @@ The container is now accessible via a browser : `https://<IP>:6901`
 
  ### How to build:
 CUDA 11.8
- ```docker buildx build -f dockerfile-kasm-core-11 -t daturaai/kasm-docker:cuda11 --build-arg START_XFCE4=1 --build-arg START_PULSEAUDIO=1 .```
+ ```docker buildx build -t daturaai/kasm-docker:cuda11 --build-arg START_XFCE4=1 --build-arg START_PULSEAUDIO=1 .```
 
 
 # Kasmweb VNC - Ubuntu Remote Desktop CUDA 11.8
