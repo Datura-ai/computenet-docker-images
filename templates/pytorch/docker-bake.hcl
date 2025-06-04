@@ -731,3 +731,16 @@ target "270-py311-cuda1280-devel-ubuntu2204" {
         TORCH = "torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128"
     }
 }
+
+target "191-py310-cuda118-devel-ubuntu2004" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:1.9.1-py3.10-cuda11.8.0-devel-ubuntu20.04"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04"
+        PYTHON_VERSION = "3.10"
+        TORCH = "torch==2.0.0+cu118 torchvision==0.15.0+cu118 torchaudio==2.0.0 -f https://download.pytorch.org/whl/torch_stable.html"
+    }
+}
