@@ -40,15 +40,7 @@ class BatchPortVerifier:
         except TimeoutError:
             raise
 
-    async def check_ports(self, ports: list[tuple[int, int]], external_ip: str) -> dict[int, bool]:
-        """
-        Spin up lightweight TCP listeners on given ports, probe each locally, then tear down.
-
-        Returns:
-            Mapping {port: True/False} where True means "listener bound and probe succeeded".
-        """
-        print(f"Checking {len(ports)} ports on {external_ip}...")
-        results: dict[int, bool] = {}
+    async def process_port(self, external_ip: str, port_pair: tuple[int, int]) -> tuple[int, bool]:
         nonce = secrets.token_hex(8)
 
         async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -66,28 +58,38 @@ class BatchPortVerifier:
                 with contextlib.suppress(Exception):
                     await writer.wait_closed()
 
-        async def process_port(port_pair: tuple[int, int]) -> tuple[int, bool]:
-            """Start server on internal port, probe external port, then close server."""
-            internal_port, external_port = port_pair
-            async with self.semaphore:
-                try:
-                    server = await asyncio.start_server(handler, host=HOST, port=internal_port)
-                except OSError:
-                    return internal_port, False
+        """Start server on internal port, probe external port, then close server."""
+        internal_port, external_port = port_pair
+        async with self.semaphore:
+            try:
+                server = await asyncio.start_server(handler, host=HOST, port=internal_port)
+            except OSError:
+                return internal_port, False
 
-                try:
-                    text = await self.get_response(external_ip, external_port, nonce)
-                    ok = text == f"OK {nonce}"
-                except Exception:
-                    ok = False
-                finally:
-                    server.close()
-                    with contextlib.suppress(Exception):
-                        await server.wait_closed()
+            try:
+                text = await self.get_response(external_ip, external_port, nonce)
+                print(71, text, text == f"OK {nonce}")
+                ok = text == f"OK {nonce}"
+            except Exception:
+                ok = False
+            finally:
+                server.close()
+                with contextlib.suppress(Exception):
+                    await server.wait_closed()
 
-                return internal_port, ok
+            return internal_port, ok
 
-        tasks = [process_port(port_pair) for port_pair in ports]
+    async def check_ports(self, ports: list[tuple[int, int]], external_ip: str) -> dict[int, bool]:
+        """
+        Spin up lightweight TCP listeners on given ports, probe each locally, then tear down.
+
+        Returns:
+            Mapping {port: True/False} where True means "listener bound and probe succeeded".
+        """
+        print(f"Checking {len(ports)} ports on {external_ip}...")
+        results: dict[int, bool] = {}
+
+        tasks = [self.process_port(external_ip, port_pair) for port_pair in ports]
         responses = await asyncio.gather(*tasks)
 
         for port, ok in responses:
