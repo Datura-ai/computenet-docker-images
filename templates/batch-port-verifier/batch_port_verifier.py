@@ -133,12 +133,6 @@ class BatchPortVerifierHandler(BaseHTTPRequestHandler):
         external_ip = config.get("external_ip", "127.0.0.1")
         ports = config.get("ports", [])
 
-        start_port = config.get("start_port")
-        end_port = config.get("end_port")
-        if start_port and end_port:
-            extra_ports = [(port, port) for port in range(start_port, end_port + 1)]
-            ports.extend(extra_ports)
-
         if not ports:
             raise ValueError("No ports provided")
 
