@@ -1,5 +1,7 @@
-FROM python:3.11-alpine
-COPY batch_port_verifier.py /app/
+FROM python:3.12-alpine
 WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+COPY batch_port_verifier.py /app/
 EXPOSE 40000
 CMD ["python", "batch_port_verifier.py"]

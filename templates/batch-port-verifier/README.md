@@ -3,33 +3,57 @@ This is the script to be loaded in the executor to check a lot of ports in one c
 ## Build and Push
 
 ```bash
-docker build -t {username}/batch-port-verifier:latest .
+docker build -t daturaai/batch-port-verifier:0.0.1 .
 
-docker push {username}/batch-port-verifier:latest
+docker push daturaai/batch-port-verifier:0.0.1
 ```
 
 
 ## Start on server
 ```bash
-docker run  -e API_PORT={OPEN_PORT} --network=host {username}/batch-port-verifier:latest
+docker run  -e API_PORT={OPEN_PORT} --network=host daturaai/batch-port-verifier:0.0.1
 ```
 
 
-## Check ports
-in
+## API Usage
+
+### Start HTTP servers on ports
 ```bash
-curl -X POST http://{EXTERNAL_IP}:{OPEN_PORT}/check-ports \
+curl -X POST http://{EXTERNAL_IP}:{OPEN_PORT}/start-ports \
   -H "Content-Type: application/json" \
-  -d '{"external_ip":"{EXTERNAL_IP}","ports":[[9000,9000], [9001,9002]]}'
+  -d '{"ports":[9000, 9001, 9002], "secret":"my_secret"}'
 ```
-out:
+Response:
 ```json
 {
-  "duration": 0.004006862640380859,
-  "success_count": 1,
-  "results": {
-    "9000": true,
-    "9001": false
-  }
+  "status": "servers_started",
+  "requested": 3,
+  "started": 3,
+  "failed": 0,
+  "failed_ports": [],
+  "active_ports": [9000, 9001, 9002]
 }
+```
+
+### Stop HTTP servers
+```bash
+curl -X POST http://{EXTERNAL_IP}:{OPEN_PORT}/stop-ports \
+  -H "Content-Type: application/json" \
+  -d '{"ports":[9000, 9001]}'
+```
+Response:
+```json
+{
+  "status": "servers_stopped",
+  "requested": 2,
+  "stopped": 2,
+  "not_found": 0,
+  "failed": 0,
+  "active_ports": [9002]
+}
+```
+
+### Health check
+```bash
+curl http://{EXTERNAL_IP}:{OPEN_PORT}/health
 ```
