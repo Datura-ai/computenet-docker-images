@@ -1,184 +1,160 @@
+"""Batch HTTP port verifier - starts multiple HTTP servers on different ports"""
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import os
-import secrets
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from aiohttp import web
 
 # Configuration
 HOST = "0.0.0.0"
 API_PORT = int(os.environ.get("API_PORT", "19999"))
-MAX_CONCURRENT = 100
-CONNECTION_TIMEOUT = 1.0
-HANDLER_TIMEOUT = 0.2
+
+# Global state: stores active servers (AppRunner and TCPSite)
+ACTIVE_SERVERS: dict[int, tuple[web.AppRunner, web.TCPSite]] = {}
 
 
-class BatchPortVerifier:
-    """Handles port connectivity verification."""
-
-    def __init__(self, max_concurrent: int = MAX_CONCURRENT):
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def get_response(self, probe_host: str, port: int, nonce: str) -> str:
-        """Send nonce and get response from port."""
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(probe_host, port), timeout=CONNECTION_TIMEOUT
-            )
-            try:
-                writer.write((nonce + "\n").encode())
-                await writer.drain()
-                line = await asyncio.wait_for(reader.readline(), timeout=CONNECTION_TIMEOUT)
-                return line.decode(errors="ignore").strip()
-            finally:
-                writer.close()
-                with contextlib.suppress(Exception):
-                    await writer.wait_closed()
-        except TimeoutError:
-            raise
-
-    async def process_port(self, external_ip: str, port_pair: tuple[int, int]) -> tuple[int, bool]:
-        nonce = secrets.token_hex(8)
-
-        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            """Single-connection handler that replies with OK + nonce."""
-            try:
-                line = await asyncio.wait_for(reader.readline(), timeout=HANDLER_TIMEOUT)
-                received_nonce = line.decode(errors="ignore").strip()
-                if received_nonce == nonce:
-                    writer.write(f"OK {nonce}\n".encode())
-                    await writer.drain()
-            except Exception:
-                pass
-            finally:
-                writer.close()
-                with contextlib.suppress(Exception):
-                    await writer.wait_closed()
-
-        """Start server on internal port, probe external port, then close server."""
-        internal_port, external_port = port_pair
-        async with self.semaphore:
-            try:
-                server = await asyncio.start_server(handler, host=HOST, port=internal_port)
-            except OSError:
-                return internal_port, False
-
-            try:
-                text = await self.get_response(external_ip, external_port, nonce)
-                print(71, text, text == f"OK {nonce}")
-                ok = text == f"OK {nonce}"
-            except Exception:
-                ok = False
-            finally:
-                server.close()
-                with contextlib.suppress(Exception):
-                    await server.wait_closed()
-
-            return internal_port, ok
-
-    async def check_ports(self, ports: list[tuple[int, int]], external_ip: str) -> dict[int, bool]:
-        """
-        Spin up lightweight TCP listeners on given ports, probe each locally, then tear down.
-
-        Returns:
-            Mapping {port: True/False} where True means "listener bound and probe succeeded".
-        """
-        print(f"Checking {len(ports)} ports on {external_ip}...")
-        results: dict[int, bool] = {}
-
-        tasks = [self.process_port(external_ip, port_pair) for port_pair in ports]
-        responses = await asyncio.gather(*tasks)
-
-        for port, ok in responses:
-            results[port] = ok
-
-        return results
+async def port_handler(port: int, secret: str, request: web.Request) -> web.Response:
+    """HTTP handler for each port - returns port and secret"""
+    return web.Response(text=f"{port}_{secret}\n")
 
 
-class BatchPortVerifierHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for port checking API."""
+async def start_single_http_server(port: int, secret: str) -> tuple[web.AppRunner, web.TCPSite]:
+    """Starts a single HTTP server on specified port"""
+    app = web.Application()
+    # Add handler for any path
+    app.router.add_get("/{tail:.*}", lambda req: port_handler(port, secret, req))
 
-    def __init__(self, *args, **kwargs):
-        self.port_verifier = BatchPortVerifier()
-        super().__init__(*args, **kwargs)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
 
-    def do_GET(self) -> None:
-        """Handle GET requests."""
-        if self.path == "/health":
-            self._send_json_response({"status": "ok"}, 200)
-        else:
-            self.send_error(404)
+    site = web.TCPSite(runner, HOST, port)
+    await site.start()
 
-    def do_POST(self) -> None:
-        """Handle POST requests."""
-        if self.path == "/check-ports":
-            try:
-                config = self._read_json_body()
-                result = self._check_ports(config)
-                self._send_json_response(result, 200)
-            except Exception as e:
-                self._send_json_response({"error": str(e)}, 400)
-        else:
-            self.send_error(404)
+    print(f"HTTP server started on port {port}")
+    return runner, site
 
-    def _read_json_body(self) -> dict:
-        """Read and parse JSON request body."""
-        content_length = int(self.headers["Content-Length"])
-        post_data = self.rfile.read(content_length)
-        return json.loads(post_data.decode("utf-8"))
 
-    def _check_ports(self, config: dict) -> dict:
-        """Process port checking request."""
-        external_ip = config.get("external_ip", "127.0.0.1")
-        ports = config.get("ports", [])
+async def stop_single_http_server(port: int) -> None:
+    """Stops a single HTTP server"""
+    server_tuple = ACTIVE_SERVERS.pop(port, None)
+    if server_tuple:
+        runner, site = server_tuple
+        await site.stop()
+        await runner.cleanup()
+        print(f"Port {port} closed")
+
+
+# --- API HTTP request handlers ---
+
+
+async def health_check(request: web.Request) -> web.Response:
+    """GET /health - Health check"""
+    return web.json_response({"status": "ok"})
+
+
+async def start_ports(request: web.Request) -> web.Response:
+    """POST /start-ports - Starts HTTP servers on multiple ports"""
+    try:
+        data = await request.json()
+        ports = data.get("ports", [])
+        secret = data.get("secret", "")
 
         if not ports:
-            raise ValueError("No ports provided")
+            return web.json_response({"error": "No ports provided"}, status=400)
+        if len(ports) > 1000:
+            return web.json_response(
+                {"error": "Too many ports requested. Maximum is 1000."}, status=400
+            )
 
-        # Run async check_ports in sync context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            t1 = time.time()
-            result = loop.run_until_complete(self.port_verifier.check_ports(ports, external_ip))
-            duration = time.time() - t1
-        finally:
-            loop.close()
+        ports_to_start = [p for p in ports if p not in ACTIVE_SERVERS]
 
-        return {
-            "duration": duration,
-            "results": result,
-            "success_count": sum(result.values()),
-        }
+        if not ports_to_start:
+            return web.json_response(
+                {
+                    "status": "servers_started",
+                    "requested": len(ports),
+                    "started": 0,
+                    "failed": 0,
+                    "failed_ports": [],
+                    "active_ports": sorted(list(ACTIVE_SERVERS.keys())),
+                }
+            )
 
-    def _send_json_response(self, data: dict, status_code: int) -> None:
-        """Send JSON response."""
-        self.send_response(status_code)
-        self.send_header("Content-type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        tasks = [start_single_http_server(p, secret) for p in ports_to_start]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    def log_message(self, format: str, *args) -> None:
-        """Suppress default logging, just print essentials."""
-        print(f"{self.address_string()} - {format % args}")
+        started_count = 0
+        failed_ports = []
+        for i, res in enumerate(results):
+            port = ports_to_start[i]
+
+            if isinstance(res, tuple):
+                ACTIVE_SERVERS[port] = res
+                started_count += 1
+            else:
+                failed_ports.append(port)
+                print(f"Failed to start on port {port}: {res}")
+
+        return web.json_response(
+            {
+                "status": "servers_started",
+                "requested": len(ports),
+                "started": started_count,
+                "failed": len(failed_ports),
+                "failed_ports": sorted(failed_ports),
+                "active_ports": sorted(list(ACTIVE_SERVERS.keys())),
+            }
+        )
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+
+async def stop_ports(request: web.Request) -> web.Response:
+    """POST /stop-ports - Stops HTTP servers"""
+    try:
+        data = await request.json()
+        ports = data.get("ports", [])
+        if not ports:
+            return web.json_response({"error": "No ports provided"}, status=400)
+
+        ports_to_stop = [p for p in ports if p in ACTIVE_SERVERS]
+        not_found_count = len(ports) - len(ports_to_stop)
+
+        tasks = [stop_single_http_server(p) for p in ports_to_stop]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        failed_count = sum(1 for res in results if isinstance(res, Exception))
+        stopped_count = len(tasks) - failed_count
+
+        return web.json_response(
+            {
+                "status": "servers_stopped",
+                "requested": len(ports),
+                "stopped": stopped_count,
+                "not_found": not_found_count,
+                "failed": failed_count,
+                "active_ports": sorted(list(ACTIVE_SERVERS.keys())),
+            }
+        )
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
 
 
 def main() -> None:
-    """Start the port checker HTTP server."""
-    print(f"Starting Batch Port Verifier HTTP Server on {HOST}:{API_PORT}")
+    """Configures and runs API HTTP server"""
+    app = web.Application()
+    app.router.add_get("/health", health_check)
+    app.router.add_post("/start-ports", start_ports)
+    app.router.add_post("/stop-ports", stop_ports)
+
+    print(f"Starting API HTTP Server on {HOST}:{API_PORT}")
     print("Endpoints:")
     print("  GET  /health - Health check")
-    print("  POST /check-ports - Check ports (JSON body)")
+    print('  POST /start-ports - Start HTTP servers (JSON: {"ports": [...], "secret": "..."})')
+    print('  POST /stop-ports - Stop HTTP servers (JSON: {"ports": [...]})')
 
-    server = HTTPServer((HOST, API_PORT), BatchPortVerifierHandler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
-        server.server_close()
+    web.run_app(app, host=HOST, port=API_PORT, access_log=None)
 
 
 if __name__ == "__main__":
