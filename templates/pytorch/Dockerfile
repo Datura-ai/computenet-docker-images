@@ -42,6 +42,7 @@ RUN pip install --upgrade --no-cache-dir pip --break-system-packages
 # Install PyTorch only if TORCH is specified
 RUN if [ -n "${TORCH}" ]; then pip install --upgrade --no-cache-dir ${TORCH} --break-system-packages; fi 
 RUN pip install --upgrade --no-cache-dir jupyterlab ipywidgets jupyter-archive jupyter_contrib_nbextensions --break-system-packages
+RUN pip install -q --upgrade --no-cache-dir 'huggingface_hub>=0.19.3,<1.0' transformers accelerate gradio requests --break-system-packages
 
 # Set up Jupyter Notebook
 RUN pip install notebook==6.5.7 --break-system-packages
