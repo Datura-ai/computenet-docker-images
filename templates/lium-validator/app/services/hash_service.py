@@ -64,7 +64,7 @@ class JobParam:
         )
 
     @property
-    def password_length(self) -> int:
+    def challenge_length(self) -> int:
         return self.num_letters + self.num_digits
 
     def __str__(self) -> str:
@@ -79,7 +79,7 @@ class JobParam:
 
 @dataclass
 class HashcatJob:
-    passwords: list[list[str]]
+    challenges: list[list[str]]
     salts: list[bytes]
     job_params: list[JobParam]
 
@@ -117,7 +117,7 @@ class HashService:
                 for _ in range(num_job_params)
             ]
 
-            passwords = [
+            challenges = [
                 sorted(
                     {
                         cls.random_string(
@@ -133,7 +133,7 @@ class HashService:
 
             jobs.append(HashcatJob(
                 job_params=job_params,
-                passwords=passwords,
+                challenges=challenges,
                 salts=salts,
             ))
 
@@ -147,10 +147,10 @@ class HashService:
     def hash_masks(self, job: HashcatJob) -> list[str]:
         return ["?1" * param.num_letters + "?d" * param.num_digits for param in job.job_params]
 
-    def hash_hexes(self, algorithm: Algorithm, passwords: list[str], salt: str) -> list[str]:
+    def hash_hexes(self, algorithm: Algorithm, challenges: list[str], salt: str) -> list[str]:
         return [
-            algorithm.hash(password.encode("ascii") + salt).hexdigest()
-            for password in passwords
+            algorithm.hash(challenge.encode("ascii") + salt).hexdigest()
+            for challenge in challenges
         ]
 
     def _hash(self, s: bytes) -> bytes:
@@ -164,7 +164,7 @@ class HashService:
             "\n".join([
                 f"{hash_hex}:{job.salts[i].hex()}"
                 for hash_hex
-                in self.hash_hexes(job.job_params[i].algorithm, job.passwords[i], job.salts[i])
+                in self.hash_hexes(job.job_params[i].algorithm, job.challenges[i], job.salts[i])
             ])
             for i in range(self.num_job_params)
         ]
@@ -192,7 +192,7 @@ class HashService:
     @property
     def answer(self) -> str:
         return self._hash(
-            "".join(["".join(["".join(passwords) for passwords in job.passwords]) for job in self.jobs]).encode("utf-8")
+            "".join(["".join(["".join(challenges) for challenges in job.challenges]) for job in self.jobs]).encode("utf-8")
         ).decode("utf-8")
 
     def __str__(self) -> str:
