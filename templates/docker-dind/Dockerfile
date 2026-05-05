@@ -51,6 +51,17 @@ COPY --from=scripts computenet.txt /etc/computenet.txt
 RUN echo 'cat /etc/computenet.txt' >> /root/.bashrc
 RUN echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
 
-# Start SSH and Docker daemon. The load-probe runs in the background — `(... &)`
-# detaches it so a failed load can never hang the container start.
-CMD ["bash", "-c", "(/usr/local/bin/load-probe.sh &) ; /nvidia-setup.sh && /start.sh"]
+# Start SSH and Docker daemon. The load-probe runs SYNCHRONOUSLY before /start.sh
+# so the bundled hello-world image is guaranteed to be in the inner dockerd's store
+# before sshd starts accepting validator connections — eliminates the race where the
+# validator's DinD probe (which waits ~5 s after `docker run` then SSHes in) could land
+# in the window between dockerd-ready and docker-load-complete.
+#
+# The base image's ENTRYPOINT (start-docker.sh from cruizba/ubuntu-dind) has already
+# brought dockerd up by the time CMD runs, so load-probe's first `docker info` poll
+# succeeds immediately and the whole script completes in ~1-2 s. Worst case (bundled
+# tar missing or `docker load` fails) load-probe exits non-zero, the `;` keeps the
+# pipeline going, and the inner dockerd just lacks the bundled image — the validator
+# probe then falls back to a registry pull (pre-DAH-1959 behaviour). It is not an `&&`
+# on purpose: a load failure must not block container startup.
+CMD ["bash", "-c", "/usr/local/bin/load-probe.sh ; /nvidia-setup.sh && /start.sh"]
