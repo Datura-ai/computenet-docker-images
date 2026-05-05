@@ -35,10 +35,22 @@ RUN chmod +x /entrypoint.sh
 COPY nvidia-setup.sh /
 RUN chmod +x /nvidia-setup.sh
 
+# Bundle the official hello-world image so the validator's DinD sysbox probe (DAH-1959)
+# can confirm nested docker works without ever pulling from Docker Hub. Anonymous pulls
+# hit per-IP rate limits when many executors share a NAT, which falsely flagged miners
+# as sysbox=False and cut their reward multiplier. The tarball is loaded asynchronously
+# right after the inner dockerd becomes reachable; if the load fails the probe falls
+# back to a registry pull (previous behaviour), so this is best-effort and never blocks
+# dockerd startup.
+COPY hello-world.tar /opt/probe/hello-world.tar
+COPY load-probe.sh /usr/local/bin/load-probe.sh
+RUN chmod +x /usr/local/bin/load-probe.sh
+
 # Welcome Message
 COPY --from=scripts computenet.txt /etc/computenet.txt
 RUN echo 'cat /etc/computenet.txt' >> /root/.bashrc
 RUN echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
 
-# Start SSH and Docker daemon
-CMD ["bash", "-c", "/nvidia-setup.sh && /start.sh"]
+# Start SSH and Docker daemon. The load-probe runs in the background — `(... &)`
+# detaches it so a failed load can never hang the container start.
+CMD ["bash", "-c", "(/usr/local/bin/load-probe.sh &) ; /nvidia-setup.sh && /start.sh"]
