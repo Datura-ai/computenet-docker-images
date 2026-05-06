@@ -38,30 +38,27 @@ RUN chmod +x /nvidia-setup.sh
 # Bundle the official hello-world image so the validator's DinD sysbox probe (DAH-1959)
 # can confirm nested docker works without ever pulling from Docker Hub. Anonymous pulls
 # hit per-IP rate limits when many executors share a NAT, which falsely flagged miners
-# as sysbox=False and cut their reward multiplier. The tarball is loaded asynchronously
-# right after the inner dockerd becomes reachable; if the load fails the probe falls
-# back to a registry pull (previous behaviour), so this is best-effort and never blocks
-# dockerd startup.
+# as sysbox=False and cut their reward multiplier.
+#
+# The tarball is loaded by load-probe.sh, which is invoked through an ENTRYPOINT chain
+# (load-probe-entrypoint.sh -> cruizba's start-docker.sh -> load-and-exec.sh -> user CMD)
+# so the load completes BEFORE any user-supplied command (in particular, the lium
+# validator's `service ssh start` chain) runs. ENTRYPOINT was chosen because lium's
+# validator overrides CMD, so any setup we put in CMD would be silently dropped.
+# A failed load is best-effort: the validator probe just falls back to a registry pull.
 COPY hello-world.tar /opt/probe/hello-world.tar
-COPY load-probe.sh /usr/local/bin/load-probe.sh
-RUN chmod +x /usr/local/bin/load-probe.sh
+COPY load-probe.sh load-probe-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/load-probe.sh /usr/local/bin/load-probe-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/load-probe-entrypoint.sh"]
 
 # Welcome Message
 COPY --from=scripts computenet.txt /etc/computenet.txt
 RUN echo 'cat /etc/computenet.txt' >> /root/.bashrc
 RUN echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
 
-# Start SSH and Docker daemon. The load-probe runs SYNCHRONOUSLY before /start.sh
-# so the bundled hello-world image is guaranteed to be in the inner dockerd's store
-# before sshd starts accepting validator connections — eliminates the race where the
-# validator's DinD probe (which waits ~5 s after `docker run` then SSHes in) could land
-# in the window between dockerd-ready and docker-load-complete.
-#
-# The base image's ENTRYPOINT (start-docker.sh from cruizba/ubuntu-dind) has already
-# brought dockerd up by the time CMD runs, so load-probe's first `docker info` poll
-# succeeds immediately and the whole script completes in ~1-2 s. Worst case (bundled
-# tar missing or `docker load` fails) load-probe exits non-zero, the `;` keeps the
-# pipeline going, and the inner dockerd just lacks the bundled image — the validator
-# probe then falls back to a registry pull (pre-DAH-1959 behaviour). It is not an `&&`
-# on purpose: a load failure must not block container startup.
-CMD ["bash", "-c", "/usr/local/bin/load-probe.sh ; /nvidia-setup.sh && /start.sh"]
+# Default CMD when nobody overrides it. load-probe runs via the ENTRYPOINT chain above,
+# not here, so this is just the regular pod-bring-up path for interactive use.
+# (The lium validator overrides CMD with its own `sh -c '... service ssh start ...'`,
+# but the ENTRYPOINT chain still runs load-probe before that override — that is the
+# whole point of moving load-probe out of CMD.)
+CMD ["bash", "-c", "/nvidia-setup.sh && /start.sh"]
