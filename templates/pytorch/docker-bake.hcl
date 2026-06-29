@@ -71,6 +71,12 @@ group "default" {
         "260-py312-cuda1260-devel-ubuntu2404",
         "260-py312-cuda1263-devel-ubuntu2404",
         "270-py312-cuda1280-devel-ubuntu2404",
+
+        # PyTorch 2.12.0 Docker-in-Docker targets
+        "2120-py312-cuda126-devel-ubuntu2404-dind",
+        "2120-py312-cuda128-devel-ubuntu2404-dind",
+        "2120-py312-cuda1302-devel-ubuntu2404-dind",
+        "2120-py312-cuda132-devel-ubuntu2404-dind",
     ]
 }
 
@@ -128,6 +134,21 @@ group "cuda" {
         "260-py311-cuda1260-devel-ubuntu2404",
         "260-py311-cuda1263-devel-ubuntu2404",
         "270-py311-cuda1280-devel-ubuntu2404",
+
+        # PyTorch 2.12.0 Docker-in-Docker targets
+        "2120-py312-cuda126-devel-ubuntu2404-dind",
+        "2120-py312-cuda128-devel-ubuntu2404-dind",
+        "2120-py312-cuda1302-devel-ubuntu2404-dind",
+        "2120-py312-cuda132-devel-ubuntu2404-dind",
+    ]
+}
+
+group "cuda-dind" {
+    targets = [
+        "2120-py312-cuda126-devel-ubuntu2404-dind",
+        "2120-py312-cuda128-devel-ubuntu2404-dind",
+        "2120-py312-cuda1302-devel-ubuntu2404-dind",
+        "2120-py312-cuda132-devel-ubuntu2404-dind",
     ]
 }
 
@@ -624,7 +645,67 @@ target "270-py311-cuda1280-devel-ubuntu2404" {
     }
 }
 
-arget "260-py312-cuda1251-devel-ubuntu2204" {
+target "2120-py312-cuda126-devel-ubuntu2404-dind" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu126"
+    }
+}
+
+target "2120-py312-cuda128-devel-ubuntu2404-dind" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu126"
+    }
+}
+
+target "2120-py312-cuda1302-devel-ubuntu2404-dind" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130"
+    }
+}
+
+target "2120-py312-cuda132-devel-ubuntu2404-dind" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda13.2-devel-ubuntu24.04-dind"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu132"
+    }
+}
+
+target "260-py312-cuda1251-devel-ubuntu2204" {
     dockerfile = "Dockerfile"
     tags = ["${PUBLISHER}/pytorch:2.6.0-py3.12-cuda12.5.1-devel-ubuntu22.04"]
     contexts = {
