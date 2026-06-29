@@ -33,12 +33,6 @@ setup_ssh() {
         ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub
     fi
 
-    if [ ! -f /etc/ssh/ssh_host_dsa_key ]; then
-        ssh-keygen -t dsa -f /etc/ssh/ssh_host_dsa_key -q -N ''
-        echo "DSA key fingerprint:"
-        ssh-keygen -lf /etc/ssh/ssh_host_dsa_key.pub
-    fi
-
     if [ ! -f /etc/ssh/ssh_host_ecdsa_key ]; then
         ssh-keygen -t ecdsa -f /etc/ssh/ssh_host_ecdsa_key -q -N ''
         echo "ECDSA key fingerprint:"

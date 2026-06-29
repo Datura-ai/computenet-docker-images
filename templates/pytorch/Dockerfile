@@ -117,6 +117,8 @@ RUN rm -f /etc/ssh/ssh_host_* && \
     echo 'cat /etc/computenet.txt' >> /root/.bashrc && \
     echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
 
-# Set the default command for the container
-ENTRYPOINT []
-CMD [ "/pytorch-entrypoint.sh" ]
+# Start dockerd from ENTRYPOINT so the nested daemon survives a CMD override
+# (lium's validator appends the renter's startup command, which replaces CMD).
+# The entrypoint then execs CMD — the default /start.sh, or the caller's command.
+ENTRYPOINT [ "/pytorch-entrypoint.sh" ]
+CMD [ "/start.sh" ]

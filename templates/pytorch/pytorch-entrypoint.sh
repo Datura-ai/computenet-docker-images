@@ -27,4 +27,9 @@ start_docker() {
 }
 
 start_docker
-exec /start.sh
+
+# Exec whatever command was passed (the image CMD, or a startup command the
+# caller appended to `docker run`). Because dockerd is started from this
+# ENTRYPOINT rather than CMD, the nested daemon comes up even when the caller
+# overrides CMD (e.g. lium's validator appends the renter's startup command).
+exec "$@"
