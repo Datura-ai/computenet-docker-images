@@ -114,8 +114,13 @@ RUN rm -f /etc/ssh/ssh_host_* && \
     install -m 0755 /tmp/pytorch-files/nvidia-setup.sh /nvidia-setup.sh && \
     install -m 0755 /tmp/pytorch-files/pytorch-entrypoint.sh /pytorch-entrypoint.sh && \
     rm -rf /tmp/computenet-scripts /tmp/pytorch-files && \
-    echo 'cat /etc/computenet.txt' >> /root/.bashrc && \
-    echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
+    # Append the welcome block only if the base image hasn't already added it.
+    # DinD targets build FROM daturaai/dind:* whose Dockerfile already appends
+    # this block, so an unconditional append here would double-print the logo.
+    if ! grep -qF 'cat /etc/computenet.txt' /root/.bashrc 2>/dev/null; then \
+        echo 'cat /etc/computenet.txt' >> /root/.bashrc && \
+        echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc; \
+    fi
 
 # Start dockerd from ENTRYPOINT so the nested daemon survives a CMD override
 # (lium's validator appends the renter's startup command, which replaces CMD).
