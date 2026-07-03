@@ -24,33 +24,78 @@ execute_script() {
 }
 
 # Setup ssh
+#
+# The Lium validator execs its own SSH bootstrap (ssh-keygen -A + sshd start)
+# into the container right after `docker run`, so everything here can race a
+# concurrent writer of /etc/ssh and the sshd daemon (DAH-2341):
+#   - a shared mkdir lock serializes the two writers when both take it
+#   - `ssh-keygen -A` never prompts and skips key types that already exist
+#     (the per-type `ssh-keygen -t -f` it replaces blocked PID 1 on an
+#     "Overwrite (y/n)?" prompt when the other side created the key first)
+#   - an sshd that is already running counts as success, not an error
+# None of this may kill PID 1 (`set -e` is active): if SSH setup fails, the
+# container must stay alive so the validator bootstrap can still repair it.
+SSH_SETUP_LOCK_DIR="/run/lium-ssh-setup.lock"
+SSH_SETUP_LOCK_HELD=0
+
+is_sshd_running() {
+    # ps fallback for images that ship start.sh without procps (no pgrep).
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x sshd >/dev/null 2>&1 && return 0
+    elif ps -ef 2>/dev/null | grep '[s]shd' >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+acquire_ssh_setup_lock() {
+    local i=0
+    while ! mkdir "$SSH_SETUP_LOCK_DIR" 2>/dev/null; do
+        if [ "$i" -ge 120 ]; then
+            echo "SSH setup lock busy for 60s; proceeding without it" >&2
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.5
+    done
+    SSH_SETUP_LOCK_HELD=1
+}
+
+release_ssh_setup_lock() {
+    if [ "$SSH_SETUP_LOCK_HELD" -eq 1 ]; then
+        rmdir "$SSH_SETUP_LOCK_DIR" 2>/dev/null || true
+        SSH_SETUP_LOCK_HELD=0
+    fi
+}
+
 setup_ssh() {
     echo "Setting up SSH..."
 
-    if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
-        ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -q -N ''
-        echo "RSA key fingerprint:"
-        ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub
+    acquire_ssh_setup_lock
+
+    ssh-keygen -A || echo "WARNING: ssh-keygen -A failed" >&2
+    mkdir -p /run/sshd
+
+    if is_sshd_running; then
+        echo "sshd is already running; skipping service start"
+    elif ! service ssh start; then
+        # Lost a start race (port already bound by the validator bootstrap's
+        # sshd) or an init-script hiccup — only a real failure if sshd is
+        # genuinely not up afterwards.
+        if is_sshd_running; then
+            echo "sshd was started concurrently; continuing"
+        else
+            echo "WARNING: failed to start sshd" >&2
+        fi
     fi
 
-    if [ ! -f /etc/ssh/ssh_host_ecdsa_key ]; then
-        ssh-keygen -t ecdsa -f /etc/ssh/ssh_host_ecdsa_key -q -N ''
-        echo "ECDSA key fingerprint:"
-        ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub
-    fi
-
-    if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
-        ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -q -N ''
-        echo "ED25519 key fingerprint:"
-        ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-    fi
-
-    service ssh start
+    release_ssh_setup_lock
 
     echo "SSH host keys:"
     for key in /etc/ssh/*.pub; do
+        [ -f "$key" ] || continue
         echo "Key: $key"
-        ssh-keygen -lf $key
+        ssh-keygen -lf "$key" || true
     done
 }
 
