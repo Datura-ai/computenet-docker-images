@@ -3,12 +3,12 @@ variable "PUBLISHER" {
 }
 
 group "default" {
-    targets = ["no-idle"]
+    targets = ["no-mining"]
 }
 
-target "no-idle" {
+target "no-mining" {
     dockerfile = "Dockerfile"
-    tags = ["${PUBLISHER}/no-idle:1.0.0"]
+    tags = ["${PUBLISHER}/no-mining:1.0.0"]
     args = {
         BASE_IMAGE = "alpine:3.20"
     }
