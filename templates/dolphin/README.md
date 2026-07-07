@@ -28,33 +28,19 @@ the process attached so the container stays alive and `docker stop` ends it clea
 | `DOLPHIN_API_KEY`     | yes      | —                                | `dp-...` key from v2.dphn.ai. Inject as a secret. |
 | `DOLPHIN_MODEL`       | no       | `nvidia/Qwen3.6-35B-A3B-NVFP4`   | Model to serve. |
 | `DOLPHIN_WORKER_TYPE` | no       | `text-v`                         | Worker type. |
-| `DOLPHIN_GPU_IDS`     | no       | (auto-select)                    | Comma-separated GPU indices, e.g. `0,1`. Empty → auto-select a valid slice (see Hardware). |
-| `DOLPHIN_MIN_VRAM_MB` | no       | `71680` (70 GiB)                 | Total VRAM floor the selected GPUs must reach. |
-| `DOLPHIN_UNSUPPORTED_GPUS` | no  | `A100`                           | Comma-separated GPU-name substrings that cannot boot NVFP4; the worker refuses to start on them. |
+| `DOLPHIN_GPU_IDS`     | no       | (empty → `null`)                 | Comma-separated GPU indices, e.g. `0,1`. Empty → `null` → the worker uses all GPUs on the node. |
 | `DOLPHIN_WORKER_URL`  | no*      | —                                | URL to fetch the worker binary when it is not baked into the image. |
 
 \* Required until an official published binary URL / image exists — see below.
 
-## Hardware
+## GPU selection & eligibility
 
-Running the full model needs **70 GB of VRAM** on an NVFP4-capable GPU. When `DOLPHIN_GPU_IDS`
-is not set, the entrypoint auto-selects the **smallest accepted GPU count** whose combined VRAM
-reaches the floor:
+The worker **auto-scales to every GPU on the node** (`gpu_ids: null`), so this image does not
+pick a GPU count. On a Lium executor the filler already gets all the node's free GPUs.
 
-- Accepted counts: **1, 2, 4, 8, 16**. Odd counts (3, 5, …) are rejected by the network; 8+ is
-  not fully efficient (only used when smaller counts cannot reach the floor).
-- Examples: `1× H100 80 GB`, `2× A6000/L40 48 GB`, `4× RTX 3090/4090 24 GB`, `1× RTX 6000 PRO / B200`.
-- If the box cannot reach the floor with an accepted count, the worker refuses to start.
-
-**Architecture gate.** VRAM size alone is not enough — the GPU must support NVFP4. **A100
-(Ampere) cannot boot NVFP4** even though its 80 GB clears the floor, so the worker refuses to
-start on it (skip, not crash-loop). This is enforced independently of `DOLPHIN_GPU_IDS` and is
-configurable via `DOLPHIN_UNSUPPORTED_GPUS`. (Note: the dphn.ai docs list A100 as compatible,
-but the Dolphin team confirmed it will not boot NVFP4 yet.)
-
-> `2× RTX 5090` (2×32 = 64 GB) is below the stated 70 GB floor — with the default
-> `DOLPHIN_MIN_VRAM_MB` that box bumps to 4×. Lower `DOLPHIN_MIN_VRAM_MB` if GLRP confirms the
-> real NVFP4 footprint fits in 64 GB.
+**Which nodes are eligible** — the 70 GB VRAM floor and the A100 exclusion (A100 clears the VRAM
+floor but cannot boot NVFP4) — is decided by the **scheduler**, not this image: see the DPHN
+strategy gate in `lium-io-backend` ([PR #748](https://github.com/Datura-ai/lium-io-backend/pull/748)).
 
 ## Payouts
 
