@@ -3,12 +3,12 @@ variable "PUBLISHER" {
 }
 
 group "default" {
-    targets = ["no-mining"]
+    targets = ["empty-job"]
 }
 
-target "no-mining" {
+target "empty-job" {
     dockerfile = "Dockerfile"
-    tags = ["${PUBLISHER}/no-mining:1.0.0"]
+    tags = ["${PUBLISHER}/empty-job:1.0.0"]
     args = {
         BASE_IMAGE = "alpine:3.20"
     }
