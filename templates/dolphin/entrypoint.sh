@@ -31,12 +31,39 @@ MIN_VRAM_MB="${DOLPHIN_MIN_VRAM_MB:-71680}"
 # The network only accepts these GPU counts; odd counts (3, 5, ...) are rejected and 8+ is
 # not fully efficient. We pick the SMALLEST count that reaches MIN_VRAM_MB.
 ALLOWED_GPU_COUNTS="1 2 4 8 16"
+# GPU models that cannot boot the NVFP4 model yet (comma-separated, case-insensitive substrings
+# matched against nvidia-smi GPU names). A100 is Ampere and will NOT boot nvfp4 per the Dolphin
+# team, even though it clears the 70 GB VRAM floor. Extend as the network adds/removes support.
+UNSUPPORTED_GPUS="${DOLPHIN_UNSUPPORTED_GPUS:-A100}"
 
 require_api_key() {
     if [[ -z "${API_KEY}" ]]; then
         echo "[dolphin] DOLPHIN_API_KEY is required (dp-... key from v2.dphn.ai)." >&2
         exit 1
     fi
+}
+
+# Refuse (don't crash-loop) on GPUs the model can't run — VRAM size is not enough, the arch
+# must support NVFP4. Runs regardless of DOLPHIN_GPU_IDS since it is a hard hardware limit.
+assert_gpus_supported() {
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        return
+    fi
+    local names patterns pattern
+    names="$(nvidia-smi --query-gpu=name --format=csv,noheader)"
+    IFS=',' read -ra patterns <<<"${UNSUPPORTED_GPUS}"
+    while IFS= read -r name; do
+        [[ -z "${name}" ]] && continue
+        for pattern in "${patterns[@]}"; do
+            pattern="$(echo "${pattern}" | xargs)"
+            [[ -z "${pattern}" ]] && continue
+            if grep -qiF -- "${pattern}" <<<"${name}"; then
+                echo "[dolphin] GPU '${name}' is not supported by Dolphin v2 (cannot boot NVFP4);" \
+                     "refusing to start." >&2
+                exit 1
+            fi
+        done
+    done <<<"${names}"
 }
 
 # Pick a valid GPU slice: the smallest allowed count whose combined VRAM reaches the floor.
@@ -121,6 +148,7 @@ ensure_binary() {
 
 main() {
     require_api_key
+    assert_gpus_supported
     select_gpus
     render_config
     ensure_binary
