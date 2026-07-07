@@ -74,7 +74,7 @@ v2.dphn.ai dashboard.
 ```bash
 cd templates/dolphin
 docker buildx bake                     # daturaai/dolphin:0.0.1
-docker buildx bake --set default.args.VERSION=0.0.2
+VERSION=0.0.2 docker buildx bake       # daturaai/dolphin:0.0.2
 ```
 
 ## Run

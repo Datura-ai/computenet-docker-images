@@ -49,21 +49,28 @@ assert_gpus_supported() {
     if ! command -v nvidia-smi >/dev/null 2>&1; then
         return
     fi
-    local names patterns pattern
-    names="$(nvidia-smi --query-gpu=name --format=csv,noheader)"
-    IFS=',' read -ra patterns <<<"${UNSUPPORTED_GPUS}"
+    local gpu_names raw_patterns patterns=() pattern name
+    if ! gpu_names="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"; then
+        echo "[dolphin] could not query GPU names; skipping unsupported-GPU check." >&2
+        return
+    fi
+    # Trim each comma-separated denylist entry once, up front (not per GPU).
+    IFS=',' read -ra raw_patterns <<<"${UNSUPPORTED_GPUS}"
+    for pattern in "${raw_patterns[@]}"; do
+        pattern="$(echo "${pattern}" | xargs)"
+        [[ -n "${pattern}" ]] && patterns+=("${pattern}")
+    done
+
     while IFS= read -r name; do
         [[ -z "${name}" ]] && continue
         for pattern in "${patterns[@]}"; do
-            pattern="$(echo "${pattern}" | xargs)"
-            [[ -z "${pattern}" ]] && continue
             if grep -qiF -- "${pattern}" <<<"${name}"; then
                 echo "[dolphin] GPU '${name}' is not supported by Dolphin v2 (cannot boot NVFP4);" \
                      "refusing to start." >&2
                 exit 1
             fi
         done
-    done <<<"${names}"
+    done <<<"${gpu_names}"
 }
 
 # Pick a valid GPU slice: the smallest allowed count whose combined VRAM reaches the floor.
@@ -80,7 +87,10 @@ select_gpus() {
     fi
 
     local vram_lines
-    vram_lines="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits)"
+    if ! vram_lines="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null)"; then
+        echo "[dolphin] could not query GPU VRAM; leaving gpu_ids=null (worker uses all GPUs)." >&2
+        return
+    fi
     local available_count per_gpu_mb
     available_count="$(grep -c . <<<"${vram_lines}")"
     per_gpu_mb="$(head -n1 <<<"${vram_lines}" | tr -d ' ')"
@@ -90,29 +100,29 @@ select_gpus() {
         exit 1
     fi
 
-    local chosen=""
+    local chosen_gpu_count=""
     for count in ${ALLOWED_GPU_COUNTS}; do
         if [[ "${count}" -le "${available_count}" && $((count * per_gpu_mb)) -ge "${MIN_VRAM_MB}" ]]; then
-            chosen="${count}"
+            chosen_gpu_count="${count}"
             break
         fi
     done
 
-    if [[ -z "${chosen}" ]]; then
+    if [[ -z "${chosen_gpu_count}" ]]; then
         echo "[dolphin] ${available_count} GPU(s) x ${per_gpu_mb}MB cannot reach the ${MIN_VRAM_MB}MB VRAM floor" \
              "with an accepted count (${ALLOWED_GPU_COUNTS// /, }); refusing to start." >&2
         exit 1
     fi
-    if [[ "${chosen}" -ge 8 ]]; then
-        echo "[dolphin] warning: using ${chosen} GPUs; 8+ is not fully efficient." >&2
+    if [[ "${chosen_gpu_count}" -ge 8 ]]; then
+        echo "[dolphin] warning: using ${chosen_gpu_count} GPUs; 8+ is not fully efficient." >&2
     fi
 
-    local ids=()
-    for ((i = 0; i < chosen; i++)); do
-        ids+=("${i}")
+    local gpu_indices=()
+    for ((i = 0; i < chosen_gpu_count; i++)); do
+        gpu_indices+=("${i}")
     done
-    GPU_IDS="$(IFS=,; echo "${ids[*]}")"
-    echo "[dolphin] selected ${chosen} of ${available_count} GPU(s) (${per_gpu_mb}MB each): gpu_ids=${GPU_IDS}."
+    GPU_IDS="$(IFS=,; echo "${gpu_indices[*]}")"
+    echo "[dolphin] selected ${chosen_gpu_count} of ${available_count} GPU(s) (${per_gpu_mb}MB each): gpu_ids=${GPU_IDS}."
 }
 
 render_config() {
