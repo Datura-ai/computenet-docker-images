@@ -16,9 +16,9 @@ MODEL="${DOLPHIN_MODEL:-nvidia/Qwen3.6-35B-A3B-NVFP4}"
 WORKER_TYPE="${DOLPHIN_WORKER_TYPE:-text-v}"
 # Comma-separated GPU indices (e.g. "0,1"); empty -> null -> worker uses all GPUs on the node.
 GPU_IDS="${DOLPHIN_GPU_IDS:-}"
-# URL to fetch the worker binary when it is not baked in. From the per-account install script at
-# v2.dphn.ai; the link expires, so it is passed at runtime, not baked. `update` refreshes it after.
-WORKER_URL="${DOLPHIN_WORKER_URL:-}"
+# Public, stable worker-binary URL (linux/amd64 only — the worker ships no arm64 build). `update`
+# refreshes it after first launch. Override only if Dolphin moves the download.
+WORKER_URL="${DOLPHIN_WORKER_URL:-https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64}"
 
 if [[ -z "${API_KEY}" ]]; then
     echo "[dolphin] DOLPHIN_API_KEY is required (dp-... key from v2.dphn.ai)." >&2
@@ -30,13 +30,18 @@ gpu_ids_json="null"
 if [[ -n "${GPU_IDS}" ]]; then
     gpu_ids_json="$(jq -Rc 'split(",") | map(select(length > 0) | tonumber)' <<<"${GPU_IDS}")"
 fi
+# 0600 up front: worker.json holds the api_key and the worker refuses a config readable beyond its
+# owner ("contains secrets but is accessible beyond its owner").
+config_path="${CONFIG_DIR}/worker.json"
+touch "${config_path}"
+chmod 600 "${config_path}"
 jq -n \
     --arg api "${API_KEY}" \
     --arg model "${MODEL}" \
     --arg worker_type "${WORKER_TYPE}" \
     --argjson gpu_ids "${gpu_ids_json}" \
     '{schema_version: 1, api_key: $api, model: $model, worker_type: $worker_type, gpu_ids: $gpu_ids}' \
-    >"${CONFIG_DIR}/worker.json"
+    >"${config_path}"
 
 if [[ ! -x "${WORKER_BIN}" ]]; then
     if [[ -z "${WORKER_URL}" ]]; then

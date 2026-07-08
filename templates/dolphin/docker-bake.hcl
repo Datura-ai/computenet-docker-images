@@ -9,6 +9,8 @@ variable "BASE_IMAGE" {
 target "default" {
     dockerfile = "Dockerfile"
     tags = ["daturaai/dolphin:${VERSION}"]
+    # amd64 only: the dolphinpod-worker binary ships no arm64 build.
+    platforms = ["linux/amd64"]
     args = {
         BASE_IMAGE = "${BASE_IMAGE}"
     }

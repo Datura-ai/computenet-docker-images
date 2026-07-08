@@ -29,18 +29,27 @@ the process attached so the container stays alive and `docker stop` ends it clea
 | `DOLPHIN_MODEL`       | no       | `nvidia/Qwen3.6-35B-A3B-NVFP4`   | Model to serve. |
 | `DOLPHIN_WORKER_TYPE` | no       | `text-v`                         | Worker type. |
 | `DOLPHIN_GPU_IDS`     | no       | (empty → `null`)                 | Comma-separated GPU indices, e.g. `0,1`. Empty → `null` → the worker uses all GPUs on the node. |
-| `DOLPHIN_WORKER_URL`  | no*      | —                                | URL to fetch the worker binary when it is not baked into the image. |
+| `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 
-\* Required until an official published binary URL / image exists — see below.
+The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
+live), so one key drives the whole fleet. `worker.json` is written `0600`; the worker refuses a
+config with secrets that is readable beyond its owner.
+
+## Architecture
+
+**linux/amd64 only** — the `dolphinpod-worker` binary has no arm64 build, so the image is pinned to
+`linux/amd64`. ARM GPU hosts (NVIDIA Grace, GH200/GB200) can't run it; every current Lium executor
+is x86_64.
 
 ## GPU selection & eligibility
 
 The worker **auto-scales to every GPU on the node** (`gpu_ids: null`), so this image does not
 pick a GPU count. On a Lium executor the filler already gets all the node's free GPUs.
 
-**Which nodes are eligible** — the 70 GB VRAM floor and the A100 exclusion (A100 clears the VRAM
-floor but cannot boot NVFP4) — is decided by the **scheduler**, not this image: see the DPHN
-strategy gate in `lium-io-backend` ([PR #748](https://github.com/Datura-ai/lium-io-backend/pull/748)).
+**Which nodes are eligible** — the 28 GB VRAM floor (the worker self-checks "need 28.0 GB free"; the
+docs' 70 GB is for the full model) and the A100 exclusion (Ampere, can't boot NVFP4) — is decided by
+the **scheduler**, not this image: see the DPHN strategy gate in `lium-io-backend`
+([PR #748](https://github.com/Datura-ai/lium-io-backend/pull/748)).
 
 ## Payouts
 
