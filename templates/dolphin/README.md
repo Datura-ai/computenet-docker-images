@@ -46,8 +46,8 @@ is x86_64.
 The worker **auto-scales to every GPU on the node** (`gpu_ids: null`), so this image does not
 pick a GPU count. On a Lium executor the filler already gets all the node's free GPUs.
 
-**Which nodes are eligible** — the 28 GB VRAM floor (the worker self-checks "need 28.0 GB free"; the
-docs' 70 GB is for the full model) and the A100 exclusion (Ampere, can't boot NVFP4) — is decided by
+**Which nodes are eligible** — the 70 GB VRAM floor (summed across the node's GPUs; Dolphin's stated
+requirement, dphn.ai docs) and the A100 exclusion (Ampere, can't boot NVFP4) — is decided by
 the **scheduler**, not this image: see the DPHN strategy gate in `lium-io-backend`
 ([PR #748](https://github.com/Datura-ai/lium-io-backend/pull/748)).
 
