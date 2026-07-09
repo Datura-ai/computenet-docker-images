@@ -12,8 +12,12 @@ FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
+# build-essential: the worker's vLLM runtime JIT-compiles Triton kernels at first forward pass
+# (Qwen3.6's GDN linear-attention path needs a C toolchain); without gcc the engine dies with
+# "Failed to find C compiler" right after the model loads into VRAM. Verified on H100/CUDA 13.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     curl \
     jq \
