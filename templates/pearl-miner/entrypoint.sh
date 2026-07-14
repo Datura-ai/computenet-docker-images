@@ -18,7 +18,9 @@ fi
 POOL="${PEARL_POOL_HOST}:${PEARL_POOL_PORT}"
 WORKER="${PEARL_POOL_WORKER:-$(hostname)}"
 
-GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
+# `|| true` inside AND outside: nvidia-smi may be absent (no driver) and grep -c exits 1 on zero
+# matches — either would kill the script via errexit/pipefail before the readable error below.
+GPU_COUNT=$( (nvidia-smi -L 2>/dev/null || true) | grep -c . || true)
 if [[ "${GPU_COUNT}" -eq 0 ]]; then
     echo "no NVIDIA GPUs visible" >&2
     exit 1
@@ -38,9 +40,13 @@ for ((i = 0; i < GPU_COUNT; i++)); do
     pids+=($!)
 done
 
-# Exit (and let the platform restart the container) as soon as any miner dies.
-wait -n "${pids[@]}"
-exit_code=$?
+# Exit (and let the platform restart the container) as soon as any miner dies. `wait -n` is called
+# WITHOUT pids (bash 5.1 returns a bogus 0 for an explicit pid that already exited) and with an
+# errexit guard (a plain non-zero `wait -n` would abort the script before the log line and kill).
+exit_code=0
+wait -n || exit_code=$?
 echo "a pearl-miner process exited with code ${exit_code}, shutting down" >&2
 kill "${pids[@]}" 2>/dev/null || true
-exit "${exit_code}"
+# A perpetual miner exiting is a failure even at code 0 (e.g. pool-initiated shutdown) — report
+# non-zero so the platform never mistakes a dead filler for a completed job.
+exit "$(( exit_code == 0 ? 1 : exit_code ))"
