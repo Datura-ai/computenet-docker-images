@@ -10,6 +10,12 @@ start_docker() {
     /nvidia-setup.sh
 
     mkdir -p /var/run /var/lib/docker
+    # This entrypoint is the first process after a container (re)start, so any
+    # pidfile left by a previous run is stale by definition. Without this,
+    # dockerd refuses to start when the recycled PID happens to be alive
+    # ("process with PID N is still running") and the container restart-loops
+    # (DAH-2341).
+    rm -f /var/run/docker.pid
     echo "Starting Docker daemon..."
     dockerd --host=unix:///var/run/docker.sock > /var/log/dockerd.log 2>&1 &
 
