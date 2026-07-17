@@ -114,8 +114,22 @@ RUN rm -f /etc/ssh/ssh_host_* && \
     install -m 0755 /tmp/pytorch-files/nvidia-setup.sh /nvidia-setup.sh && \
     install -m 0755 /tmp/pytorch-files/pytorch-entrypoint.sh /pytorch-entrypoint.sh && \
     rm -rf /tmp/computenet-scripts /tmp/pytorch-files && \
-    echo 'cat /etc/computenet.txt' >> /root/.bashrc && \
-    echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
+    # Lium welcome banner. It MUST live outside /root: lium mounts a volume at
+    # /root for rentals (full-node rentals use a sparse loopback volume), which
+    # shadows the image's /root/.bashrc and hides any banner appended there — so
+    # the logo never prints in a real rental. Install it as an interactive-only
+    # /etc/profile.d script (sourced by login shells, i.e. the renter's ssh
+    # session) and strip the base image's /root/.bashrc copy so it can't
+    # double-print on paths where /root is NOT shadowed (partial rentals, local).
+    sed -i '/cat \/etc\/computenet\.txt/d; /made with .* by Datura/d' /root/.bashrc 2>/dev/null || true; \
+    printf '%s\n' \
+        'case "$-" in' \
+        '  *i*)' \
+        '    [ -r /etc/computenet.txt ] && cat /etc/computenet.txt' \
+        '    printf "\nmade with ❤️  by Datura\n\n" ;;' \
+        'esac' \
+        > /etc/profile.d/zz-lium-welcome.sh && \
+    chmod 0644 /etc/profile.d/zz-lium-welcome.sh
 
 # Start dockerd from ENTRYPOINT so the nested daemon survives a CMD override
 # (lium's validator appends the renter's startup command, which replaces CMD).
