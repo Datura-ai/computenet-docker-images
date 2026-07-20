@@ -29,6 +29,7 @@ RUN apt-get update --yes && \
         build-essential \
         ca-certificates \
         curl \
+        fuse3 \
         git \
         gnupg2 \
         htop \
@@ -62,6 +63,16 @@ RUN apt-get update --yes && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+
+# gocryptfs powers lium encrypted local volumes
+ARG GOCRYPTFS_VERSION=2.6.1
+RUN curl -fsSL \
+        "https://github.com/rfjakob/gocryptfs/releases/download/v${GOCRYPTFS_VERSION}/gocryptfs_v${GOCRYPTFS_VERSION}_linux-static_amd64.tar.gz" \
+        -o /tmp/gocryptfs.tgz && \
+    tar -xzf /tmp/gocryptfs.tgz -C /usr/local/bin gocryptfs && \
+    chmod 0755 /usr/local/bin/gocryptfs && \
+    rm -f /tmp/gocryptfs.tgz && \
+    gocryptfs --version
 
 # Install Docker Engine and NVIDIA runtime support only for DinD-enabled targets
 # that do not already provide Docker.
