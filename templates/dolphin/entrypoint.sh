@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Boot a Dolphin (dphn.ai) v2 inference worker inside a Lium pod: render worker.json from env,
-# ensure the binary is present, then `dolphinpod-worker update && start`.
+# ensure the binary is present, then supervise `dolphinpod-worker update && start` in a restart
+# loop so the worker can self-update while the container keeps running.
 #
 # The worker auto-scales to every GPU on the node (gpu_ids: null), so this image does NOT pick
 # a GPU count. Which nodes are eligible (VRAM floor, supported arch) is the scheduler's job.
@@ -53,6 +54,57 @@ if [[ ! -x "${WORKER_BIN}" ]]; then
     chmod +x "${WORKER_BIN}"
 fi
 
+# How often (seconds) to check WORKER_URL for a newly published binary while the worker runs.
+CHECK_INTERVAL="${DOLPHIN_UPDATE_CHECK_SECONDS:-3600}"
+# Worker liveness is checked this often; the etag poll fires once per CHECK_INTERVAL.
+LIVENESS_INTERVAL=30
+
+published_etag() {
+    curl -fsSI --max-time 30 "${WORKER_URL}" | awk 'tolower($1) == "etag:" {print $2}' | tr -d '\r'
+}
+
+worker_pid=""
+on_term() {
+    if [[ -n "${worker_pid}" ]]; then
+        kill -TERM "${worker_pid}" 2>/dev/null || true
+        wait "${worker_pid}" || true
+    fi
+    exit 0
+}
+trap on_term TERM INT
+
 cd "${DOLPHIN_HOME}"
-"${WORKER_BIN}" update
-exec "${WORKER_BIN}" start
+# Supervisor loop. The worker's own self-update downloads a new binary and then exits expecting an
+# external supervisor to restart it (systemd in Dolphin's reference install); without this loop that
+# exit killed PID 1, so long-lived fillers stayed on their boot version forever (DAH-2457). The etag
+# poll is the fallback for when that self-update path does not fire: a changed etag on WORKER_URL
+# means a new binary was published, so restart the worker through `update`.
+while true; do
+    "${WORKER_BIN}" update || echo "[dolphin] update failed; starting current version" >&2
+    running_etag="$(published_etag || true)"
+    "${WORKER_BIN}" start &
+    worker_pid=$!
+
+    elapsed=0
+    while kill -0 "${worker_pid}" 2>/dev/null; do
+        # sleep in background + wait, so the TERM trap fires immediately instead of after the nap.
+        sleep "${LIVENESS_INTERVAL}" &
+        wait $! || true
+        elapsed=$((elapsed + LIVENESS_INTERVAL))
+        if (( elapsed < CHECK_INTERVAL )); then
+            continue
+        fi
+        elapsed=0
+        latest_etag="$(published_etag || true)"
+        if [[ -n "${latest_etag}" && -n "${running_etag}" && "${latest_etag}" != "${running_etag}" ]]; then
+            echo "[dolphin] new worker binary published; restarting worker to update" >&2
+            kill -TERM "${worker_pid}" 2>/dev/null || true
+            break
+        fi
+    done
+
+    wait "${worker_pid}" || true
+    worker_pid=""
+    echo "[dolphin] worker exited; restarting in 5s" >&2
+    sleep 5
+done
