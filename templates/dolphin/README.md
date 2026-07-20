@@ -16,10 +16,15 @@ a `worker.json` config, so this image runs the worker **directly in the pod**: n
 
 1. Renders `~/.config/dolphinpod/worker.json` from environment variables.
 2. Ensures the `dolphinpod-worker` binary is present (downloads it if missing).
-3. Runs `dolphinpod-worker update && dolphinpod-worker start` in the foreground.
+3. Supervises `dolphinpod-worker update && dolphinpod-worker start` in a restart loop.
 
-`update` self-updates the binary each boot (the network kicks stale binaries); `start` keeps
-the process attached so the container stays alive and `docker stop` ends it cleanly.
+The worker's own self-update exits expecting an external supervisor to restart it (systemd in
+Dolphin's reference install); the loop plays that role, re-running `update` before every start
+so the worker comes back on the freshly published binary. As a fallback, the loop polls the
+download URL's etag every `DOLPHIN_UPDATE_CHECK_SECONDS` (default 3600) and gracefully restarts
+the worker when a new binary appears — so long-lived containers pick up Dolphin rollouts within
+about an hour even if the worker's self-update never fires (DAH-2457). `docker stop` still ends
+the worker cleanly: SIGTERM is forwarded and the container exits.
 
 ## Environment variables
 
@@ -30,6 +35,7 @@ the process attached so the container stays alive and `docker stop` ends it clea
 | `DOLPHIN_WORKER_TYPE` | no       | `text-v`                         | Worker type. |
 | `DOLPHIN_GPU_IDS`     | no       | (empty → `null`)                 | Comma-separated GPU indices, e.g. `0,1`. Empty → `null` → the worker uses all GPUs on the node. |
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
+| `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
 
 The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
 live), so one key drives the whole fleet. `worker.json` is written `0600`; the worker refuses a
@@ -68,8 +74,8 @@ v2.dphn.ai dashboard.
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.1
-VERSION=0.0.2 docker buildx bake       # daturaai/dolphin:0.0.2
+docker buildx bake                     # daturaai/dolphin:0.0.3
+VERSION=0.0.4 docker buildx bake       # override the tag
 ```
 
 ## Run

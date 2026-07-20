@@ -35,7 +35,9 @@ WORKDIR ${DOLPHIN_HOME}
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# entrypoint.sh renders worker.json from env, ensures the binary is present, then runs
-# `dolphinpod-worker update && dolphinpod-worker start` in the foreground (start keeps the
-# process attached so the container stays up and a `docker stop` cleanly ends the worker).
+# entrypoint.sh renders worker.json from env, ensures the binary is present, then supervises
+# `dolphinpod-worker update && dolphinpod-worker start` in a restart loop: when the worker exits
+# for a self-update (or crashes) it is restarted onto the freshly fetched binary, and an etag
+# poll on the download URL forces that restart if the worker's own self-update never fires.
+# `docker stop` still ends the worker cleanly (SIGTERM is forwarded).
 CMD ["/usr/local/bin/entrypoint.sh"]
