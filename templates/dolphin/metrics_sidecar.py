@@ -33,6 +33,9 @@ TOTAL_BUDGET_S = 4.0
 CONNECT_TIMEOUT_S = 1.0
 MAX_BODY_BYTES = 5 * 1024 * 1024
 LOG_INTERVAL_S = 10.0
+# Prometheus text exposition format version — NOT the image version (which also
+# happens to be 0.0.4). Do not bump this when bumping the image tag.
+PROM_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 _last_ok_ts: float = 0.0
 _last_socket: str = ""
@@ -100,7 +103,10 @@ def fetch_vllm_metrics(sockets: list[str]) -> bytes | None:
             _last_socket = path
             _last_error = None
             return body
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:
+            # a stale socket may host a non-HTTP listener, or vllm can die
+            # mid-response (IncompleteRead) — fall through to the next socket;
+            # a crash here would defeat the 200 fail-open the scraper relies on
             _last_error = f"{path}: {e}"
             continue
         finally:
@@ -172,7 +178,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not body.endswith(b"\n"):
                 body += b"\n"
             out = body + sidecar_series(len(sockets), proxy_ok=True)
-        self._reply(200, out, "text/plain; version=0.0.4; charset=utf-8")
+        self._reply(200, out, PROM_CONTENT_TYPE)
 
     def _get_health(self) -> None:
         sockets = discover_sockets()

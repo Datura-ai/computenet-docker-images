@@ -37,9 +37,10 @@ def free_port() -> int:
 
 class _UdsHandler(http.server.BaseHTTPRequestHandler):
     body: bytes = b""
+    status: int = 200
 
     def do_GET(self) -> None:  # noqa: N802
-        self.send_response(200)
+        self.send_response(self.status)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(self.body)))
         self.end_headers()
@@ -57,11 +58,19 @@ class _UdsServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         request, _ = super().get_request()
         return request, ("uds", 0)
 
+    def handle_error(self, request, client_address) -> None:
+        # the sidecar closes a non-200 upstream mid-body; the resulting broken
+        # pipe on our side is expected, not a test failure
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
 
 @contextlib.contextmanager
-def fake_vllm(sock_path: pathlib.Path, body: bytes):
+def fake_vllm(sock_path: pathlib.Path, body: bytes, status: int = 200):
     # minimal HTTP-over-unix-socket server standing in for the vLLM engine
-    handler = type("H", (_UdsHandler,), {"body": body})
+    handler = type("H", (_UdsHandler,), {"body": body, "status": status})
     server = _UdsServer(str(sock_path), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -70,6 +79,39 @@ def fake_vllm(sock_path: pathlib.Path, body: bytes):
     finally:
         server.shutdown()
         server.server_close()
+
+
+@contextlib.contextmanager
+def garbage_uds(sock_path: pathlib.Path):
+    # a listener that speaks non-HTTP, so http.client raises BadStatusLine:
+    # exercises the fetch fall-through that must NOT crash the endpoint
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(8)
+    srv.settimeout(0.2)
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            try:
+                conn.recv(4096)
+                conn.sendall(b"i am not http\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        srv.close()
 
 
 @contextlib.contextmanager
@@ -182,6 +224,29 @@ def test_stale_newest_socket_falls_through() -> None:
     assert body.startswith(FIXTURE), "must fall through the dead newest socket to the live one"
     assert b"dolphin_sidecar_proxy_ok 1\n" in body
     assert b"dolphin_sidecar_sockets_found 2\n" in body
+
+
+def test_upstream_non_200_falls_through_to_sidecar_only() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = pathlib.Path(tmp) / "dp-1" / "v.sock"
+        sock.parent.mkdir()
+        with fake_vllm(sock, FIXTURE, status=500), sidecar(f"{tmp}/dp-*/v.sock", TOKEN) as base:
+            status, body, _ = get(f"{base}/metrics")
+    assert status == 200, status
+    assert b"vllm:" not in body, "a non-200 upstream must be skipped, not passed through"
+    assert b"dolphin_sidecar_proxy_ok 0\n" in body
+    assert b"dolphin_sidecar_sockets_found 1\n" in body
+
+
+def test_non_http_socket_does_not_crash_endpoint() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = pathlib.Path(tmp) / "dp-1" / "v.sock"
+        sock.parent.mkdir()
+        with garbage_uds(sock), sidecar(f"{tmp}/dp-*/v.sock", TOKEN) as base:
+            status, body, _ = get(f"{base}/metrics")
+    assert status == 200, "a non-HTTP listener must fall through, not crash the request"
+    assert b"vllm:" not in body
+    assert b"dolphin_sidecar_proxy_ok 0\n" in body
 
 
 def test_health_endpoint() -> None:
