@@ -90,12 +90,12 @@ plan_worker_gpu_sets() {
     # Spread ALL cards evenly over the workers (bundle sizes differ by at most 1), then verify
     # every bundle really clears the floor — a mixed node that can't is left on the single
     # all-GPUs worker rather than launched broken.
-    local bundles=() base_size=$(( gpu_count / worker_count )) oversized=$(( gpu_count % worker_count ))
+    local bundles=() base_bundle_size=$(( gpu_count / worker_count )) bundles_with_extra_card=$(( gpu_count % worker_count ))
     local cursor=0 w size i bundle bundle_vram
     for (( w = 0; w < worker_count; w++ )); do
-        size=${base_size}
-        if (( w < oversized )); then
-            size=$(( base_size + 1 ))
+        size=${base_bundle_size}
+        if (( w < bundles_with_extra_card )); then
+            size=$(( base_bundle_size + 1 ))
         fi
         bundle=""
         bundle_vram=0
@@ -145,21 +145,27 @@ refresh_binary() {
         || echo "[dolphin] update failed; starting current version" >&2
 }
 
+# Download the worker binary if it isn't present yet; `update` refreshes it later.
+ensure_worker_binary() {
+    if [[ -x "${WORKER_BIN}" ]]; then
+        return
+    fi
+    if [[ -z "${WORKER_URL}" ]]; then
+        echo "[dolphin] dolphinpod-worker not found and DOLPHIN_WORKER_URL is unset." >&2
+        echo "[dolphin] Provide the binary URL from your v2.dphn.ai install script." >&2
+        exit 1
+    fi
+    curl -fsSL "${WORKER_URL}" -o "${WORKER_BIN}"
+    chmod +x "${WORKER_BIN}"
+}
+
 main() {
     if [[ -z "${API_KEY}" ]]; then
         echo "[dolphin] DOLPHIN_API_KEY is required (dp-... key from v2.dphn.ai)." >&2
         exit 1
     fi
 
-    if [[ ! -x "${WORKER_BIN}" ]]; then
-        if [[ -z "${WORKER_URL}" ]]; then
-            echo "[dolphin] dolphinpod-worker not found and DOLPHIN_WORKER_URL is unset." >&2
-            echo "[dolphin] Provide the binary URL from your v2.dphn.ai install script." >&2
-            exit 1
-        fi
-        curl -fsSL "${WORKER_URL}" -o "${WORKER_BIN}"
-        chmod +x "${WORKER_BIN}"
-    fi
+    ensure_worker_binary
     touch "${DOLPHIN_HOME}/.update.lock"
 
     local gpu_sets=() gpu_set_line
@@ -189,7 +195,7 @@ main() {
     echo "[dolphin] spawning ${instance_count} worker(s): $(printf '[%s] ' "${gpu_sets[@]}")" >&2
 
     local worker_pids=()
-    on_term() {
+    terminate_workers() {
         local pid
         for pid in "${worker_pids[@]}"; do
             [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
@@ -197,6 +203,9 @@ main() {
         for pid in "${worker_pids[@]}"; do
             [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
         done
+    }
+    on_term() {
+        terminate_workers
         exit 0
     }
     trap on_term TERM INT
@@ -234,6 +243,10 @@ main() {
                     echo "[dolphin] worker [${gpu_sets[$i]}] exited; restarting" >&2
                     refresh_binary
                     spawn_instance "${i}"
+                    # A worker exits to self-update onto a freshly published binary; refresh_binary
+                    # just pulled it, so re-baseline the etag — otherwise the poll below still sees
+                    # the old baseline and forces a redundant full restart of every worker.
+                    running_etag="$(published_etag || true)"
                 fi
             done
             elapsed=$((elapsed + LIVENESS_INTERVAL))
@@ -251,12 +264,7 @@ main() {
         done
 
         if (( restart_all )); then
-            for i in "${!worker_pids[@]}"; do
-                kill -TERM "${worker_pids[$i]}" 2>/dev/null || true
-            done
-            for i in "${!worker_pids[@]}"; do
-                wait "${worker_pids[$i]}" 2>/dev/null || true
-            done
+            terminate_workers
             echo "[dolphin] workers stopped for update; restarting in 5s" >&2
             sleep 5
         fi
