@@ -74,6 +74,9 @@ RUN curl -fsSL \
     rm -f /tmp/gocryptfs.tgz && \
     gocryptfs --version
 
+# label that enables encrypted volume provisioning in lium
+LABEL lium.volume_encryption.enable="1"
+
 # Install Docker Engine and NVIDIA runtime support only for DinD-enabled targets
 # that do not already provide Docker.
 RUN if [[ "${ENABLE_DIND}" == "true" ]] && ! command -v docker >/dev/null 2>&1; then \
