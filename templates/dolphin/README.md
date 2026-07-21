@@ -36,6 +36,7 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_GPU_IDS`     | no       | (empty → `null`)                 | Comma-separated GPU indices, e.g. `0,1`. Empty → `null` → the worker uses all GPUs on the node. |
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
+| `METRICS_TOKEN`       | no       | —                                | Bearer token for the metrics sidecar on `:9101`. Unset → the sidecar answers 503 to everything (fail closed). |
 
 The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
 live), so one key drives the whole fleet. `worker.json` is written `0600`; the worker refuses a
@@ -70,12 +71,30 @@ v2.dphn.ai dashboard.
 > published (the config format may still change). Tracked in DAH-1958; strategy wiring in
 > DAH-2302.
 
+## Metrics sidecar (DAH-2468)
+
+`metrics_sidecar.py` (stdlib python, supervised by `entrypoint.sh` in its own
+restart loop) proxies the vLLM engine's unix-socket `/metrics` onto `:9101` so
+the platform's published-port machinery can expose per-machine token counters
+to the lium-stats scraper. Verbatim Prometheus pass-through plus appended
+`dolphin_sidecar_*` series (`dolphin_sidecar_proxy_ok` tells a dead engine
+apart from a schema change). Auth: `Authorization: Bearer $METRICS_TOKEN`,
+fail-closed. The engine being down does NOT fail the endpoint — it answers 200
+with sidecar series only, which is exactly the scraper's liveness signal.
+
+Tests (no GPU needed):
+
+```bash
+python3 tests/test_sidecar.py            # host run against the repo copy
+tests/run_in_image.sh daturaai/dolphin:0.0.4   # same tests inside the image + docker-stop cleanliness
+```
+
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.3
-VERSION=0.0.4 docker buildx bake       # override the tag
+docker buildx bake                     # daturaai/dolphin:0.0.4
+VERSION=0.0.5 docker buildx bake       # override the tag
 ```
 
 ## Run
