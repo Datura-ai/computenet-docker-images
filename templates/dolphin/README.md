@@ -14,9 +14,10 @@ a `worker.json` config, so this image runs the worker **directly in the pod**: n
 
 `entrypoint.sh`:
 
-1. Plans how many workers to run: **one worker per GPU** when the node has 2+ GPUs and every
-   card individually clears the model's VRAM floor (`DOLPHIN_SPLIT_MIN_VRAM_MB`, default 70 GB);
-   otherwise a single worker over all GPUs (DAH-2465, see below).
+1. Plans how many workers to run: **one worker per minimal VRAM bundle** — the smallest card
+   group clearing the model's VRAM floor (`DOLPHIN_SPLIT_MIN_VRAM_MB`, default 70 GB): 96 GB
+   cards → per GPU, 48 GB cards → per pair, 32 GB → per triple+. Nodes that can't form 2+
+   bundles keep the single all-GPUs worker (DAH-2465, see below).
 2. Renders one `worker.json` per worker from environment variables (per-worker `HOME` isolates
    the configs; model/runtime caches stay shared so weights live once on the volume).
 3. Ensures the `dolphinpod-worker` binary is present (downloads it if missing).
@@ -41,8 +42,8 @@ the workers cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_GPU_IDS`     | no       | (empty → auto)                   | Comma-separated GPU indices, e.g. `0,1`. When set, exactly ONE worker runs pinned to these GPUs (disables the per-GPU split). Empty → auto: split per GPU when eligible, else one worker over all GPUs. |
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
-| `DOLPHIN_WORKER_PER_GPU` | no    | `1`                              | `1` → spawn one worker per GPU on eligible multi-GPU nodes. Anything else → always a single worker over all GPUs (pre-0.0.4 behavior). |
-| `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                          | Per-GPU VRAM floor (MB) for the split: every card must individually fit the model (70 GB, dphn.ai docs), otherwise the node keeps the single all-GPUs worker. |
+| `DOLPHIN_WORKER_PER_GPU` | no    | `1`                              | `1` → spawn one worker per VRAM bundle on eligible multi-GPU nodes. Anything else → always a single worker over all GPUs (pre-0.0.4 behavior). |
+| `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                          | Per-WORKER VRAM floor (MB): each worker gets the smallest card group whose summed VRAM clears the model requirement (70 GB, dphn.ai docs). Nodes that can't form 2+ such bundles keep the single all-GPUs worker. |
 | `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                        | Delay between initial worker spawns so the first instance warms the shared model cache. |
 
 The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
@@ -61,9 +62,10 @@ Left alone, a single worker **auto-scales to every GPU on the node** (`gpu_ids: 
 tensor-sharding the model — and wastes most of the VRAM on big multi-GPU boxes: measured on prod,
 an 8x RTX PRO 6000 single worker reports 317 slots at ~13% VRAM per GPU, while a 1x worker
 reports 72 slots at ~70% VRAM (DAH-2465). Since 0.0.4 the entrypoint therefore spawns **one
-worker per GPU** whenever the node has 2+ GPUs and each card individually clears
-`DOLPHIN_SPLIT_MIN_VRAM_MB`; nodes whose cards can't fit the model alone (L40S, RTX 5090, ...)
-keep the single all-GPUs worker.
+worker per minimal VRAM bundle**: 96 GB cards get one worker per GPU (8x PRO 6000 → 8 workers),
+48 GB cards one per pair (8x L40S → 4 workers), 32 GB cards one per triple+ (8x RTX 5090 → 2
+workers x4). Cards are spread evenly so none sits idle; nodes that can't form 2+ bundles keep
+the single all-GPUs worker.
 
 **Which nodes are eligible at all** — the 70 GB VRAM floor (summed across the node's GPUs; Dolphin's stated
 requirement, dphn.ai docs) and the A100 exclusion (Ampere, can't boot NVFP4) — is decided by

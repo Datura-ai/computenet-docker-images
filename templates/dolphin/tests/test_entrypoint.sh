@@ -68,7 +68,19 @@ test_plan() {
     assert_eq "single GPU keeps all-GPUs worker" "all" "$(plan_as_line)"
 
     mock_nvidia_smi "0:32607" "1:32607" "2:32607" "3:32607" "4:32607" "5:32607" "6:32607" "7:32607"
-    assert_eq "8x32GB (below floor) keeps all-GPUs worker" "all" "$(plan_as_line)"
+    assert_eq "8x32GB (5090) bundles into 2 workers x4 GPUs" "0,1,2,3|4,5,6,7" "$(plan_as_line)"
+
+    mock_nvidia_smi "0:46068" "1:46068" "2:46068" "3:46068" "4:46068" "5:46068" "6:46068" "7:46068"
+    assert_eq "8x48GB (L40S) bundles into 4 workers x2 GPUs" "0,1|2,3|4,5|6,7" "$(plan_as_line)"
+
+    mock_nvidia_smi "0:46068" "1:46068" "2:46068" "3:46068"
+    assert_eq "4x48GB bundles into 2 workers x2 GPUs" "0,1|2,3" "$(plan_as_line)"
+
+    mock_nvidia_smi "0:46068" "1:46068"
+    assert_eq "2x48GB (one bundle = whole node) keeps all-GPUs worker" "all" "$(plan_as_line)"
+
+    mock_nvidia_smi "0:32607" "1:32607" "2:32607"
+    assert_eq "3x32GB (one bundle = whole node) keeps all-GPUs worker" "all" "$(plan_as_line)"
 
     mock_nvidia_smi "0:81559" "1:81559"
     assert_eq "2xH100 splits per GPU" "0|1" "$(plan_as_line)"

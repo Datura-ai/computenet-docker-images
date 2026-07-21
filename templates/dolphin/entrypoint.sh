@@ -4,11 +4,12 @@
 # ensure the binary is present, then supervise `dolphinpod-worker update && start` in a restart
 # loop so the worker can self-update while the container keeps running.
 #
-# DAH-2465: on multi-GPU nodes whose EVERY card individually fits the model (VRAM floor), one
-# worker is spawned PER GPU instead of one tensor-sharded worker over all of them. Measured on
+# DAH-2465: on multi-GPU nodes one worker is spawned per minimal VRAM bundle (the smallest card
+# group that fits the model) instead of one tensor-sharded worker over every GPU. Measured on
 # prod: an 8x RTX PRO 6000 single worker reports 317 slots at ~13% VRAM/GPU, while a 1x worker
-# reports 72 slots at ~70% VRAM — per-GPU workers recover the lost concurrency. Nodes whose cards
-# can't fit the model alone (L40S, 5090, ...) keep the single all-GPUs worker.
+# reports 72 slots at ~70% VRAM — more workers recover the lost concurrency. 96 GB cards get a
+# worker per GPU, 48 GB cards one per pair, and so on; nodes that can't form 2+ bundles keep
+# the single all-GPUs worker.
 set -euo pipefail
 
 DOLPHIN_HOME="${DOLPHIN_HOME:-/opt/dolphinpod}"
@@ -37,14 +38,18 @@ detect_gpus() {
 
 # Emit one line per worker to spawn: a comma-separated gpu_ids list, or the literal "all"
 # (worker.json gpu_ids: null -> the worker auto-scales to every GPU on the node).
+#
+# Every worker instance loads the full model, so it needs the VRAM floor ("Running the full
+# model requires 70 GB of VRAM", dphn.ai docs — the same figure the backend gates DPHN nodes
+# on) across ITS cards. The plan gives each worker the smallest card group that clears the
+# floor: 96 GB cards -> one worker per GPU, 48 GB cards -> one per pair, 32 GB -> one per
+# triple-or-more; cards are spread evenly so none sits idle. Fewer than 2 such groups -> the
+# node keeps the single all-GPUs worker (pre-0.0.4 behavior).
 plan_worker_gpu_sets() {
     if [[ -n "${DOLPHIN_GPU_IDS:-}" ]]; then
         echo "${DOLPHIN_GPU_IDS}"
         return
     fi
-    # Per-GPU split knobs, read at call time. A GPU must individually clear the VRAM floor to
-    # host its own worker — the floor is the model requirement ("Running the full model requires
-    # 70 GB of VRAM", dphn.ai docs), the same figure the backend gates DPHN nodes on.
     local worker_per_gpu="${DOLPHIN_WORKER_PER_GPU:-1}"
     local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-71680}"
     if [[ "${worker_per_gpu}" != "1" ]]; then
@@ -59,17 +64,53 @@ plan_worker_gpu_sets() {
         indices+=("${index}")
         vram_values+=("${vram}")
     done < <(detect_gpus)
-    if [[ ${#indices[@]} -lt 2 ]]; then
+    local gpu_count=${#indices[@]}
+    if (( gpu_count < 2 )); then
         echo "all"
         return
     fi
+    # The smallest card decides how many cards one worker needs (Lium nodes are homogeneous;
+    # min is the conservative choice for a mixed node).
+    local min_vram=${vram_values[0]}
     for vram in "${vram_values[@]}"; do
-        if (( vram < split_min_vram_mb )); then
+        if (( vram < min_vram )); then
+            min_vram=${vram}
+        fi
+    done
+    if (( min_vram <= 0 )); then
+        echo "all"
+        return
+    fi
+    local cards_per_worker=$(( (split_min_vram_mb + min_vram - 1) / min_vram ))
+    local worker_count=$(( gpu_count / cards_per_worker ))
+    if (( worker_count < 2 )); then
+        echo "all"
+        return
+    fi
+    # Spread ALL cards evenly over the workers (bundle sizes differ by at most 1), then verify
+    # every bundle really clears the floor — a mixed node that can't is left on the single
+    # all-GPUs worker rather than launched broken.
+    local bundles=() base_size=$(( gpu_count / worker_count )) oversized=$(( gpu_count % worker_count ))
+    local cursor=0 w size i bundle bundle_vram
+    for (( w = 0; w < worker_count; w++ )); do
+        size=${base_size}
+        if (( w < oversized )); then
+            size=$(( base_size + 1 ))
+        fi
+        bundle=""
+        bundle_vram=0
+        for (( i = cursor; i < cursor + size; i++ )); do
+            bundle="${bundle:+${bundle},}${indices[$i]}"
+            bundle_vram=$(( bundle_vram + vram_values[i] ))
+        done
+        if (( bundle_vram < split_min_vram_mb )); then
             echo "all"
             return
         fi
+        bundles+=("${bundle}")
+        cursor=$(( cursor + size ))
     done
-    printf '%s\n' "${indices[@]}"
+    printf '%s\n' "${bundles[@]}"
 }
 
 # Render one worker.json into <config_dir>. gpu_set "all" -> gpu_ids null. 0600 up front:
@@ -139,7 +180,7 @@ main() {
         instance_homes=("${base_home}")
     else
         for i in "${!gpu_sets[@]}"; do
-            instance_homes+=("${base_home}/dolphin-workers/gpu${gpu_sets[$i]}")
+            instance_homes+=("${base_home}/dolphin-workers/gpu${gpu_sets[$i]//,/-}")
         done
     fi
     for i in "${!gpu_sets[@]}"; do
