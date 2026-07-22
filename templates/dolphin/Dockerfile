@@ -15,12 +15,15 @@ ARG DEBIAN_FRONTEND=noninteractive
 # build-essential: the worker's vLLM runtime JIT-compiles Triton kernels at first forward pass
 # (Qwen3.6's GDN linear-attention path needs a C toolchain); without gcc the engine dies with
 # "Failed to find C compiler" right after the model loads into VRAM. Verified on H100/CUDA 13.
+# python3 (FULL package, not python3-minimal): the metrics sidecar needs http.server, which
+# the -minimal stdlib split may not ship.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
     jq \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Expose all host GPUs to the worker (auto-scales when worker.json gpu_ids is null).
@@ -34,6 +37,10 @@ WORKDIR ${DOLPHIN_HOME}
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Metrics sidecar (DAH-2468): proxies vLLM's unix-socket /metrics onto :9101 so the
+# platform's published-port machinery can expose per-machine token counters.
+COPY metrics_sidecar.py ${DOLPHIN_HOME}/metrics_sidecar.py
 
 # entrypoint.sh renders worker.json from env, ensures the binary is present, then supervises
 # `dolphinpod-worker update && dolphinpod-worker start` in a restart loop: when the worker exits

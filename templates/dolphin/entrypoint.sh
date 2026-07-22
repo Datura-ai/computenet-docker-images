@@ -63,8 +63,26 @@ published_etag() {
     curl -fsSI --max-time 30 "${WORKER_URL}" | awk 'tolower($1) == "etag:" {print $2}' | tr -d '\r'
 }
 
+# Metrics sidecar (DAH-2468): proxies vLLM's uds /metrics onto :9101. Own restart loop
+# with backoff so a broken sidecar can neither kill the worker nor spin hot; the worker
+# supervisor below stays untouched. Orphaned python (if the subshell dies first on TERM)
+# is reaped by container teardown when PID 1 exits.
+sidecar_pid=""
+if [[ -f "${DOLPHIN_HOME}/metrics_sidecar.py" ]]; then
+    (
+        while true; do
+            python3 "${DOLPHIN_HOME}/metrics_sidecar.py" || true
+            sleep 5
+        done
+    ) &
+    sidecar_pid=$!
+fi
+
 worker_pid=""
 on_term() {
+    if [[ -n "${sidecar_pid}" ]]; then
+        kill -TERM "${sidecar_pid}" 2>/dev/null || true
+    fi
     if [[ -n "${worker_pid}" ]]; then
         kill -TERM "${worker_pid}" 2>/dev/null || true
         wait "${worker_pid}" || true
