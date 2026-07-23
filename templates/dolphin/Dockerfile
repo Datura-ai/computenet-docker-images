@@ -2,8 +2,12 @@
 #
 # v2 is a single self-updating binary + worker.json config (the model runtime is pulled
 # by the binary at start), so — unlike the deprecated v1 image — this image runs the
-# worker DIRECTLY in the pod. No nested Docker: the sysbox runtime used by Lium executors
-# blocks the DinD GPU container that the v1 bootstrap needed, which is why v1 could not run.
+# worker DIRECTLY in the pod, with no nested Docker to bootstrap.
+#
+# (An earlier version of this comment claimed sysbox blocks nested GPU containers. Measured
+# false on 2026-07-23: under `--runtime=sysbox-runc --gpus all`, an inner `docker run --gpus
+# all ... nvidia-smi` works, and nesting costs dolphin nothing. Whatever stopped v1, it was
+# not that. Running directly is simply the simpler shape, not a workaround.)
 #
 # CUDA 12.8 runtime base so Blackwell (NVFP4) drivers are available; the worker still pulls
 # its own model runtime on top. Override BASE_IMAGE for older CUDA if needed.

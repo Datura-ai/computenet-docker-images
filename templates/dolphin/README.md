@@ -14,9 +14,11 @@ a `worker.json` config, so this image runs the worker **directly in the pod**: n
 
 `entrypoint.sh`:
 
-1. Renders `~/.config/dolphinpod/worker.json` from environment variables.
-2. Ensures the `dolphinpod-worker` binary is present (downloads it if missing).
-3. Supervises `dolphinpod-worker update && dolphinpod-worker start` in a restart loop.
+1. Plans how many worker instances the node should run (see **Worker split** below).
+2. Renders one `worker.json` per instance from environment variables.
+3. Ensures the `dolphinpod-worker` binary is present (downloads it if missing).
+4. Supervises `dolphinpod-worker update && dolphinpod-worker start` for every instance, each
+   restartable on its own.
 
 Two side processes get their own restart loops next to it, so neither can take the worker
 down with it: the metrics sidecar and the engine watchdog (both below).
@@ -55,10 +57,46 @@ config with secrets that is readable beyond its owner.
 `linux/amd64`. ARM GPU hosts (NVIDIA Grace, GH200/GB200) can't run it; every current Lium executor
 is x86_64.
 
+## Worker split (DAH-2465)
+
+On a multi-GPU node the entrypoint runs **one worker per minimal VRAM bundle** instead of one
+worker tensor-sharded over every card.
+
+Every worker instance loads the **full** model, so sharding one worker across many cards spends
+VRAM on duplicate weights that would otherwise be KV cache — and slots (the concurrent batch
+Dolphin pays for) scale with KV cache. Measured on prod: an 8x RTX PRO 6000 single worker
+reports 317 slots at ~13% VRAM per GPU, while a 1x worker on the same card reports 72 slots at
+~70%. More workers recover the lost concurrency.
+
+The plan gives each worker the smallest card group that clears the 70 GB floor:
+
+| node | bundles | workers |
+|---|---|---|
+| 8x 96 GB (RTX PRO 6000) | one card each | 8 |
+| 8x 48 GB (L40S) | pairs | 4 |
+| 8x 32 GB (RTX 5090) | quads | 2 |
+| 2x 48 GB | one bundle = whole node | 1 (all-GPUs worker) |
+| 1 GPU, mixed VRAM below the floor, or `nvidia-smi` failure | — | 1 (all-GPUs worker) |
+
+Escape hatches: `DOLPHIN_GPU_IDS` (explicit pinning) and `DOLPHIN_WORKER_PER_GPU=0` both force
+the single all-GPUs worker, which is the exact pre-split behavior.
+
+What running N instances in one container costs, and how each cost is paid:
+
+| cost | how it is handled |
+|---|---|
+| configs collide | per-instance `HOME`, so each worker reads its own `worker.json` |
+| N copies of the ~35 GB model + runtime | each instance's `HOME/.cache` is a **symlink** to the shared cache. The closed worker binary scrubs its child's environment, so `HF_HOME`/`XDG_CACHE_HOME` alone cannot be relied on — a path that resolves to one directory can. |
+| siblings corrupt the shared binary | every write to `DOLPHIN_HOME` goes through `flock`, staged to a temp file and renamed atomically (DAH-2475) |
+| cold start stampede | initial spawns are staggered `DOLPHIN_SPLIT_STAGGER_SECONDS` (default 30) apart, so the first instance warms the shared cache before its siblings hit the same downloads |
+| metrics undercount | the sidecar scrapes **every** engine socket and tags each with its own `dolphin_engine` label (see below) |
+| one wedge kills all | the engine watchdog stays **off** when more than one instance runs — it cannot yet target a single engine (see below) |
+
 ## GPU selection & eligibility
 
-The worker **auto-scales to every GPU on the node** (`gpu_ids: null`), so this image does not
-pick a GPU count. On a Lium executor the filler already gets all the node's free GPUs.
+Within a bundle the worker auto-scales to the cards it was given; with a single bundle it takes
+every GPU on the node (`gpu_ids: null`). On a Lium executor the filler already gets all the
+node's free GPUs.
 
 **Which nodes are eligible** — the 70 GB VRAM floor (summed across the node's GPUs; Dolphin's stated
 requirement, dphn.ai docs) and the A100 exclusion (Ampere, can't boot NVFP4) — is decided by

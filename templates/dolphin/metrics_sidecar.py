@@ -9,6 +9,15 @@ Design constraints (DAH-2468):
   plus appended dolphin_sidecar_* series. vLLM down still answers 200 with
   the sidecar series only, so the scraper can tell "worker dead" from
   "sidecar dead" from "machine dead".
+
+Multi-engine (DAH-2465): one container may run N worker instances, one per GPU
+bundle, so N vLLM engines answer on N unix sockets. Every engine is scraped and
+all bodies are concatenated, each series tagged with the engine's own
+`dolphin_engine` label. That label is what keeps N engines from collapsing into
+one label set — the lium-stats ETL sums its counters ACROSS label sets
+(DESIGN.md 244-249), so tagging is all that is needed for the machine total to
+stay correct with no ETL change. Picking one engine (the pre-DAH-2465 "first
+good response wins") would have silently published 1/N of the tokens.
 - Fail closed: without METRICS_TOKEN every request gets 503 — this port is
   published to the internet, never serve it unauthenticated.
 - Total upstream budget per request stays under the scraper's client timeout
@@ -36,8 +45,16 @@ WATCHDOG_STATE_PATH = os.environ.get(
     "DOLPHIN_WATCHDOG_STATE",
     os.path.join(os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state.json"),
 )
-SIDECAR_VERSION = 1
-TOTAL_BUDGET_S = 4.0
+# How many engines the entrypoint spawned. Exported so a missing engine reads as a gap
+# (up < expected) instead of as a smaller token number that looks like a quiet machine.
+# 0 means "unknown" — the single-worker image does not set it.
+ENGINES_EXPECTED = int(os.environ.get("DOLPHIN_ENGINES_EXPECTED", "0") or "0")
+SIDECAR_VERSION = 2
+# One deadline covers ALL engines, so a fixed 4 s silently drops the tail once a node runs many
+# of them: 8 engines x a slow /metrics would exhaust it and the last engines would vanish from
+# the body — the very undercount this fan-out exists to prevent. Grow with the engine count but
+# stay under the scraper's 8 s client timeout.
+TOTAL_BUDGET_S = min(4.0 + 0.4 * max(0, ENGINES_EXPECTED - 1), 7.0)
 CONNECT_TIMEOUT_S = 1.0
 MAX_BODY_BYTES = 5 * 1024 * 1024
 LOG_INTERVAL_S = 10.0
@@ -125,16 +142,183 @@ def fetch_vllm_metrics(sockets: list[str]) -> bytes | None:
     return None
 
 
-def sidecar_series(sockets_found: int, proxy_ok: bool) -> bytes:
+def engine_id(socket_path: str) -> str:
+    # /tmp/dp-4f2a/v.sock -> "dp-4f2a". The worker names the directory, so this is stable for
+    # the life of an engine and changes when it respawns — which is the honest behavior: a
+    # respawned engine has fresh counters and must not be summed onto the old label set.
+    name = os.path.basename(os.path.dirname(socket_path))
+    return name or socket_path
+
+
+def _label_insert_at(line: bytes) -> tuple[int, bytes]:
+    # Where to splice a label into one exposition line, and what separator it needs.
+    # `name{a="1"} 5` -> insert before the closing brace with a comma;
+    # `name 5`        -> insert after the name with braces.
+    end = 0
+    while end < len(line) and line[end] not in b"{ \t":
+        end += 1
+    if end >= len(line) or line[end] != ord("{"):
+        return end, b""
+    # Scan for the brace that closes the label set. Label values are quoted and may themselves
+    # contain braces or escaped quotes, so a plain rfind/index would cut in the wrong place.
+    i = end + 1
+    in_quotes = False
+    while i < len(line):
+        char = line[i]
+        if in_quotes:
+            if char == ord("\\"):
+                i += 2
+                continue
+            if char == ord('"'):
+                in_quotes = False
+        elif char == ord('"'):
+            in_quotes = True
+        elif char == ord("}"):
+            return i, b","
+        i += 1
+    return -1, b""  # malformed line: no closing brace
+
+
+def tag_series(body: bytes, engine: str) -> bytes:
+    # Add dolphin_engine="<engine>" to every sample line. Comments are dropped — the caller
+    # emits one deduplicated set for the whole response, since HELP/TYPE are per metric name
+    # and repeating them once per engine would make the exposition invalid.
+    label = b'dolphin_engine="' + engine.encode() + b'"'
+    out: list[bytes] = []
+    for line in body.split(b"\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            continue
+        position, separator = _label_insert_at(stripped)
+        if position < 0:
+            continue  # unparseable line: better dropped than emitted corrupt
+        if separator:
+            out.append(stripped[:position] + separator + label + stripped[position:])
+        else:
+            out.append(stripped[:position] + b"{" + label + b"}" + stripped[position:])
+    return b"\n".join(out) + b"\n" if out else b""
+
+
+def comment_lines(body: bytes) -> list[bytes]:
+    return [line.strip() for line in body.split(b"\n") if line.strip().startswith(b"#")]
+
+
+def _comment_family(comment: bytes) -> bytes:
+    # "# TYPE vllm:foo histogram" -> b"vllm:foo"; anything unexpected -> b""
+    parts = comment.split()
+    return parts[2] if len(parts) >= 3 and parts[1] in (b"HELP", b"TYPE") else b""
+
+
+def _metric_name(line: bytes) -> bytes:
+    end = 0
+    while end < len(line) and line[end] not in b"{ \t":
+        end += 1
+    return line[:end]
+
+
+def _family_of(name: bytes, families: set[bytes]) -> bytes:
+    # A histogram's samples are named <family>_bucket/_sum/_count, so the sample name alone
+    # would split one family into three. Map back onto a declared family when one matches.
+    if name in families:
+        return name
+    for suffix in (b"_bucket", b"_sum", b"_count", b"_created", b"_total"):
+        if name.endswith(suffix) and name[: -len(suffix)] in families:
+            return name[: -len(suffix)]
+    return name
+
+
+def merge_engine_bodies(engines: list[tuple[str, bytes]]) -> bytes:
+    # Concatenating whole bodies would interleave metric families, which makes the exposition
+    # invalid. Tag each engine's samples, then regroup so every family's HELP/TYPE and all of
+    # its samples (from every engine) stay contiguous.
+    comments: dict[bytes, list[bytes]] = {}
+    samples: dict[bytes, list[bytes]] = {}
+    order: list[bytes] = []
+    tagged_bodies: list[bytes] = []
+
+    for path, body in engines:
+        tagged_bodies.append(tag_series(body, engine_id(path)))
+        for comment in comment_lines(body):
+            family = _comment_family(comment)
+            if not family:
+                continue
+            bucket = comments.setdefault(family, [])
+            if comment not in bucket:
+                bucket.append(comment)
+
+    declared = set(comments)
+    for tagged in tagged_bodies:
+        for line in tagged.split(b"\n"):
+            if not line:
+                continue
+            family = _family_of(_metric_name(line), declared)
+            if family not in samples:
+                order.append(family)
+                samples[family] = []
+            samples[family].append(line)
+
+    out: list[bytes] = []
+    for family in order:
+        out.extend(comments.get(family, []))
+        out.extend(samples[family])
+    return b"\n".join(out) + b"\n" if out else b""
+
+
+def fetch_all_engines(sockets: list[str]) -> list[tuple[str, bytes]]:
+    # Every engine within ONE shared deadline, so N engines cannot stretch the response past
+    # the scraper's timeout. Engines that do not answer are simply absent from the result and
+    # show up as up < expected. Stale socket files fail to connect and drop out the same way.
+    global _last_ok_ts, _last_socket, _last_error
+    results: list[tuple[str, bytes]] = []
+    deadline = time.monotonic() + TOTAL_BUDGET_S
+    for path in sockets:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _last_error = "budget exhausted"
+            break
+        conn = UdsHTTPConnection(path, timeout=min(CONNECT_TIMEOUT_S, remaining))
+        try:
+            conn.connect()
+            conn.sock.settimeout(max(0.1, deadline - time.monotonic()))
+            conn.request("GET", "/metrics")
+            resp = conn.getresponse()
+            if resp.status != 200:
+                _last_error = f"{path}: HTTP {resp.status}"
+                continue
+            body = resp.read(MAX_BODY_BYTES + 1)
+            if len(body) > MAX_BODY_BYTES:
+                _last_error = f"{path}: body over {MAX_BODY_BYTES} bytes"
+                continue
+            _last_ok_ts = time.time()
+            _last_socket = path
+            _last_error = None
+            results.append((path, body))
+        except (OSError, http.client.HTTPException) as e:
+            _last_error = f"{path}: {e}"
+            continue
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return results
+
+
+def sidecar_series(sockets_found: int, proxy_ok: bool, engines_up: int = 0) -> bytes:
     # proxy_ok is THE engine-liveness discriminator for the scraper: stale
     # socket files can exist while the engine is dead, so sockets_found alone
     # cannot distinguish "vllm down" from "vllm schema changed".
+    # engines_up vs engines_expected is the multi-worker equivalent: with N engines behind one
+    # port, a dead engine only makes the token total smaller, which is indistinguishable from a
+    # quiet machine. The pair makes the gap explicit. expected 0 = single-worker image.
     return (
         f"dolphin_sidecar_up 1\n"
         f"dolphin_sidecar_proxy_ok {int(proxy_ok)}\n"
         f"dolphin_sidecar_sockets_found {sockets_found}\n"
         f"dolphin_sidecar_last_proxy_ok_timestamp {int(_last_ok_ts)}\n"
         f"dolphin_sidecar_version {SIDECAR_VERSION}\n"
+        f"dolphin_engines_up {engines_up}\n"
+        f"dolphin_engines_expected {ENGINES_EXPECTED}\n"
     ).encode()
 
 
@@ -194,17 +378,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._reply(405, b"method not allowed\n", "text/plain")
 
     def _get_metrics(self) -> None:
-        # verbatim vllm body (if any engine answers) + appended sidecar series
+        # every engine's body (tagged + regrouped when there is more than one) + sidecar series
         sockets = discover_sockets()
-        body = fetch_vllm_metrics(sockets)
-        if body is None:
-            out = sidecar_series(len(sockets), proxy_ok=False)
+        engines = fetch_all_engines(sockets)
+        if not engines:
+            body = b""
             if sockets:
                 _log(f"no responsive vllm socket ({len(sockets)} candidates): {_last_error}")
-        else:
+        elif len(engines) == 1:
+            # Single-worker path stays byte-identical to the pre-DAH-2465 contract: the whole
+            # fleet runs this today, and a label added here would change every shipped series
+            # for no gain. Tagging starts where it is actually needed — at two engines.
+            body = engines[0][1]
             if not body.endswith(b"\n"):
                 body += b"\n"
-            out = body + sidecar_series(len(sockets), proxy_ok=True)
+        else:
+            body = merge_engine_bodies(engines)
+        if ENGINES_EXPECTED and len(engines) < ENGINES_EXPECTED:
+            _log(f"only {len(engines)}/{ENGINES_EXPECTED} engines answered: {_last_error}")
+        out = body + sidecar_series(len(sockets), proxy_ok=bool(engines), engines_up=len(engines))
         self._reply(200, out + watchdog_series(), PROM_CONTENT_TYPE)
 
     def _get_health(self) -> None:
