@@ -279,10 +279,58 @@ EOF
         "$(grep watchdog "${log}" 2>/dev/null | head -1)"
 }
 
+# ------------------------------------------- per-engine watchdog hook (off by default)
+test_per_engine_watchdog_hook() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}"
+    mock_nvidia_smi "0:97887" "1:97887"
+    cat >"${SANDBOX}/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/curl"
+    touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
+    cat >"${SANDBOX}/bin/python3" <<EOF
+#!/usr/bin/env bash
+echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
+exec sleep 300
+EOF
+    chmod +x "${SANDBOX}/bin/python3"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "start" ]]; then
+    mkdir -p "${SANDBOX}/dp-\$\$" && touch "${SANDBOX}/dp-\$\$/v.sock"
+    exec sleep 300
+fi
+exit 0
+EOF
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+
+    # The flag is what the watchdog task flips once it can target a single engine; until then
+    # the default path (tested above) runs none. Each instance must get its own GPU set AND its
+    # own state file, since one file cannot describe N engines.
+    DOLPHIN_API_KEY="dp-test" DOLPHIN_SPLIT_STAGGER_SECONDS=0 DOLPHIN_WATCHDOG_MULTI_ENGINE=1 \
+        METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock" bash "${ENTRYPOINT}" >/dev/null 2>&1 &
+    local entry_pid=$!
+    local waited=0
+    while [[ "$(grep -c watchdog "${SANDBOX}/python.log" 2>/dev/null || echo 0)" -lt 2 ]] && (( waited < 25 )); do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    kill -TERM "${entry_pid}" 2>/dev/null
+    wait "${entry_pid}" 2>/dev/null
+
+    assert_eq "one watchdog per bundle, each told its cards" "watchdog.py gpus=0 state=watchdog_state_gpu0.json
+watchdog.py gpus=1 state=watchdog_state_gpu1.json" \
+        "$(grep watchdog "${SANDBOX}/python.log" 2>/dev/null | sort)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
 test_wait_for_cache_seed
+test_per_engine_watchdog_hook
 test_split_sidecar_and_watchdog_wiring
 test_spawn_smoke
 

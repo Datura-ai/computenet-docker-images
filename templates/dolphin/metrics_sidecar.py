@@ -395,7 +395,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             body = merge_engine_bodies(engines)
         if ENGINES_EXPECTED and len(engines) < ENGINES_EXPECTED:
-            _log(f"only {len(engines)}/{ENGINES_EXPECTED} engines answered: {_last_error}")
+            # No error is the normal transient right after a restart: the engine's socket does
+            # not exist yet, so there was nothing to fail. Saying "None" there reads like a bug
+            # to whoever is looking at this during an incident.
+            reason = f": {_last_error}" if _last_error else " (no error — engine not up yet)"
+            _log(f"only {len(engines)}/{ENGINES_EXPECTED} engines answered{reason}")
         out = body + sidecar_series(len(sockets), proxy_ok=bool(engines), engines_up=len(engines))
         self._reply(200, out + watchdog_series(), PROM_CONTENT_TYPE)
 

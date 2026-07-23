@@ -307,23 +307,46 @@ main() {
         sidecar_pid=$!
     fi
 
-    # Engine watchdog: restarts a vLLM engine that wedged inside a CUDA kernel. It kills every
-    # `vllm serve` it finds in the container, which is correct for one engine and catastrophic
-    # for N — one wedge would take down every bundle. Until it can target a single engine (see
-    # its socket->pid contract), it stays off in multi-instance mode rather than shipping a
-    # blast radius. DOLPHIN_WATCHDOG_ENABLED=0 turns it off everywhere.
-    local watchdog_pid=""
+    # Engine watchdog: restarts a vLLM engine that wedged inside a CUDA kernel (requests in
+    # flight, token counter frozen, GPU pinned at 100% on a third of normal power — observed
+    # live on this image 2026-07-23).
+    #
+    # Today it kills EVERY `vllm serve` it finds in the container, which is right for one engine
+    # and catastrophic for N: one wedge would take down every bundle. So with more than one
+    # instance it stays off rather than ship that blast radius — at the cost of no wedge cure on
+    # exactly the nodes this split targets. That trade is temporary and is the release blocker
+    # tracked in the plan.
+    #
+    # When the watchdog learns to target a single engine, set DOLPHIN_WATCHDOG_MULTI_ENGINE=1:
+    # one watchdog is then started per bundle with DOLPHIN_WATCHDOG_GPU_SET naming its cards.
+    # It can find its own engine from that — the worker runs `vllm serve --uds <socket>` with
+    # CUDA_VISIBLE_DEVICES set per engine, so /proc gives socket <-> pid <-> GPU set (measured).
+    # No change to this file is needed to switch it on.
+    local watchdog_pids=()
     if [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]]; then
-        if (( instance_count > 1 )); then
-            echo "[dolphin] watchdog disabled: ${instance_count} engines, and it cannot yet restart just one" >&2
-        else
+        if (( instance_count == 1 )); then
             (
                 while true; do
                     python3 "${DOLPHIN_HOME}/watchdog.py" || true
                     sleep 5
                 done
             ) &
-            watchdog_pid=$!
+            watchdog_pids=($!)
+        elif [[ "${DOLPHIN_WATCHDOG_MULTI_ENGINE:-0}" == "1" ]]; then
+            for i in "${!gpu_sets[@]}"; do
+                (
+                    while true; do
+                        DOLPHIN_WATCHDOG_GPU_SET="${gpu_sets[$i]}" \
+                        DOLPHIN_WATCHDOG_STATE="${DOLPHIN_HOME}/watchdog_state_gpu${gpu_sets[$i]//,/-}.json" \
+                            python3 "${DOLPHIN_HOME}/watchdog.py" || true
+                        sleep 5
+                    done
+                ) &
+                watchdog_pids+=($!)
+            done
+            echo "[dolphin] ${#watchdog_pids[@]} per-engine watchdog(s) started" >&2
+        else
+            echo "[dolphin] watchdog disabled: ${instance_count} engines, and it cannot yet restart just one" >&2
         fi
     fi
 
@@ -341,9 +364,10 @@ main() {
         if [[ -n "${sidecar_pid}" ]]; then
             kill -TERM "${sidecar_pid}" 2>/dev/null || true
         fi
-        if [[ -n "${watchdog_pid}" ]]; then
-            kill -TERM "${watchdog_pid}" 2>/dev/null || true
-        fi
+        local wpid
+        for wpid in ${watchdog_pids[@]+"${watchdog_pids[@]}"}; do
+            kill -TERM "${wpid}" 2>/dev/null || true
+        done
         terminate_workers
         exit 0
     }
