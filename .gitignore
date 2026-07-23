@@ -1,0 +1,3 @@
+# Running the template test suites imports the shipped modules, which leaves bytecode behind.
+__pycache__/
+*.pyc
