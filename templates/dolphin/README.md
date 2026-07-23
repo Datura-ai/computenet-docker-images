@@ -18,6 +18,9 @@ a `worker.json` config, so this image runs the worker **directly in the pod**: n
 2. Ensures the `dolphinpod-worker` binary is present (downloads it if missing).
 3. Supervises `dolphinpod-worker update && dolphinpod-worker start` in a restart loop.
 
+Two side processes get their own restart loops next to it, so neither can take the worker
+down with it: the metrics sidecar and the engine watchdog (both below).
+
 The worker's own self-update exits expecting an external supervisor to restart it (systemd in
 Dolphin's reference install); the loop plays that role, re-running `update` before every start
 so the worker comes back on the freshly published binary. As a fallback, the loop polls the
@@ -37,6 +40,10 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
 | `METRICS_TOKEN`       | no       | —                                | Bearer token for the metrics sidecar on `:9101`. Unset → the sidecar answers 503 to everything (fail closed). |
+| `DOLPHIN_WATCHDOG_ENABLED` | no  | `1`                              | `0` stops the entrypoint from starting the engine watchdog. |
+| `DOLPHIN_WATCHDOG_STALL_SECONDS` | no | `300`                  | How long the token counter may stand still, with requests in flight, before the engine is restarted. |
+| `DOLPHIN_WATCHDOG_POLL_SECONDS` | no | `60`                    | How often the watchdog reads the engine's counters. |
+| `DOLPHIN_WATCHDOG_GRACE_SECONDS` | no | `300`                  | Quiet period after a restart, while the engine reloads weights. |
 
 The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
 live), so one key drives the whole fleet. `worker.json` is written `0600`; the worker refuses a
@@ -82,19 +89,57 @@ apart from a schema change). Auth: `Authorization: Bearer $METRICS_TOKEN`,
 fail-closed. The engine being down does NOT fail the endpoint — it answers 200
 with sidecar series only, which is exactly the scraper's liveness signal.
 
+## Engine watchdog
+
+`watchdog.py` (stdlib python, its own restart loop in `entrypoint.sh`) restarts a vLLM
+engine that has wedged inside a CUDA kernel. Under load the engine stops making progress
+while everything that normally reads as health still looks fine: the container runs with
+zero restarts, the worker stays connected, vLLM's API answers `/health` in milliseconds,
+and the GPU reports 100% utilization at about a third of its normal power draw — full
+occupancy with no memory traffic is a spinning kernel, not inference. Measured 2026-07-23:
+twelve engines stuck between 1.6 and 23.5 hours, none of them visible to any existing
+check.
+
+The only honest signal is vLLM's own `generation_tokens_total`: it stops moving while
+`num_requests_running` stays above zero. The watchdog polls that over the same unix socket
+the sidecar proxies, and after `DOLPHIN_WATCHDOG_STALL_SECONDS` of no tokens it kills
+`vllm serve` — SIGKILL, because a wedged process ignores SIGTERM — then kills the
+`VLLM::EngineCore` child, which outlived its parent in 12 of 12 production cases while
+holding ~70 GB of VRAM that blocks the respawn. The worker brings the engine back from the
+warm cache and tokens return 2-3 minutes after the kill; the container and its `filler_run`
+row are untouched, so there is no cold start and no launch backoff.
+
+Two cases are deliberately left alone: no socket at all (a cold start legitimately takes
+30-60 minutes, and a restart would only send it back to the beginning) and an empty queue
+(no demand is not a fault).
+
+Restarts reach the platform through the sidecar, which appends the watchdog's state to
+`/metrics`:
+
+| Series | Meaning |
+|---|---|
+| `dolphin_watchdog_up` | `0` when the watchdog stopped ticking — a dead watchdog must not look like a healthy one |
+| `dolphin_watchdog_restarts_total` | Engine restarts since the container started |
+| `dolphin_watchdog_last_restart_timestamp` | Unix time of the last restart |
+| `dolphin_watchdog_stall_seconds` | How long the token counter has been standing still |
+
+The series are absent entirely when no watchdog is running, so zeros never claim a
+watchdog that does not exist.
+
 Tests (no GPU needed):
 
 ```bash
 python3 tests/test_sidecar.py            # host run against the repo copy
-tests/run_in_image.sh daturaai/dolphin:0.0.5   # same tests inside the image + docker-stop cleanliness
+python3 tests/test_watchdog.py           # same; the kill tests need /proc and SKIP on macOS
+tests/run_in_image.sh daturaai/dolphin:0.0.6   # both suites inside the image + docker-stop cleanliness
 ```
 
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.5
-VERSION=0.0.5 docker buildx bake       # override the tag
+docker buildx bake                     # daturaai/dolphin:0.0.6
+VERSION=0.0.7 docker buildx bake       # override the tag
 ```
 
 ## Run

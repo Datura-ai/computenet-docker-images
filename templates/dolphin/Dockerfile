@@ -42,6 +42,11 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # platform's published-port machinery can expose per-machine token counters.
 COPY metrics_sidecar.py ${DOLPHIN_HOME}/metrics_sidecar.py
 
+# Engine watchdog: restarts a vLLM engine that wedged inside a CUDA kernel (token counters
+# frozen while requests are in flight). Imports the sidecar's unix-socket client, so both
+# files must live in the same directory.
+COPY watchdog.py ${DOLPHIN_HOME}/watchdog.py
+
 # entrypoint.sh renders worker.json from env, ensures the binary is present, then supervises
 # `dolphinpod-worker update && dolphinpod-worker start` in a restart loop: when the worker exits
 # for a self-update (or crashes) it is restarted onto the freshly fetched binary, and an etag

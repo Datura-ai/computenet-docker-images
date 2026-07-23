@@ -13,6 +13,9 @@ Design constraints (DAH-2468):
   published to the internet, never serve it unauthenticated.
 - Total upstream budget per request stays under the scraper's client timeout
   even when falling through several stale sockets.
+- Read-only: the sidecar observes and republishes, it never acts on the worker.
+  Acting is watchdog.py's job; this file only exposes the state file it writes
+  as dolphin_watchdog_* series, so the restarts reach the scraper.
 """
 
 import glob
@@ -28,6 +31,11 @@ import time
 PORT = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN = os.environ.get("METRICS_TOKEN", "")
 SOCKET_GLOB = os.environ.get("METRICS_SOCKET_GLOB", "/tmp/dp-*/v.sock")
+# Written every tick by watchdog.py; absent when the watchdog is disabled or not shipped.
+WATCHDOG_STATE_PATH = os.environ.get(
+    "DOLPHIN_WATCHDOG_STATE",
+    os.path.join(os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state.json"),
+)
 SIDECAR_VERSION = 1
 TOTAL_BUDGET_S = 4.0
 CONNECT_TIMEOUT_S = 1.0
@@ -130,6 +138,25 @@ def sidecar_series(sockets_found: int, proxy_ok: bool) -> bytes:
     ).encode()
 
 
+def watchdog_series() -> bytes:
+    # Empty when there is no watchdog at all — better than zeros, which would claim a
+    # healthy watchdog that does not exist. A watchdog that ran and died is a different
+    # story and must be visible, so a stale state file reports up 0 with its last numbers.
+    try:
+        with open(WATCHDOG_STATE_PATH) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return b""
+    poll_s = float(state.get("poll_interval_s") or 60.0)
+    age_s = time.time() - float(state.get("updated") or 0.0)
+    return (
+        f"dolphin_watchdog_up {int(age_s <= 3 * poll_s)}\n"
+        f"dolphin_watchdog_restarts_total {int(state.get('restarts_total') or 0)}\n"
+        f"dolphin_watchdog_last_restart_timestamp {int(state.get('last_restart_timestamp') or 0)}\n"
+        f"dolphin_watchdog_stall_seconds {float(state.get('stall_seconds') or 0.0):.0f}\n"
+    ).encode()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "dolphin-sidecar"
 
@@ -178,7 +205,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not body.endswith(b"\n"):
                 body += b"\n"
             out = body + sidecar_series(len(sockets), proxy_ok=True)
-        self._reply(200, out, PROM_CONTENT_TYPE)
+        self._reply(200, out + watchdog_series(), PROM_CONTENT_TYPE)
 
     def _get_health(self) -> None:
         sockets = discover_sockets()

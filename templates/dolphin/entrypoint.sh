@@ -78,10 +78,28 @@ if [[ -f "${DOLPHIN_HOME}/metrics_sidecar.py" ]]; then
     sidecar_pid=$!
 fi
 
+# Engine watchdog: vLLM wedges inside a CUDA kernel under load — worker alive, container
+# running, /health 200, GPU pinned at 100% — and only the token counters show it. Restarts
+# the engine (not the worker, not the container) so a filler loses minutes, not hours. Own
+# restart loop for the same reason as the sidecar; DOLPHIN_WATCHDOG_ENABLED=0 turns it off.
+watchdog_pid=""
+if [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]]; then
+    (
+        while true; do
+            python3 "${DOLPHIN_HOME}/watchdog.py" || true
+            sleep 5
+        done
+    ) &
+    watchdog_pid=$!
+fi
+
 worker_pid=""
 on_term() {
     if [[ -n "${sidecar_pid}" ]]; then
         kill -TERM "${sidecar_pid}" 2>/dev/null || true
+    fi
+    if [[ -n "${watchdog_pid}" ]]; then
+        kill -TERM "${watchdog_pid}" 2>/dev/null || true
     fi
     if [[ -n "${worker_pid}" ]]; then
         kill -TERM "${worker_pid}" 2>/dev/null || true
