@@ -24,7 +24,6 @@ RUN apt-get update && \
     curl \
     jq \
     python3 \
-    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # Expose all host GPUs to the worker (auto-scales when worker.json gpu_ids is null).

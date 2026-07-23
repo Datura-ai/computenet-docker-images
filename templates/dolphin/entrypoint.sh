@@ -49,7 +49,9 @@ jq -n \
 # workers writing the same path at once produce a corrupted binary and a crash loop. Serialize them
 # behind a lock file inside that volume; the first container populates it and the rest wait, then
 # find it ready. Writes are also staged + atomically renamed, so even a lock timeout can never expose
-# a half-written binary to a sibling.
+# a half-written binary to a sibling. `flock` ships in the CUDA base image (util-linux is a required
+# package), so nothing extra is installed for it.
+# The model weights under HOME/.cache are shared too, but huggingface_hub does its own file locking.
 DOLPHIN_LOCK="${DOLPHIN_HOME}/.dolphinpod.lock"
 # A cold download on a slow miner link takes minutes; this only bounds a stuck holder, and on timeout
 # we proceed anyway rather than fail the container.
