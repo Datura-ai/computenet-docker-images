@@ -129,15 +129,15 @@ plan_worker_gpu_sets() {
     # every bundle really clears the floor — a mixed node that can't is left on the single
     # all-GPUs worker rather than launched broken.
     local bundles=() base_bundle_size=$(( gpu_count / worker_count )) bundles_with_extra_card=$(( gpu_count % worker_count ))
-    local cursor=0 w size i bundle bundle_vram
+    local cursor=0 w bundle_size i bundle bundle_vram
     for (( w = 0; w < worker_count; w++ )); do
-        size=${base_bundle_size}
+        bundle_size=${base_bundle_size}
         if (( w < bundles_with_extra_card )); then
-            size=$(( base_bundle_size + 1 ))
+            bundle_size=$(( base_bundle_size + 1 ))
         fi
         bundle=""
         bundle_vram=0
-        for (( i = cursor; i < cursor + size; i++ )); do
+        for (( i = cursor; i < cursor + bundle_size; i++ )); do
             bundle="${bundle:+${bundle},}${indices[$i]}"
             bundle_vram=$(( bundle_vram + vram_values[i] ))
         done
@@ -146,7 +146,7 @@ plan_worker_gpu_sets() {
             return
         fi
         bundles+=("${bundle}")
-        cursor=$(( cursor + size ))
+        cursor=$(( cursor + bundle_size ))
     done
     printf '%s\n' "${bundles[@]}"
 }

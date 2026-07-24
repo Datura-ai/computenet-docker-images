@@ -161,7 +161,7 @@ def _first_metric_value(pattern: re.Pattern[bytes], body: bytes) -> float | None
         return None
 
 
-def own_sockets(engine: EngineProcesses | None) -> list[str]:
+def sockets_to_poll(engine: EngineProcesses | None) -> list[str]:
     # In split mode only THIS bundle's socket may be read: a sibling's counters would
     # attribute its wedge — or its health — to us, and the kill that follows lands on the
     # wrong engine. An unidentified engine yields no socket, which the poll below reads as
@@ -241,7 +241,7 @@ def scan_vllm_processes() -> list[VllmProcess]:
     # processes — no risk of reaching another filler on the same machine. environ and status
     # are read only for processes that already matched a marker, so this stays a handful of
     # extra file reads per poll.
-    found: list[VllmProcess] = []
+    processes: list[VllmProcess] = []
     own_pid = os.getpid()
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -254,10 +254,10 @@ def scan_vllm_processes() -> list[VllmProcess]:
             continue
         if SERVE_CMDLINE_MARKER not in cmdline and ENGINE_CORE_CMDLINE_MARKER not in cmdline:
             continue
-        found.append(
+        processes.append(
             VllmProcess(pid=pid, cmdline=cmdline, gpus=_read_gpus(pid), ppid=_read_ppid(pid))
         )
-    return found
+    return processes
 
 
 def find_engine_processes() -> EngineProcesses | None:
@@ -273,8 +273,8 @@ def find_engine_processes() -> EngineProcesses | None:
             serve=[p.pid for p in serves], engine_core=[p.pid for p in cores], socket=None
         )
 
-    mine = [p for p in serves if p.gpus == GPU_SET]
-    sockets = {path for path in (socket_from_cmdline(p.cmdline) for p in mine) if path}
+    own_serves = [p for p in serves if p.gpus == GPU_SET]
+    sockets = {path for path in (socket_from_cmdline(p.cmdline) for p in own_serves) if path}
     if len(sockets) > 1:
         # Two engines claiming the same cards means the environment does not separate the
         # bundles the way it was measured to (a worker re-indexing CUDA_VISIBLE_DEVICES would
@@ -285,7 +285,7 @@ def find_engine_processes() -> EngineProcesses | None:
         )
         return None
 
-    serve_pids = [p.pid for p in mine]
+    serve_pids = [p.pid for p in own_serves]
     # The EngineCore child does not inherit CUDA_VISIBLE_DEVICES, so the parent link is what
     # claims it; the cards are still checked first for a child that does carry them. Neither
     # claim can point at a sibling's bundle.
@@ -421,7 +421,7 @@ def main() -> None:
         if GPU_SET and engine_socket != reported_socket:
             reported_socket = engine_socket
             _log(f"engine for GPUs {','.join(GPU_SET)}: {engine_socket or 'not identified'}")
-        poll = poll_engine(own_sockets(engine))
+        poll = poll_engine(sockets_to_poll(engine))
         counters = poll.counters
         now = time.monotonic()
 

@@ -379,6 +379,23 @@ def test_dead_engine_reads_as_a_gap_not_a_smaller_number() -> None:
     assert b"dolphin_sidecar_proxy_ok 1\n" in body, "one live engine still means proxy_ok"
 
 
+def test_split_container_labels_the_survivor_while_a_sibling_is_down() -> None:
+    # The label must not depend on how many engines answered this scrape: dropping it for the
+    # minutes a sibling spends restarting makes the survivor a different series to the scraper
+    # — its counter reads as gone, and the relabelled one as a fresh counter starting at zero.
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = pathlib.Path(tmp) / "dp-aaa" / "v.sock"
+        sock.parent.mkdir()
+        (pathlib.Path(tmp) / "dp-restarting").mkdir()  # socket dir with no listener
+        with fake_vllm(sock, FIXTURE), sidecar(
+            f"{tmp}/dp-*/v.sock", TOKEN, {"DOLPHIN_ENGINES_EXPECTED": "2"}
+        ) as base:
+            _, body, _ = get(f"{base}/metrics")
+    label_sets = [labels for labels, _ in _samples(body, b"vllm:generation_tokens_total")]
+    assert label_sets, "the live engine's counter must still be published"
+    assert all(b'dolphin_engine="dp-aaa"' in labels for labels in label_sets), label_sets
+
+
 def test_metric_families_stay_contiguous() -> None:
     # Exposition validity: every sample of one metric family must form a single block.
     # Concatenating two whole engine bodies would interleave families and break this.

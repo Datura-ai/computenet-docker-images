@@ -41,7 +41,12 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_GPU_IDS`     | no       | (empty → `null`)                 | Comma-separated GPU indices, e.g. `0,1`. Empty → `null` → the worker uses all GPUs on the node. |
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
+| `DOLPHIN_WORKER_PER_GPU` | no    | `1`                              | `0` forces the single all-GPUs worker — the exact pre-split behavior. |
+| `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                        | VRAM floor one worker's bundle must clear (the full model needs ~70 GB). Each worker gets the smallest card group above it. |
+| `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                      | Delay between initial worker spawns, once the shared cache is seeded. |
+| `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. `0` = no wait, plain stagger. |
 | `METRICS_TOKEN`       | no       | —                                | Bearer token for the metrics sidecar on `:9101`. Unset → the sidecar answers 503 to everything (fail closed). |
+| `DOLPHIN_ENGINES_EXPECTED` | no  | (set by the entrypoint)          | How many engines this container runs. The sidecar publishes it next to `dolphin_engines_up`, and above 1 it tags every engine's series with `dolphin_engine`. |
 | `DOLPHIN_WATCHDOG_ENABLED` | no  | `1`                              | `0` stops the entrypoint from starting any engine watchdog. |
 | `DOLPHIN_WATCHDOG_GPU_SET` | no | (set per bundle by the entrypoint) | Cards this watchdog owns, e.g. `0` or `2,3`. Empty = the single-engine container, where every vLLM process belongs to the one engine. |
 | `DOLPHIN_WATCHDOG_STALL_SECONDS` | no | `300`                  | How long the token counter may stand still, with requests in flight, before the engine is restarted. |
@@ -93,7 +98,7 @@ What running N instances in one container costs, and how each cost is paid:
 | configs collide | per-instance `HOME`, so each worker reads its own `worker.json` |
 | N copies of the ~35 GB model + runtime | each instance's `HOME/.cache` is a **symlink** to the shared cache. The closed worker binary scrubs its child's environment, so `HF_HOME`/`XDG_CACHE_HOME` alone cannot be relied on — a path that resolves to one directory can. |
 | siblings corrupt the shared binary | every write to `DOLPHIN_HOME` goes through `flock`, staged to a temp file and renamed atomically (DAH-2475) |
-| cold start stampede | initial spawns are staggered `DOLPHIN_SPLIT_STAGGER_SECONDS` (default 30) apart, so the first instance warms the shared cache before its siblings hit the same downloads |
+| cold start stampede | the siblings wait for the first instance's engine socket (`DOLPHIN_SEED_WAIT_SECONDS`, default 5400) instead of merely pausing: once it serves, the runtime and the weights are on disk, so 2..N start warm. Measured 2026-07-23 — with a plain 30 s stagger both workers downloaded the same ~12 GB side by side over a link the miner throttles. `DOLPHIN_SPLIT_STAGGER_SECONDS` (default 30) then spaces the warm starts. |
 | metrics undercount | the sidecar scrapes **every** engine socket and tags each with its own `dolphin_engine` label (see below) |
 | one wedge kills all | one watchdog per bundle, each scoped to its own cards, so a wedged engine is killed on its cards alone and the siblings keep serving (see below) |
 
