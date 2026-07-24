@@ -212,8 +212,11 @@ for i, arg in enumerate(argv):
 runpy.run_path(REAL, run_name="__main__")
 EOF
     # Staged and renamed rather than written in place (DAH-2475): a worker in a sibling container
-    # can exec this path at any moment, and a half-written script is not a launcher.
-    chmod +x "${staged}"
+    # can exec this path at any moment, and a half-written script is not a launcher. mktemp opens
+    # at 0600, so the mode is set to the vendor script's own 0755 rather than merely +x: this path
+    # is read by whatever uid a sibling container's worker runs as, not only by the one that
+    # installed it.
+    chmod 0755 "${staged}"
     mv -f "${staged}" "${wrapper}"
     echo "[dolphin] engine VRAM wrapper installed: each of ${WORKERS_PER_BUNDLE} workers claims 1/${WORKERS_PER_BUNDLE} of the card" >&2
 }

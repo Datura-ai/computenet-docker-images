@@ -459,6 +459,10 @@ test_engine_memory_wrapper() {
 
     assert_eq "the vendor script is kept, not destroyed" "yes" \
         "$([[ -f "${bin_dir}/vllm.real" ]] && echo yes)"
+    # mktemp opens at 0600, so a bare +x would publish a launcher only its owner can read —
+    # measured 0711 on the H200 box before this was pinned. Sibling containers share the volume.
+    assert_eq "the wrapper is as readable as the launcher it replaces" "755" \
+        "$(stat -c %a "${bin_dir}/vllm" 2>/dev/null || stat -f %Lp "${bin_dir}/vllm")"
     assert_eq "the claim is divided by the number of workers sharing the card" \
         "VENDOR serve m --gpu-memory-utilization 0.4250 --moe-backend marlin" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 --moe-backend marlin)"
