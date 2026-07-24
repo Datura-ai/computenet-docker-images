@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # In-image verification for daturaai/dolphin: run the sidecar and watchdog
 # contract tests with the image's python3 + shipped copies (catches stdlib
-# gaps a host run would hide), then prove the entrypoint supervises both and
-# `docker stop` stays clean (trap kills them, no SIGKILL).
+# gaps a host run would hide), then prove the entrypoint starts both and that
+# `docker stop` returns promptly with exit code 0 (no SIGKILL after the grace).
 #
 # The watchdog's kill tests are skipped on a macOS host for want of /proc, so
 # this is the only place they actually run — do not skip it.
@@ -21,7 +21,6 @@ docker run --rm --entrypoint python3 \
     -v "${HERE}:/tests:ro" \
     -e SIDECAR_PATH=/opt/dolphinpod/metrics_sidecar.py \
     -e WATCHDOG_PATH=/opt/dolphinpod/watchdog.py \
-    -e PYTHONPATH=/opt/dolphinpod \
     "${IMAGE}" /tests/test_watchdog.py
 
 echo "== [3/3] entrypoint integration: sidecar + watchdog up, clean docker stop =="

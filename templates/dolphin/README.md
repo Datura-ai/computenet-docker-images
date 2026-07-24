@@ -44,6 +44,8 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_WATCHDOG_STALL_SECONDS` | no | `300`                  | How long the token counter may stand still, with requests in flight, before the engine is restarted. |
 | `DOLPHIN_WATCHDOG_POLL_SECONDS` | no | `60`                    | How often the watchdog reads the engine's counters. |
 | `DOLPHIN_WATCHDOG_GRACE_SECONDS` | no | `300`                  | Quiet period after a restart, while the engine reloads weights. |
+| `DOLPHIN_WATCHDOG_ENGINE_CORE_SECONDS` | no | `20`             | How long the `VLLM::EngineCore` child gets to die with its parent before it is killed directly. |
+| `DOLPHIN_WATCHDOG_STATE` | no | `${DOLPHIN_HOME}/watchdog_state.json` | Where the watchdog writes its state. The sidecar reads the same path to export the series below, so both processes must agree on it. |
 
 The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
 live), so one key drives the whole fleet. `worker.json` is written `0600`; the worker refuses a
@@ -109,9 +111,11 @@ holding ~70 GB of VRAM that blocks the respawn. The worker brings the engine bac
 warm cache and tokens return 2-3 minutes after the kill; the container and its `filler_run`
 row are untouched, so there is no cold start and no launch backoff.
 
-Two cases are deliberately left alone: no socket at all (a cold start legitimately takes
-30-60 minutes, and a restart would only send it back to the beginning) and an empty queue
-(no demand is not a fault).
+Three cases are deliberately left alone: no socket at all (a cold start legitimately takes
+30-60 minutes, and a restart would only send it back to the beginning), an empty queue (no
+demand is not a fault), and more than one engine in the container — the counters belong to
+whichever engine answered first, so there is no way to tell which one wedged, and the
+watchdog refuses rather than take the healthy ones down with it.
 
 Restarts reach the platform through the sidecar, which appends the watchdog's state to
 `/metrics`:
@@ -119,12 +123,14 @@ Restarts reach the platform through the sidecar, which appends the watchdog's st
 | Series | Meaning |
 |---|---|
 | `dolphin_watchdog_up` | `0` when the watchdog stopped ticking — a dead watchdog must not look like a healthy one |
-| `dolphin_watchdog_restarts_total` | Engine restarts since the container started |
+| `dolphin_watchdog_restarts_total` | Engine restarts since the container was created — the count survives the watchdog's own restart, and only a kill that actually removed the process is counted |
 | `dolphin_watchdog_last_restart_timestamp` | Unix time of the last restart |
 | `dolphin_watchdog_stall_seconds` | How long the token counter has been standing still |
 
-The series are absent entirely when no watchdog is running, so zeros never claim a
-watchdog that does not exist.
+The series are absent entirely until a watchdog has written its state file even once, so
+zeros never claim a watchdog that was never installed. Once the file exists the series stay,
+and a watchdog that ran and died reports `dolphin_watchdog_up 0` with its last known
+numbers — silence would read as health.
 
 Tests (no GPU needed):
 

@@ -113,6 +113,8 @@ fi
 # running, /health 200, GPU pinned at 100% — and only the token counters show it. Restarts
 # the engine (not the worker, not the container) so a filler loses minutes, not hours. Own
 # restart loop for the same reason as the sidecar; DOLPHIN_WATCHDOG_ENABLED=0 turns it off.
+# Unlike the sidecar this process acts, so an orphan surviving the TERM below can still
+# SIGKILL an engine during shutdown — harmless only because the container is going away.
 watchdog_pid=""
 if [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]]; then
     (
