@@ -45,7 +45,11 @@ TOKEN = os.environ.get("METRICS_TOKEN", "")
 SOCKET_GLOB = os.environ.get("METRICS_SOCKET_GLOB", "/tmp/dp-*/v.sock")
 # Written every tick by watchdog.py; absent when the watchdog is disabled or not shipped.
 # Split mode runs one watchdog — and one state file — per GPU bundle, so the default is a
-# glob; DOLPHIN_WATCHDOG_STATE pins a single file when the caller knows which one it wants.
+# glob; DOLPHIN_WATCHDOG_STATE pins a single file when the caller knows which one it wants,
+# and SINGLE_ENGINE_STATE_PATH is where an unscoped watchdog writes.
+SINGLE_ENGINE_STATE_PATH = os.path.join(
+    os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state.json"
+)
 WATCHDOG_STATE_PATH = os.environ.get("DOLPHIN_WATCHDOG_STATE", "")
 WATCHDOG_STATE_GLOB = os.environ.get(
     "DOLPHIN_WATCHDOG_STATE_GLOB",
@@ -64,14 +68,65 @@ TOTAL_BUDGET_S = min(4.0 + 0.4 * max(0, ENGINES_EXPECTED - 1), 7.0)
 CONNECT_TIMEOUT_S = 1.0
 MAX_BODY_BYTES = 5 * 1024 * 1024
 LOG_INTERVAL_S = 10.0
-# Prometheus text exposition format version — NOT the image version (which also
-# happens to be 0.0.4). Do not bump this when bumping the image tag.
+# Prometheus text exposition format version — NOT the image version, which it once
+# coincided with. Do not bump this when bumping the image tag.
 PROM_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 _last_ok_ts: float = 0.0
 _last_socket: str = ""
 _last_error: str | None = None
 _last_log_ts: float = 0.0
+
+
+def _optional_float(value: object) -> float | None:
+    return None if value is None else float(value)
+
+
+@dataclass(frozen=True)
+class WatchdogState:
+    """What watchdog.py writes every tick. Declared here because three parties read these
+    names — the sidecar below, the watchdog itself after its own restart, and the tests —
+    and a key renamed on one side only makes the whole dolphin_watchdog_* group disappear,
+    which on a dashboard is indistinguishable from a watchdog that was never installed.
+    In split mode one of these is written per GPU bundle, which is what gpus + engine_socket
+    are for: telling N states apart and labelling them."""
+
+    updated: float
+    # Widest gap a healthy watchdog may leave between writes; the watchdog owns the number
+    # because only it knows how long its slowest tick (the one that kills an engine) takes.
+    max_write_gap_s: float
+    restarts_total: int
+    last_restart_timestamp: float
+    stall_seconds: float
+    # None when the engine did not answer this tick. requests_running is what tells an idle
+    # queue apart from a wedge, so a high stall_seconds cannot be read without it.
+    requests_running: float | None
+    generated_tokens: float | None
+    # Split mode only (both None in the single-engine image). engine_socket None means a
+    # watchdog that is running but cannot see its engine — guarding nothing.
+    gpus: str | None
+    engine_socket: str | None
+
+    @classmethod
+    def read(cls, path: str) -> "WatchdogState | None":
+        # None for every shape we cannot use: absent, unparsable, or written by something
+        # else. Callers turn that into silence, never into invented zeros.
+        try:
+            with open(path) as fh:
+                raw = json.load(fh)
+            return cls(
+                updated=float(raw["updated"]),
+                max_write_gap_s=float(raw["max_write_gap_s"]),
+                restarts_total=int(raw["restarts_total"]),
+                last_restart_timestamp=float(raw["last_restart_timestamp"]),
+                stall_seconds=float(raw["stall_seconds"]),
+                requests_running=_optional_float(raw["requests_running"]),
+                generated_tokens=_optional_float(raw["generated_tokens"]),
+                gpus=raw["gpus"],
+                engine_socket=raw["engine_socket"],
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
 
 
 def _log(msg: str) -> None:
@@ -328,55 +383,6 @@ def sidecar_series(sockets_found: int, proxy_ok: bool, engines_up: int = 0) -> b
     ).encode()
 
 
-def _optional_float(value: object) -> float | None:
-    return None if value is None else float(value)
-
-
-@dataclass(frozen=True)
-class WatchdogState:
-    """What watchdog.py writes every tick, one file per GPU bundle in split mode. Declared
-    here because both sides read these names — the sidecar below and the watchdog after its
-    own restart — and a key renamed on one side only makes the dolphin_watchdog_* group
-    silently wrong instead of absent, which on a dashboard is indistinguishable from a
-    watchdog that was never installed. gpus + engine_socket are the split-mode additions that
-    let N per-bundle states be told apart and labelled."""
-
-    updated: float
-    poll_interval_s: float
-    restarts_total: int
-    last_restart_timestamp: float
-    stall_seconds: float
-    # None when the engine did not answer this tick. requests_running is what tells an idle
-    # queue apart from a wedge, so a high stall_seconds cannot be read without it.
-    requests_running: float | None
-    generated_tokens: float | None
-    # Split mode only (both None in the single-engine image). engine_socket None means a
-    # watchdog that is running but cannot see its engine — guarding nothing.
-    gpus: str | None
-    engine_socket: str | None
-
-    @classmethod
-    def read(cls, path: str) -> "WatchdogState | None":
-        # None for every shape we cannot use: absent, unparsable, or a key renamed on the
-        # writer side. Callers turn that into an empty series, never into invented zeros.
-        try:
-            with open(path) as fh:
-                raw = json.load(fh)
-            return cls(
-                updated=float(raw["updated"]),
-                poll_interval_s=float(raw["poll_interval_s"]),
-                restarts_total=int(raw["restarts_total"]),
-                last_restart_timestamp=float(raw["last_restart_timestamp"]),
-                stall_seconds=float(raw["stall_seconds"]),
-                requests_running=_optional_float(raw["requests_running"]),
-                generated_tokens=_optional_float(raw["generated_tokens"]),
-                gpus=raw["gpus"],
-                engine_socket=raw["engine_socket"],
-            )
-        except (OSError, ValueError, TypeError, KeyError):
-            return None
-
-
 def watchdog_state_paths() -> list[str]:
     # Globbed per request, not at import: in split mode the files appear as each bundle's
     # watchdog starts, and a list captured at boot would miss them.
@@ -388,7 +394,9 @@ def watchdog_state_paths() -> list[str]:
 def watchdog_values(state: WatchdogState) -> list[tuple[str, str]]:
     age_s = time.time() - state.updated
     values = [
-        ("dolphin_watchdog_up", str(int(age_s <= 3 * state.poll_interval_s))),
+        # Three missed writes mean it is gone. The bound comes from the file rather than from
+        # the poll interval, because the tick that kills an engine blocks far longer than a poll.
+        ("dolphin_watchdog_up", str(int(age_s <= 3 * state.max_write_gap_s))),
         ("dolphin_watchdog_restarts_total", str(state.restarts_total)),
         ("dolphin_watchdog_last_restart_timestamp", str(int(state.last_restart_timestamp))),
         ("dolphin_watchdog_stall_seconds", f"{state.stall_seconds:.0f}"),
