@@ -49,6 +49,36 @@ LIVENESS_INTERVAL=30
 # Delay between initial worker spawns, AFTER the shared cache is seeded.
 SPLIT_STAGGER_SECONDS="${DOLPHIN_SPLIT_STAGGER_SECONDS:-30}"
 
+# How many workers share each VRAM bundle (DAH-2473). >1 puts several engines on the SAME card:
+# every extra worker pays a fresh ~31.5 GB for its own copy of the weights out of the KV cache,
+# so it only pays off where the pool, not the card, is the limit.
+#
+# "auto" derives it from the bundle — see derive_workers_per_bundle. A positive integer forces it,
+# which is the escape hatch for measuring a layout the rule would not pick; it is NOT checked
+# against the card's VRAM, so forcing 2 onto an 80 GB card gives two crippled engines. "1"
+# disables the split entirely.
+#
+# The default is 1, and it has to stay 1 until the DAH-2465 watchdog is re-keyed off the engine
+# socket instead of the card set: two workers on one card produce two engines with identical card
+# sets, which is the ambiguous case the watchdog refuses to act on, so a wedge on a split card
+# stays wedged. Splitting is opt-in ("auto" or an explicit count) until then.
+WORKERS_PER_BUNDLE_SETTING="${DOLPHIN_WORKERS_PER_BUNDLE:-1}"
+if [[ "${WORKERS_PER_BUNDLE_SETTING}" != "auto" ]] && ! [[ "${WORKERS_PER_BUNDLE_SETTING}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[dolphin] DOLPHIN_WORKERS_PER_BUNDLE='${WORKERS_PER_BUNDLE_SETTING}' is neither 'auto' nor a positive integer; not splitting" >&2
+    WORKERS_PER_BUNDLE_SETTING=1
+fi
+# Resolved per bundle at plan time; 1 until then so every helper has a sane value.
+WORKERS_PER_BUNDLE=1
+
+# What one worker needs on the card, in MB: its own copy of the weights plus a KV cache worth
+# having. Measured 2026-07-24 on a live H200 split in two — each engine reported 42 slots and ran
+# 16-21 concurrent requests at 17-19% KV usage, so ~35 slots (0.717 GB each) is a floor with room
+# above the load the pool actually sends, not a number that merely boots.
+WORKER_WEIGHTS_MB="${DOLPHIN_WORKER_WEIGHTS_MB:-32256}"
+WORKER_MIN_KV_MB="${DOLPHIN_WORKER_MIN_KV_MB:-25600}"
+# vLLM is launched with --gpu-memory-utilization 0.85, so this is what a bundle really offers.
+VRAM_USABLE_PERCENT="${DOLPHIN_VRAM_USABLE_PERCENT:-85}"
+
 # On a cold node the siblings wait for the FIRST instance to finish seeding the shared cache
 # instead of merely pausing a few seconds. Measured 2026-07-23: with a 30 s stagger both workers
 # downloaded the ~12 GB runtime into their own staging directories side by side, doubling the
@@ -72,6 +102,152 @@ DOLPHIN_LOCK_TIMEOUT="${DOLPHIN_LOCK_TIMEOUT:-900}"
 # One line per GPU: "<index>, <vram_mb>". Empty output when nvidia-smi is absent/failing.
 detect_gpus() {
     nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits 2>/dev/null || true
+}
+
+# How many workers this bundle can carry. Two conditions, and both must hold:
+#
+#   1. The bundle is ONE card. Bundles of several cards exist only because each card is too small
+#      to hold the model alone, i.e. the node is built from weak cards — and a weak card is
+#      limited by the card, not by the pool, so splitting it buys nothing. (Measured: an L40S
+#      worker's token rate stops dead at p99 1993 / max 2083, while an H200's median 1697 has a
+#      max of 5384 on the same hardware. Splitting the first is pointless, splitting the second
+#      is the whole point.) A 4x L40S bundle has the VRAM for a split and must still not get one,
+#      which is why VRAM alone is not the test.
+#   2. Every worker still gets its weights plus a real KV cache out of the usable VRAM.
+#
+# Everything the rule needs is already on hand from detect_gpus, so this costs no extra probing.
+derive_workers_per_bundle() {
+    local bundle_cards="$1" bundle_vram_mb="$2"
+    if [[ "${WORKERS_PER_BUNDLE_SETTING}" != "auto" ]]; then
+        echo "${WORKERS_PER_BUNDLE_SETTING}"
+        return
+    fi
+    if (( bundle_cards != 1 )) || (( bundle_vram_mb <= 0 )); then
+        echo 1
+        return
+    fi
+    local per_worker_mb=$(( WORKER_WEIGHTS_MB + WORKER_MIN_KV_MB ))
+    local workers=$(( bundle_vram_mb * VRAM_USABLE_PERCENT / 100 / per_worker_mb ))
+    (( workers < 1 )) && workers=1
+    echo "${workers}"
+}
+
+# "<cards> <total_vram_mb>" behind one plan line; "all" covers every GPU on the node.
+bundle_cards_and_vram() {
+    local gpu_set="$1" index vram cards=0 total=0
+    while IFS=',' read -r index vram; do
+        index="${index//[[:space:]]/}"
+        vram="${vram//[[:space:]]/}"
+        [[ -n "${index}" && -n "${vram}" ]] || continue
+        if [[ "${gpu_set}" == "all" || ",${gpu_set}," == *",${index},"* ]]; then
+            cards=$(( cards + 1 ))
+            total=$(( total + vram ))
+        fi
+    done < <(detect_gpus)
+    echo "${cards} ${total}"
+}
+
+# Print each bundle WORKERS_PER_BUNDLE times: an intra-card split is just the same bundle
+# claimed by more than one worker, so it composes with every path in the planner below.
+emit_worker_plan() {
+    local bundle rep
+    for bundle in "$@"; do
+        for (( rep = 0; rep < WORKERS_PER_BUNDLE; rep++ )); do
+            echo "${bundle}"
+        done
+    done
+}
+
+# Marker that tells our wrapper apart from the vendor's console script.
+ENGINE_WRAPPER_MARKER="dolphin-intra-card-vram-wrapper"
+
+engine_memory_wrapper_installed() {
+    local wrapper="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin/vllm"
+    [[ -f "${wrapper}" ]] && grep -q "${ENGINE_WRAPPER_MARKER}" "${wrapper}"
+}
+
+# The worker execs `<runtime>/bin/vllm serve ... --gpu-memory-utilization 0.85`, and vLLM sizes
+# that fraction against the card's TOTAL memory. So the second worker on a card asks for memory
+# the first one already holds and dies at init — the reproducible blocker DAH-2473 hit. The
+# fraction is hardcoded in the closed worker binary and worker.json exposes no knob for it, but
+# the runtime lives inside DOLPHIN_HOME, which is our volume, so the file the worker execs can be
+# wrapped. The wrapper only divides that one flag and then defers to the untouched vendor script
+# via runpy, so a vendor change to its contents cannot break us.
+install_engine_memory_wrapper() {
+    local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
+    local wrapper="${bin_dir}/vllm" real="${bin_dir}/vllm.real"
+    if [[ ! -f "${wrapper}" ]]; then
+        # First boot on a cold node: the worker downloads its runtime only once it starts, so
+        # there is nothing to wrap yet. The node runs unsplit until the next container start.
+        echo "[dolphin] engine runtime not present yet; VRAM wrapper installs on the next start" >&2
+        return 1
+    fi
+    if ! engine_memory_wrapper_installed; then
+        # Vendor script in place: either the first install, or a self-update overwrote us. If it
+        # cannot be staged, refuse — a wrapper whose vllm.real is missing launches nothing at all.
+        if ! cp -p "${wrapper}" "${real}"; then
+            echo "[dolphin] cannot stage ${real}; leaving the vendor engine script alone" >&2
+            return 1
+        fi
+    fi
+    local staged
+    staged="$(mktemp "${bin_dir}/.vllm.XXXXXX")"
+    cat >"${staged}" <<EOF
+#!${bin_dir}/python
+# ${ENGINE_WRAPPER_MARKER} (DAH-2473)
+"""Claim only this worker's share of the card, then run the vendor's launcher unchanged."""
+import runpy
+import sys
+
+SHARE = ${WORKERS_PER_BUNDLE}
+REAL = "${real}"
+
+argv = sys.argv
+for i, arg in enumerate(argv):
+    if arg == "--gpu-memory-utilization" and i + 1 < len(argv):
+        argv[i + 1] = "%.4f" % (float(argv[i + 1]) / SHARE)
+    elif arg.startswith("--gpu-memory-utilization="):
+        argv[i] = "--gpu-memory-utilization=%.4f" % (float(arg.split("=", 1)[1]) / SHARE)
+
+runpy.run_path(REAL, run_name="__main__")
+EOF
+    # Staged and renamed rather than written in place (DAH-2475): a worker in a sibling container
+    # can exec this path at any moment, and a half-written script is not a launcher. mktemp opens
+    # at 0600, so the mode is set to the vendor script's own 0755 rather than merely +x: this path
+    # is read by whatever uid a sibling container's worker runs as, not only by the one that
+    # installed it.
+    chmod 0755 "${staged}"
+    mv -f "${staged}" "${wrapper}"
+    echo "[dolphin] engine VRAM wrapper installed: each of ${WORKERS_PER_BUNDLE} workers claims 1/${WORKERS_PER_BUNDLE} of the card" >&2
+}
+
+# The off-switch has to undo the wrapper as well. DOLPHIN_HOME survives container restarts, so a
+# wrapper left over from an earlier split would keep dividing the claim after the split is off —
+# a single worker silently running on 1/N of the card, which is worse than the split it replaced.
+# A node that was never split has nothing to restore and this is a no-op.
+remove_engine_memory_wrapper() {
+    local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
+    local wrapper="${bin_dir}/vllm" real="${bin_dir}/vllm.real"
+    engine_memory_wrapper_installed || return 0
+    if [[ ! -f "${real}" ]]; then
+        # Keeping the wrapper only divides the claim; removing it would leave no launcher at all.
+        echo "[dolphin] engine VRAM wrapper is installed but ${real} is gone; leaving it in place" >&2
+        return 0
+    fi
+    mv -f "${real}" "${wrapper}"
+    echo "[dolphin] engine VRAM wrapper removed: the worker claims the vendor's share of the card" >&2
+}
+
+# Name one instance's private files (HOME, watchdog state). The card set stays in the name for
+# readability; the index is only prepended when cards alone cannot separate instances, so the
+# single-worker-per-bundle layout keeps the exact paths it has always used.
+instance_tag() {
+    local index="$1" gpu_set="$2"
+    if (( WORKERS_PER_BUNDLE > 1 )); then
+        echo "w${index}-gpu${gpu_set//,/-}"
+    else
+        echo "gpu${gpu_set//,/-}"
+    fi
 }
 
 # Emit one line per worker to spawn: a comma-separated gpu_ids list, or the literal "all"
@@ -276,6 +452,36 @@ main() {
     done < <(plan_worker_gpu_sets)
     local instance_count=${#gpu_sets[@]}
 
+    # Lium nodes are homogeneous, so the first bundle decides the layout for all of them.
+    local bundle_cards bundle_vram
+    read -r bundle_cards bundle_vram < <(bundle_cards_and_vram "${gpu_sets[0]}")
+    WORKERS_PER_BUNDLE="$(derive_workers_per_bundle "${bundle_cards}" "${bundle_vram}")"
+
+    # Only an intra-card split needs the VRAM divided; one worker per bundle keeps the vendor's
+    # own 0.85 of the whole card. If the runtime isn't downloaded yet there is nothing to wrap,
+    # and running N engines that each claim the whole card just crash-loops N-1 of them — so
+    # fall back to a single worker for this start and split once the cache is warm.
+    # Both paths write the engine launcher inside the shared DOLPHIN_HOME, so they take the same
+    # lock as the binary download: two containers on one node, one installing while the other
+    # removes, would otherwise race on vllm/vllm.real (DAH-2475). Removal is pre-checked outside
+    # the lock like ensure_worker_binary does, so the unsplit fleet — every node, every start —
+    # does not queue behind a sibling's download just to find nothing to undo.
+    if (( WORKERS_PER_BUNDLE > 1 )) && ! with_dolphin_lock install_engine_memory_wrapper; then
+        WORKERS_PER_BUNDLE=1
+    fi
+    if (( WORKERS_PER_BUNDLE == 1 )) && engine_memory_wrapper_installed; then
+        with_dolphin_lock remove_engine_memory_wrapper
+    fi
+    if (( WORKERS_PER_BUNDLE > 1 )); then
+        echo "[dolphin] bundle of ${bundle_cards} card(s), ${bundle_vram} MB -> ${WORKERS_PER_BUNDLE} workers per bundle" >&2
+        local expanded=()
+        while IFS= read -r gpu_set_line; do
+            [[ -n "${gpu_set_line}" ]] && expanded+=("${gpu_set_line}")
+        done < <(emit_worker_plan "${gpu_sets[@]}")
+        gpu_sets=("${expanded[@]}")
+        instance_count=${#gpu_sets[@]}
+    fi
+
     local base_home="${HOME:-/root}"
     local shared_cache="${base_home}/.cache"
     export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${shared_cache}}"
@@ -287,7 +493,9 @@ main() {
         instance_homes=("${base_home}")
     else
         for i in "${!gpu_sets[@]}"; do
-            instance_homes+=("${base_home}/dolphin-workers/gpu${gpu_sets[$i]//,/-}")
+            # With WORKERS_PER_BUNDLE > 1 the same cards appear more than once, so the card set
+            # alone no longer names a home; the instance index is what keeps them apart.
+            instance_homes+=("${base_home}/dolphin-workers/$(instance_tag "${i}" "${gpu_sets[$i]}")")
             prepare_instance_home "${instance_homes[$i]}" "${shared_cache}"
         done
     fi
@@ -340,7 +548,7 @@ main() {
             watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state.json"
             if (( instance_count > 1 )); then
                 watchdog_gpu_set="${gpu_sets[$i]}"
-                watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state_gpu${gpu_sets[$i]//,/-}.json"
+                watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state_$(instance_tag "${i}" "${gpu_sets[$i]}").json"
             fi
             (
                 while true; do

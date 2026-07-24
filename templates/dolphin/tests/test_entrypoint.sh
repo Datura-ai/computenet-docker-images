@@ -19,6 +19,17 @@ assert_eq() {
     fi
 }
 
+assert_fails() {
+    local label="$1"
+    shift
+    if "$@" 2>/dev/null; then
+        echo "FAIL ${label}"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   ${label}"
+    fi
+}
+
 make_sandbox() {
     SANDBOX="$(mktemp -d)"
     mkdir -p "${SANDBOX}/bin"
@@ -374,7 +385,145 @@ EOF
         "$(ls "${DOLPHIN_WATCHDOG_STATE_DIR}"/dolphin_watchdog_state_gpu7.json 2>/dev/null)"
 }
 
+# ---------------------------------------------------------------- intra-card split (DAH-2473)
+test_intra_card_plan() {
+    make_sandbox
+    unset DOLPHIN_WORKERS_PER_BUNDLE DOLPHIN_GPU_IDS DOLPHIN_WORKER_PER_GPU DOLPHIN_SPLIT_MIN_VRAM_MB || true
+    load_entrypoint
+
+    # Splitting disarms the DAH-2465 watchdog until it is re-keyed off the engine socket, so a
+    # plain deploy must not enable it: no env, no split, on the cards the rule likes most.
+    assert_eq "the default does not split an H200" "1" "$(derive_workers_per_bundle 1 143771)"
+    assert_eq "the default does not split a B300"  "1" "$(derive_workers_per_bundle 1 281600)"
+
+    export DOLPHIN_WORKERS_PER_BUNDLE=auto
+    load_entrypoint
+
+    # The rule must reproduce the fleet's real verdicts, most of all the ones that would hurt:
+    # 80 GB cards cannot hold two copies of the weights, and bundles of small cards are limited
+    # by the card rather than by the pool, so splitting them buys nothing.
+    assert_eq "H200 splits in two"              "2" "$(derive_workers_per_bundle 1 143771)"
+    assert_eq "B200 splits in two"              "2" "$(derive_workers_per_bundle 1 183359)"
+    assert_eq "B300 splits in four"             "4" "$(derive_workers_per_bundle 1 281600)"
+    assert_eq "H100 80GB is never split"        "1" "$(derive_workers_per_bundle 1 81559)"
+    assert_eq "RTX PRO 6000 96GB is not split"  "1" "$(derive_workers_per_bundle 1 97887)"
+    assert_eq "a 2-card L40S bundle is not split" "1" "$(derive_workers_per_bundle 2 92136)"
+    assert_eq "a 4-card bundle with H200-class VRAM is still not split" "1" \
+        "$(derive_workers_per_bundle 4 184272)"
+    assert_eq "a bundle of unknown size is not split" "1" "$(derive_workers_per_bundle 1 0)"
+
+    mock_nvidia_smi "0:143771"
+    assert_eq "'all' on a one-card node measures that card" "1 143771" "$(bundle_cards_and_vram all)"
+    mock_nvidia_smi "0:143771" "1:143771" "2:143771" "3:143771"
+    assert_eq "'all' on a four-card node measures all of them" "4 575084" "$(bundle_cards_and_vram all)"
+    assert_eq "a pinned bundle measures only its own cards" "2 287542" "$(bundle_cards_and_vram 1,2)"
+    assert_eq "card 10 is not matched by card 1" "1 143771" "$(bundle_cards_and_vram 1)"
+
+    WORKERS_PER_BUNDLE=2
+    assert_eq "each bundle is claimed by two workers" "0|0|1|1" \
+        "$(emit_worker_plan 0 1 | paste -sd'|' -)"
+    assert_eq "replicas of one card get distinct homes" "w0-gpu0 w1-gpu0" \
+        "$(instance_tag 0 0) $(instance_tag 1 0)"
+    WORKERS_PER_BUNDLE=1
+    assert_eq "off: the plan is untouched" "0|1" "$(emit_worker_plan 0 1 | paste -sd'|' -)"
+    assert_eq "off: the shipped home name is untouched" "gpu0" "$(instance_tag 0 0)"
+
+    # An explicit value is the escape hatch for measuring a layout the rule would not pick.
+    export DOLPHIN_WORKERS_PER_BUNDLE=3
+    load_entrypoint
+    assert_eq "an explicit count overrides the rule, VRAM and all" "3" \
+        "$(derive_workers_per_bundle 1 81559)"
+    export DOLPHIN_WORKERS_PER_BUNDLE=oops
+    load_entrypoint 2>/dev/null
+    assert_eq "a junk value falls back to not splitting" "1" "$(derive_workers_per_bundle 1 143771)"
+    unset DOLPHIN_WORKERS_PER_BUNDLE
+}
+
+# The wrapper is the only lever we have over the closed worker's hardcoded VRAM claim, and
+# getting it wrong is expensive in both directions: no wrapper and the second engine dies at
+# init, a double wrapper and every engine claims a quarter of the card it should have halved.
+test_engine_memory_wrapper() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphin"
+    load_entrypoint
+    # main resolves this per bundle; the wrapper is what turns it into an actual VRAM fraction.
+    WORKERS_PER_BUNDLE=2
+
+    assert_fails "a missing runtime refuses so the caller can fall back" \
+        install_engine_memory_wrapper
+
+    local bin_dir="${DOLPHIN_HOME}/runtimes/text-v/bin"
+    mkdir -p "${bin_dir}"
+    printf 'import sys\nprint("VENDOR " + " ".join(sys.argv[1:]))\n' >"${bin_dir}/vllm"
+    install_engine_memory_wrapper 2>/dev/null
+
+    assert_eq "the vendor script is kept, not destroyed" "yes" \
+        "$([[ -f "${bin_dir}/vllm.real" ]] && echo yes)"
+    # mktemp opens at 0600, so a bare +x would publish a launcher only its owner can read —
+    # measured 0711 on the H200 box before this was pinned. Sibling containers share the volume.
+    assert_eq "the wrapper is as readable as the launcher it replaces" "755" \
+        "$(stat -c %a "${bin_dir}/vllm" 2>/dev/null || stat -f %Lp "${bin_dir}/vllm")"
+    assert_eq "the claim is divided by the number of workers sharing the card" \
+        "VENDOR serve m --gpu-memory-utilization 0.4250 --moe-backend marlin" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 --moe-backend marlin)"
+    assert_eq "the --flag=value form is divided too" \
+        "VENDOR serve m --gpu-memory-utilization=0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization=0.85)"
+    assert_eq "a command without the flag is passed through untouched" \
+        "VENDOR serve m --kv-cache-dtype fp8" \
+        "$(python3 "${bin_dir}/vllm" serve m --kv-cache-dtype fp8)"
+
+    # Staging the vendor script is what makes the wrapper reversible AND runnable: if the copy
+    # fails, overwriting the launcher would leave a wrapper pointing at a file that never existed.
+    cat >"${SANDBOX}/bin/cp" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/cp"
+    hash -r
+    rm -f "${bin_dir}/vllm.real"
+    printf 'import sys\nprint("VENDOR " + " ".join(sys.argv[1:]))\n' >"${bin_dir}/vllm"
+    assert_fails "a failed stage refuses instead of destroying the vendor script" \
+        install_engine_memory_wrapper
+    assert_eq "the vendor script survives a failed stage" \
+        "VENDOR serve m --gpu-memory-utilization 0.85" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+    rm -f "${SANDBOX}/bin/cp"
+    hash -r
+    install_engine_memory_wrapper 2>/dev/null
+
+    # A worker self-update overwrites our wrapper with a fresh vendor script. Re-wrapping must
+    # restage THAT script, and must not treat the previous wrapper as the vendor's.
+    printf 'import sys\nprint("VENDOR2 " + " ".join(sys.argv[1:]))\n' >"${bin_dir}/vllm"
+    install_engine_memory_wrapper 2>/dev/null
+    assert_eq "a vendor update is re-wrapped, never double-wrapped" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+
+    install_engine_memory_wrapper 2>/dev/null
+    assert_eq "re-running the install is idempotent" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+
+    # Turning the split off must give the card back: DOLPHIN_HOME outlives the container, so a
+    # leftover wrapper would run the single worker on half a card without saying anything.
+    WORKERS_PER_BUNDLE=1
+    remove_engine_memory_wrapper 2>/dev/null
+    assert_eq "off: the vendor's claim is restored in full" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.85" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+    assert_eq "off: the staged copy is gone, so the next install restages the vendor script" "" \
+        "$([[ -f "${bin_dir}/vllm.real" ]] && echo yes)"
+    remove_engine_memory_wrapper 2>/dev/null
+    assert_eq "off: removing again leaves the vendor script alone" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.85" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+    unset DOLPHIN_HOME
+}
+
 test_plan
+test_intra_card_plan
+test_engine_memory_wrapper
 test_render
 test_prepare_instance_home
 test_wait_for_cache_seed

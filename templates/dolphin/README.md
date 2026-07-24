@@ -42,6 +42,7 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
 | `DOLPHIN_WORKER_PER_GPU` | no    | `1`                              | `0` forces the single all-GPUs worker — the exact pre-split behavior. |
+| `DOLPHIN_WORKERS_PER_BUNDLE` | no | `1`                             | Workers on the **same** bundle — the intra-card split below. `1` is off; `auto` derives the count from the bundle's VRAM; an explicit integer forces it. Anything else falls back to `1`. |
 | `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                        | VRAM floor one worker's bundle must clear (the full model needs ~70 GB). Each worker gets the smallest card group above it. |
 | `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                      | Delay between initial worker spawns, once the shared cache is seeded. |
 | `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. `0` = no wait, plain stagger. |
@@ -101,6 +102,31 @@ What running N instances in one container costs, and how each cost is paid:
 | cold start stampede | the siblings wait for the first instance's engine socket (`DOLPHIN_SEED_WAIT_SECONDS`, default 5400) instead of merely pausing: once it serves, the runtime and the weights are on disk, so 2..N start warm. Measured 2026-07-23 — with a plain 30 s stagger both workers downloaded the same ~12 GB side by side over a link the miner throttles. `DOLPHIN_SPLIT_STAGGER_SECONDS` (default 30) then spaces the warm starts. |
 | metrics undercount | the sidecar scrapes **every** engine socket and tags each with its own `dolphin_engine` label (see below) |
 | one wedge kills all | one watchdog per bundle, each scoped to its own cards, so a wedged engine is killed on its cards alone and the siblings keep serving (see below) |
+
+## Intra-card split (DAH-2473)
+
+The split above gives each worker its own cards. `DOLPHIN_WORKERS_PER_BUNDLE` goes one step
+further and runs **several workers on the same bundle**, because on a big card the limit is not
+the card but Dolphin's per-worker quota of 100 concurrent requests: prod KV-cache use is 6.1%
+on H200, 0.7% on B300. Measured on a 1x H200 under live traffic, two workers moved 1.79x the
+tokens of one — ~90% of a full worker each, ~$21k/month across the 70 prod H200.
+
+`auto` derives the count per bundle, since a fleet constant would cripple smaller cards:
+split only if the bundle is **one** card and each worker still gets weights plus real KV cache
+out of the vendor's 0.85 usable — `floor(vram * 0.85 / (32256 + 25600 MB))`. That gives H200 2,
+B200 2, B300 4, H100 80 GB 1, RTX PRO 6000 96 GB 1, and any multi-card bundle 1.
+
+vLLM sizes `--gpu-memory-utilization 0.85` against the **whole** card, so worker 2 would die at
+init. The engine is an ordinary pip console script inside `DOLPHIN_HOME`, so the entrypoint
+copies it to `vllm.real` and writes a wrapper that divides that one flag by the worker count.
+A cold node has no runtime to wrap yet and runs a single worker until the cache is warm.
+Turning the split back off restores the vendor script — `DOLPHIN_HOME` outlives the container,
+and a leftover wrapper would leave a lone worker silently claiming 1/N of the card.
+
+The default is `1`, and it stays `1` until the watchdog is re-keyed off the engine socket
+instead of the card set: two workers on one card produce two engines with identical card sets,
+which is the ambiguous case the watchdog refuses to act on, so a wedge on a split card stays
+wedged.
 
 ## GPU selection & eligibility
 
