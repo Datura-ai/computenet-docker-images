@@ -220,18 +220,19 @@ def test_growing_counter_is_left_alone() -> None:
 
 
 def test_idle_queue_is_not_a_wedge() -> None:
-    # counters frozen because there is nothing to do — a demand problem, not a fault
+    # counters frozen because there is nothing to do — a demand problem, not a fault.
+    # The clock must stay at zero, not merely be masked: stall banked while idle would
+    # fire the moment the first request lands (see the mid-prefill test below).
     engine = Engine(generated=1000.0, running=0.0)
     with tempfile.TemporaryDirectory() as tmp:
         sock = pathlib.Path(tmp) / "dp-1" / "v.sock"
         sock.parent.mkdir()
         state = pathlib.Path(tmp) / "state.json"
         with fake_engine(sock, engine), watchdog(f"{tmp}/dp-*/v.sock", state):
-            # the state file is written after the tick has already decided whether to kill,
-            # so a stall past the limit recorded there proves the decision was "no"
-            wait_for(lambda: read_watchdog_state(state).stall_seconds >= STALL_S, 8.0, "the stall clock")
+            time.sleep(STALL_S * 4)
             final = read_watchdog_state(state)
     assert final.restarts_total == 0, "an idle engine must not be restarted"
+    assert final.stall_seconds < STALL_S, "idle time must not arm the stall clock"
 
 
 def test_missing_socket_is_not_a_wedge() -> None:
@@ -278,6 +279,31 @@ def test_frozen_counter_with_requests_restarts_engine() -> None:
                 )
                 final = read_watchdog_state(state)
     assert final.last_restart_timestamp > 0, "the restart must be timestamped for the scraper"
+
+
+def test_first_request_after_idle_is_not_killed_mid_prefill() -> None:
+    # The false positive this guards: stall banked during a quiet stretch, then the first
+    # request lands and a poll catches it mid-prefill — requests running, no tokens
+    # generated yet. The clock may only start counting from the last poll that saw the
+    # queue empty, so the engine gets the full stall window, not the remainder of one
+    # that expired while nothing was asked of it.
+    require_proc()
+    engine = Engine(generated=1000.0, running=0.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = pathlib.Path(tmp) / "dp-1" / "v.sock"
+        sock.parent.mkdir()
+        state = pathlib.Path(tmp) / "state.json"
+        with fake_process("vllm serve --model fake") as serve, fake_engine(sock, engine):
+            with watchdog(f"{tmp}/dp-*/v.sock", state):
+                time.sleep(STALL_S * 4)  # idle long past the stall limit
+                with engine.lock:
+                    engine.running = 8.0  # first request arrives; prefill: no tokens yet
+                time.sleep(STALL_S / 2)  # a poll lands inside the prefill window
+                assert not is_dead(serve), "prefill after idle must get the full stall window"
+                engine.produce(500.0)  # generation starts; the engine was healthy all along
+                time.sleep(STALL_S / 2)
+                assert not is_dead(serve), "a producing engine must never be restarted"
+                assert read_watchdog_state(state).restarts_total == 0
 
 
 def test_engine_core_child_is_killed_when_it_outlives_the_parent() -> None:

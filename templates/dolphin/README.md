@@ -104,8 +104,9 @@ check.
 
 The only honest signal is vLLM's own `generation_tokens_total`: it stops moving while
 `num_requests_running` stays above zero. The watchdog polls that over the same unix socket
-the sidecar proxies, and after `DOLPHIN_WATCHDOG_STALL_SECONDS` of no tokens it kills
-`vllm serve` — SIGKILL, because a wedged process ignores SIGTERM — then kills the
+the sidecar proxies, and after `DOLPHIN_WATCHDOG_STALL_SECONDS` of no tokens with
+requests in flight it kills `vllm serve` — SIGKILL, because a wedged process ignores
+SIGTERM — then kills the
 `VLLM::EngineCore` child, which outlived its parent in 12 of 12 production cases while
 holding ~70 GB of VRAM that blocks the respawn. The worker brings the engine back from the
 warm cache and tokens return 2-3 minutes after the kill; the container and its `filler_run`
@@ -113,7 +114,9 @@ row are untouched, so there is no cold start and no launch backoff.
 
 Three cases are deliberately left alone: no socket at all (a cold start legitimately takes
 30-60 minutes, and a restart would only send it back to the beginning), an empty queue (no
-demand is not a fault), and more than one engine in the container — the counters belong to
+demand is not a fault, and idle time never arms the stall clock — the first request after
+a quiet stretch gets the full window), and more than one engine in the container — the
+counters belong to
 whichever engine answered first, so there is no way to tell which one wedged, and the
 watchdog refuses rather than take the healthy ones down with it.
 
@@ -125,7 +128,7 @@ Restarts reach the platform through the sidecar, which appends the watchdog's st
 | `dolphin_watchdog_up` | `0` when the watchdog stopped ticking — a dead watchdog must not look like a healthy one |
 | `dolphin_watchdog_restarts_total` | Engine restarts since the container was created — the count survives the watchdog's own restart, and only a kill that actually removed the process is counted |
 | `dolphin_watchdog_last_restart_timestamp` | Unix time of the last restart |
-| `dolphin_watchdog_stall_seconds` | How long the token counter has been standing still |
+| `dolphin_watchdog_stall_seconds` | How long the token counter has been standing still with requests in flight (an idle queue holds it at zero) |
 
 The series are absent entirely until a watchdog has written its state file even once, so
 zeros never claim a watchdog that was never installed. Once the file exists the series stay,
@@ -137,15 +140,15 @@ Tests (no GPU needed):
 ```bash
 python3 tests/test_sidecar.py            # host run against the repo copy
 python3 tests/test_watchdog.py           # same; the kill tests need /proc and SKIP on macOS
-tests/run_in_image.sh daturaai/dolphin:0.0.8   # both suites inside the image + docker-stop cleanliness
+tests/run_in_image.sh daturaai/dolphin:0.0.9   # both suites inside the image + docker-stop cleanliness
 ```
 
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.8
-VERSION=0.0.9 docker buildx bake       # override the tag
+docker buildx bake                     # daturaai/dolphin:0.0.9
+VERSION=0.0.10 docker buildx bake      # override the tag
 ```
 
 ## Run

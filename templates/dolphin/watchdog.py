@@ -25,7 +25,9 @@ optional, both learned from production: a wedged process ignores SIGTERM, and th
 Deliberately NOT handled here:
 - An engine that never came up at all (no socket). A cold start legitimately produces
   nothing for 30-60 minutes, and killing a worker mid-download restarts the download.
-- An idle queue. No demand is not a fault.
+- An idle queue. No demand is not a fault, and idle time never arms the stall clock —
+  otherwise the first request after a quiet stretch would arrive with the limit already
+  spent and could be killed mid-prefill.
 - More than one engine in the container. The counters read belong to whichever engine
   answered first, so there is no way to tell which one wedged; kill_engine() refuses
   rather than take the healthy ones down with the wedged one.
@@ -278,6 +280,13 @@ def main() -> None:
         # cold start, and a cold start legitimately produces nothing for 30-60 minutes.
         if counters is not None and counters.generated_tokens != last_generated_tokens:
             last_generated_tokens = counters.generated_tokens
+            tokens_last_moved_at = now
+        elif counters is not None and counters.requests_running == 0:
+            # An idle queue holds the clock at zero rather than merely masking the kill:
+            # stall banked while nothing was asked of the engine would otherwise fire the
+            # moment the first request lands, when a poll can catch it mid-prefill —
+            # requests running, no tokens generated yet — and SIGKILL a healthy engine
+            # together with the request it was serving.
             tokens_last_moved_at = now
         elif not poll.socket_found:
             last_generated_tokens = None
