@@ -115,7 +115,7 @@ def garbage_uds(sock_path: pathlib.Path):
 
 
 @contextlib.contextmanager
-def sidecar(glob_pattern: str, token: str | None):
+def sidecar(glob_pattern: str, token: str | None, extra_env: dict[str, str] | None = None):
     # run the real sidecar as a subprocess, wait until it listens
     port = free_port()
     env = dict(os.environ)
@@ -124,6 +124,7 @@ def sidecar(glob_pattern: str, token: str | None):
     env.pop("METRICS_TOKEN", None)
     if token is not None:
         env["METRICS_TOKEN"] = token
+    env.update(extra_env or {})
     proc = subprocess.Popen(
         [sys.executable, SIDECAR_PATH], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -168,7 +169,7 @@ def test_passthrough_and_appended_series() -> None:
     assert b"\ndolphin_sidecar_up 1\n" in body
     assert b"dolphin_sidecar_proxy_ok 1\n" in body
     assert b"dolphin_sidecar_sockets_found 1\n" in body
-    assert b"dolphin_sidecar_version 1\n" in body
+    assert b"dolphin_sidecar_version 2\n" in body
     assert ctype.startswith("text/plain; version=0.0.4"), ctype
 
 
@@ -259,7 +260,7 @@ def test_health_endpoint() -> None:
     assert status == 200, status
     assert ctype.startswith("application/json"), ctype
     payload = json.loads(body)
-    assert payload["sidecar_version"] == 1
+    assert payload["sidecar_version"] == 2
     assert payload["sockets_found"] == 1
     assert payload["socket"].endswith("v.sock")
     assert payload["last_ok"] > 0
@@ -269,6 +270,208 @@ def test_post_rejected() -> None:
     with tempfile.TemporaryDirectory() as tmp, sidecar(f"{tmp}/dp-*/v.sock", TOKEN) as base:
         status, _, _ = get(f"{base}/metrics", method="POST")
     assert status == 405, status
+
+
+# --- multi-engine (DAH-2465) -------------------------------------------------
+#
+# One container can run N worker instances, so N vLLM engines answer on N sockets. Every real
+# engine labels itself engine="0" with the same model_name, so their label sets are IDENTICAL:
+# concatenating bodies untagged yields duplicate series, and picking one (the old "first good
+# response wins") publishes 1/N of the tokens with nothing to signal it. These tests pin the
+# property that actually matters — no tokens are lost and no series collide.
+
+
+def _load_sidecar_module():
+    # import the shipped file directly; its module body only reads env, nothing starts
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("sidecar_under_test", SIDECAR_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _samples(body: bytes, metric: bytes) -> list[tuple[bytes, float]]:
+    # every (label_set, value) pair for one metric name in an exposition body
+    found = []
+    for line in body.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(metric):
+            continue
+        rest = line[len(metric):]
+        if rest[:1] not in (b"{", b" ", b"\t"):
+            continue  # a longer metric name that merely starts the same way
+        labels, _, value = rest.rpartition(b" ")
+        found.append((labels.strip(), float(value)))
+    return found
+
+
+def _fixture_with_generated(value: float) -> bytes:
+    # same real body, different token counter, so the two engines are distinguishable
+    out = []
+    for line in FIXTURE.split(b"\n"):
+        if line.startswith(b"vllm:generation_tokens_total{"):
+            labels, _, _ = line.rpartition(b" ")
+            out.append(labels + b" " + str(value).encode())
+        else:
+            out.append(line)
+    return b"\n".join(out)
+
+
+@contextlib.contextmanager
+def _two_engines(tmp: str, body_a: bytes, body_b: bytes):
+    sock_a = pathlib.Path(tmp) / "dp-aaa" / "v.sock"
+    sock_b = pathlib.Path(tmp) / "dp-bbb" / "v.sock"
+    sock_a.parent.mkdir()
+    sock_b.parent.mkdir()
+    with fake_vllm(sock_a, body_a), fake_vllm(sock_b, body_b):
+        yield
+
+
+def test_two_engines_lose_no_tokens() -> None:
+    # THE regression test for the single-engine bug: the totals of both engines must both
+    # reach the scraper, which sums across label sets.
+    a, b = _fixture_with_generated(19340.0), _fixture_with_generated(500.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        with _two_engines(tmp, a, b), sidecar(f"{tmp}/dp-*/v.sock", TOKEN) as base:
+            _, body, _ = get(f"{base}/metrics")
+    samples = _samples(body, b"vllm:generation_tokens_total")
+    assert len(samples) == 2, f"expected one series per engine, got {samples}"
+    assert sum(value for _, value in samples) == 19840.0, samples
+
+
+def test_two_engines_get_distinct_label_sets() -> None:
+    # identical upstream labels must not collapse: a scraper that keys by label set would
+    # otherwise keep only one engine's value
+    a, b = _fixture_with_generated(1.0), _fixture_with_generated(2.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        with _two_engines(tmp, a, b), sidecar(f"{tmp}/dp-*/v.sock", TOKEN) as base:
+            _, body, _ = get(f"{base}/metrics")
+    label_sets = [labels for labels, _ in _samples(body, b"vllm:generation_tokens_total")]
+    assert len(set(label_sets)) == 2, label_sets
+    assert all(b'dolphin_engine="dp-' in labels for labels in label_sets), label_sets
+
+
+def test_two_engines_report_up_count() -> None:
+    a, b = _fixture_with_generated(1.0), _fixture_with_generated(2.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        with _two_engines(tmp, a, b), sidecar(
+            f"{tmp}/dp-*/v.sock", TOKEN, {"DOLPHIN_ENGINES_EXPECTED": "2"}
+        ) as base:
+            _, body, _ = get(f"{base}/metrics")
+    assert b"dolphin_engines_up 2\n" in body
+    assert b"dolphin_engines_expected 2\n" in body
+
+
+def test_dead_engine_reads_as_a_gap_not_a_smaller_number() -> None:
+    # with N engines behind one port, a dead engine only makes the token total smaller, which
+    # is indistinguishable from a quiet machine. up < expected is what makes it visible.
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = pathlib.Path(tmp) / "dp-aaa" / "v.sock"
+        sock.parent.mkdir()
+        (pathlib.Path(tmp) / "dp-dead").mkdir()  # socket dir with no listener
+        with fake_vllm(sock, FIXTURE), sidecar(
+            f"{tmp}/dp-*/v.sock", TOKEN, {"DOLPHIN_ENGINES_EXPECTED": "2"}
+        ) as base:
+            _, body, _ = get(f"{base}/metrics")
+    assert b"dolphin_engines_up 1\n" in body
+    assert b"dolphin_engines_expected 2\n" in body
+    assert b"dolphin_sidecar_proxy_ok 1\n" in body, "one live engine still means proxy_ok"
+
+
+def test_split_container_labels_the_survivor_while_a_sibling_is_down() -> None:
+    # The label must not depend on how many engines answered this scrape: dropping it for the
+    # minutes a sibling spends restarting makes the survivor a different series to the scraper
+    # — its counter reads as gone, and the relabelled one as a fresh counter starting at zero.
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = pathlib.Path(tmp) / "dp-aaa" / "v.sock"
+        sock.parent.mkdir()
+        (pathlib.Path(tmp) / "dp-restarting").mkdir()  # socket dir with no listener
+        with fake_vllm(sock, FIXTURE), sidecar(
+            f"{tmp}/dp-*/v.sock", TOKEN, {"DOLPHIN_ENGINES_EXPECTED": "2"}
+        ) as base:
+            _, body, _ = get(f"{base}/metrics")
+    label_sets = [labels for labels, _ in _samples(body, b"vllm:generation_tokens_total")]
+    assert label_sets, "the live engine's counter must still be published"
+    assert all(b'dolphin_engine="dp-aaa"' in labels for labels in label_sets), label_sets
+
+
+def test_metric_families_stay_contiguous() -> None:
+    # Exposition validity: every sample of one metric family must form a single block.
+    # Concatenating two whole engine bodies would interleave families and break this.
+    # A histogram's _bucket/_sum/_count belong to the family named by its # TYPE line, so
+    # families -- not raw sample names -- are the unit that must stay together.
+    a, b = _fixture_with_generated(1.0), _fixture_with_generated(2.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        with _two_engines(tmp, a, b), sidecar(f"{tmp}/dp-*/v.sock", TOKEN) as base:
+            _, body, _ = get(f"{base}/metrics")
+
+    declared = {
+        parts[2]
+        for parts in (line.split() for line in body.split(b"\n"))
+        if len(parts) >= 3 and parts[0] == b"#" and parts[1] == b"TYPE"
+    }
+
+    def family_of(name: bytes) -> bytes:
+        if name in declared:
+            return name
+        for suffix in (b"_bucket", b"_sum", b"_count", b"_created", b"_total"):
+            if name.endswith(suffix) and name[: -len(suffix)] in declared:
+                return name[: -len(suffix)]
+        return name
+
+    assert declared, "no # TYPE lines survived the merge"
+    seen: set[bytes] = set()
+    previous = b""
+    for line in body.split(b"\n"):
+        line = line.strip()
+        if not line or line.startswith(b"#"):
+            continue
+        family = family_of(line.split(b"{")[0].split(b" ")[0])
+        if family != previous:
+            assert family not in seen, f"family {family!r} appears in two separate blocks"
+            seen.add(family)
+            previous = family
+
+
+def test_tag_series_survives_braces_inside_label_values() -> None:
+    # a naive rfind/index on "}" would cut inside the value and corrupt the line
+    module = _load_sidecar_module()
+    line = b'vllm:x{model_name="a}b",engine="0"} 5.0'
+    tagged = module.tag_series(line, "dp-zzz").strip()
+    assert tagged == b'vllm:x{model_name="a}b",engine="0",dolphin_engine="dp-zzz"} 5.0', tagged
+
+
+def test_tag_series_adds_braces_when_line_has_no_labels() -> None:
+    module = _load_sidecar_module()
+    tagged = module.tag_series(b"vllm:x 5.0", "dp-zzz").strip()
+    assert tagged == b'vllm:x{dolphin_engine="dp-zzz"} 5.0', tagged
+
+
+def test_engine_id_comes_from_the_socket_directory() -> None:
+    module = _load_sidecar_module()
+    assert module.engine_id("/tmp/dp-4f2a/v.sock") == "dp-4f2a"
+
+
+def test_scrape_budget_grows_with_engine_count_but_stays_under_the_client_timeout() -> None:
+    # One deadline covers all engines, so a fixed budget would drop the tail on a wide node --
+    # the same undercount the fan-out exists to prevent. The cap keeps it under the scraper's
+    # 8 s client timeout.
+    previous = os.environ.get("DOLPHIN_ENGINES_EXPECTED")
+    try:
+        budgets = {}
+        for expected in ("0", "1", "2", "8", "64"):
+            os.environ["DOLPHIN_ENGINES_EXPECTED"] = expected
+            budgets[expected] = _load_sidecar_module().TOTAL_BUDGET_S
+    finally:
+        if previous is None:
+            os.environ.pop("DOLPHIN_ENGINES_EXPECTED", None)
+        else:
+            os.environ["DOLPHIN_ENGINES_EXPECTED"] = previous
+    assert budgets["0"] == 4.0, budgets
+    assert budgets["1"] == 4.0, budgets
+    assert budgets["8"] > budgets["2"] > budgets["1"], budgets
+    assert budgets["64"] <= 7.0, budgets
 
 
 def main() -> None:

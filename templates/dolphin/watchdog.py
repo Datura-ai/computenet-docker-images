@@ -22,15 +22,25 @@ optional, both learned from production: a wedged process ignores SIGTERM, and th
 `VLLM::EngineCore` child survived the parent's death in 12 of 12 cases while holding
 ~70 GB of VRAM, which blocks the respawn until it is killed too.
 
+Split mode (DAH-2465): one container may run N worker instances, one per GPU bundle, so
+N vLLM engines share this /proc. `DOLPHIN_WATCHDOG_GPU_SET` names the cards this watchdog
+owns, and everything below is then scoped to that bundle alone — the counters it judges
+come from its own engine's socket, and the kill reaches only its own processes. A sibling
+bundle's engine is another instance's business; killing it would turn one wedge into N.
+The mapping is measured, not assumed: the worker exports CUDA_VISIBLE_DEVICES per engine
+and drives vLLM with `--uds /tmp/dp-<id>/v.sock`, so /proc gives cards -> pid -> socket.
+
 Deliberately NOT handled here:
 - An engine that never came up at all (no socket). A cold start legitimately produces
   nothing for 30-60 minutes, and killing a worker mid-download restarts the download.
 - An idle queue. No demand is not a fault, and idle time never arms the stall clock —
   otherwise the first request after a quiet stretch would arrive with the limit already
   spent and could be killed mid-prefill.
-- More than one engine in the container. The counters read belong to whichever engine
-  answered first, so there is no way to tell which one wedged; kill_engine() refuses
-  rather than take the healthy ones down with the wedged one.
+- Any engine this watchdog cannot prove is its own. Unscoped, the counters read belong to
+  whichever engine answered first, so with several engines in one container there is no
+  way to tell which one wedged; scoped, two engines claiming the same cards mean the
+  environment does not separate the bundles the way it was measured to. Both cases kill
+  NOTHING, because a wrong guess costs a healthy bundle on top of the wedged one.
 """
 
 import json
@@ -42,10 +52,11 @@ import time
 
 from dataclasses import asdict, dataclass
 
-# The sidecar owns the unix-socket client, the socket-discovery order, the state-file path
+# The sidecar owns the unix-socket client, the socket-discovery order, the state-file paths
 # and the state schema; importing it keeps one implementation of each. Its module body only
 # reads env — nothing starts on import.
 from metrics_sidecar import (
+    SINGLE_ENGINE_STATE_PATH,
     TOTAL_BUDGET_S,
     WATCHDOG_STATE_PATH,
     WatchdogState,
@@ -65,9 +76,15 @@ ORPHAN_SETTLE_S = 2.0
 # blocks for the fetch budget plus both grace periods. The sidecar turns a wider gap than
 # this into dolphin_watchdog_up 0, so it must not be read off the poll interval alone.
 MAX_WRITE_GAP_S = POLL_INTERVAL_S + TOTAL_BUDGET_S + ENGINE_CORE_GRACE_S + ORPHAN_SETTLE_S
+# One state file per bundle in split mode, named by the entrypoint. Unset is the single-engine
+# path, which is also what the sidecar's glob finds either way.
+STATE_PATH = WATCHDOG_STATE_PATH or SINGLE_ENGINE_STATE_PATH
 
 SERVE_CMDLINE_MARKER = "vllm serve"
 ENGINE_CORE_CMDLINE_MARKER = "VLLM::EngineCore"
+# The socket the worker gives its engine, and the only handle that ties a process to the
+# metrics this watchdog reads.
+_UDS_ARG_RE = re.compile(r"--uds[= ]+(\S+)")
 
 # The optional group skips the labels (engine, model_name) that vLLM puts on these lines.
 _GENERATED_TOKENS_RE = re.compile(
@@ -76,6 +93,17 @@ _GENERATED_TOKENS_RE = re.compile(
 _REQUESTS_RUNNING_RE = re.compile(
     rb"^vllm:num_requests_running(?:\{[^}]*\})?[ \t]+([0-9.eE+-]+)", re.M
 )
+
+
+def normalize_gpus(value: str) -> tuple[str, ...]:
+    # "2,3", "3,2" and " 2, 3 " all name the same bundle; order and spacing are not meaningful.
+    return tuple(sorted(part.strip() for part in value.split(",") if part.strip()))
+
+
+# Empty = the single-engine container: every vLLM process in /proc belongs to the one engine,
+# which is the pre-split behavior the whole current fleet runs.
+GPU_SET = normalize_gpus(os.environ.get("DOLPHIN_WATCHDOG_GPU_SET", ""))
+SCOPE = f"GPUs {','.join(GPU_SET)}" if GPU_SET else "every vLLM process in this container"
 
 
 @dataclass(frozen=True)
@@ -97,11 +125,26 @@ class EnginePoll:
 
 
 @dataclass(frozen=True)
-class EnginePids:
-    """The engine's processes, as two markers found in /proc cmdlines."""
+class EngineProcesses:
+    """One engine's processes and the socket that identifies it.
+
+    In split mode this is exactly one bundle's engine; in a single-engine container it is
+    every vLLM process in /proc, which amounts to the same thing.
+    """
 
     serve: list[int]
     engine_core: list[int]
+    socket: str | None
+
+
+@dataclass(frozen=True)
+class VllmProcess:
+    """A vLLM process as /proc describes it, with the two facts that identify its bundle."""
+
+    pid: int
+    cmdline: str
+    gpus: tuple[str, ...] | None
+    ppid: int
 
 
 def _log(msg: str) -> None:
@@ -118,10 +161,21 @@ def _first_metric_value(pattern: re.Pattern[bytes], body: bytes) -> float | None
         return None
 
 
-def poll_engine() -> EnginePoll:
+def sockets_to_poll(engine: EngineProcesses | None) -> list[str]:
+    # In split mode only THIS bundle's socket may be read: a sibling's counters would
+    # attribute its wedge — or its health — to us, and the kill that follows lands on the
+    # wrong engine. An unidentified engine yields no socket, which the poll below reads as
+    # "nothing came up yet" and is the safe answer.
+    if not GPU_SET:
+        return discover_sockets()
+    if engine is None or engine.socket is None:
+        return []
+    return [engine.socket]
+
+
+def poll_engine(sockets: list[str]) -> EnginePoll:
     # Missing counters never fire a kill on their own; what they do to the stall clock
     # depends on whether a socket was there at all, so the two cases stay distinguishable.
-    sockets = discover_sockets()
     if not sockets:
         return EnginePoll(counters=None, socket_found=False)
     body = fetch_vllm_metrics(sockets)
@@ -139,12 +193,55 @@ def poll_engine() -> EnginePoll:
     )
 
 
-def find_engine_pids() -> EnginePids:
+def _read_cmdline(pid: int) -> str | None:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return fh.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return None  # process exited between listdir and open
+
+
+def _read_gpus(pid: int) -> tuple[str, ...] | None:
+    # The worker sets CUDA_VISIBLE_DEVICES per engine, so the environment is what tells one
+    # bundle's `vllm serve` from another's inside a shared container. Measured on live
+    # engines: the EngineCore child does NOT inherit it, which is why the parent link in
+    # find_engine_processes() is the claim that actually carries the children.
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    for item in raw.split(b"\0"):
+        if item.startswith(b"CUDA_VISIBLE_DEVICES="):
+            return normalize_gpus(item.split(b"=", 1)[1].decode(errors="replace"))
+    return None
+
+
+def _read_ppid(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def socket_from_cmdline(cmdline: str) -> str | None:
+    # `vllm serve --uds /tmp/dp-<id>/v.sock` — the same socket the metrics sidecar scrapes,
+    # so the command line is what maps a process to the engine whose counters we read.
+    match = _UDS_ARG_RE.search(cmdline)
+    return match.group(1) if match else None
+
+
+def scan_vllm_processes() -> list[VllmProcess]:
     # Scanning /proc rather than pkill, which matches its own shell cmdline. The watchdog
     # runs inside the filler container, so /proc can only ever show that container's
-    # processes — no risk of reaching another filler on the same machine.
-    serve: list[int] = []
-    engine_core: list[int] = []
+    # processes — no risk of reaching another filler on the same machine. environ and status
+    # are read only for processes that already matched a marker, so this stays a handful of
+    # extra file reads per poll.
+    processes: list[VllmProcess] = []
     own_pid = os.getpid()
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -152,16 +249,51 @@ def find_engine_pids() -> EnginePids:
         pid = int(entry)
         if pid == own_pid:
             continue
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                cmdline = fh.read().replace(b"\0", b" ").decode(errors="replace")
-        except OSError:
-            continue  # process exited between listdir and open
-        if SERVE_CMDLINE_MARKER in cmdline:
-            serve.append(pid)
-        elif ENGINE_CORE_CMDLINE_MARKER in cmdline:
-            engine_core.append(pid)
-    return EnginePids(serve=serve, engine_core=engine_core)
+        cmdline = _read_cmdline(pid)
+        if cmdline is None:
+            continue
+        if SERVE_CMDLINE_MARKER not in cmdline and ENGINE_CORE_CMDLINE_MARKER not in cmdline:
+            continue
+        processes.append(
+            VllmProcess(pid=pid, cmdline=cmdline, gpus=_read_gpus(pid), ppid=_read_ppid(pid))
+        )
+    return processes
+
+
+def find_engine_processes() -> EngineProcesses | None:
+    # None means "cannot tell which engine is mine" and the caller must then do nothing.
+    # That is the whole safety property of split mode: guessing wrong does not lose one
+    # bundle, it loses a healthy one as well.
+    processes = scan_vllm_processes()
+    serves = [p for p in processes if SERVE_CMDLINE_MARKER in p.cmdline]
+    cores = [p for p in processes if SERVE_CMDLINE_MARKER not in p.cmdline]
+
+    if not GPU_SET:
+        return EngineProcesses(
+            serve=[p.pid for p in serves], engine_core=[p.pid for p in cores], socket=None
+        )
+
+    own_serves = [p for p in serves if p.gpus == GPU_SET]
+    sockets = {path for path in (socket_from_cmdline(p.cmdline) for p in own_serves) if path}
+    if len(sockets) > 1:
+        # Two engines claiming the same cards means the environment does not separate the
+        # bundles the way it was measured to (a worker re-indexing CUDA_VISIBLE_DEVICES would
+        # do it). Refusing is the only safe answer, and engine_found 0 makes it visible.
+        _log(
+            f"WARNING: {len(sockets)} engines claim GPUs {','.join(GPU_SET)} "
+            f"({sorted(sockets)}) — refusing to act on an ambiguous match"
+        )
+        return None
+
+    serve_pids = [p.pid for p in own_serves]
+    # The EngineCore child does not inherit CUDA_VISIBLE_DEVICES, so the parent link is what
+    # claims it; the cards are still checked first for a child that does carry them. Neither
+    # claim can point at a sibling's bundle.
+    parents = set(serve_pids)
+    engine_core_pids = [p.pid for p in cores if p.gpus == GPU_SET or p.ppid in parents]
+    return EngineProcesses(
+        serve=serve_pids, engine_core=engine_core_pids, socket=next(iter(sockets), None)
+    )
 
 
 def _is_alive(pid: int) -> bool:
@@ -184,36 +316,41 @@ def _sigkill(pids: list[int]) -> None:
 
 
 def kill_engine() -> bool:
-    """SIGKILL the engine and report whether it is actually gone afterwards. Only SIGKILL:
-    a process stuck in a CUDA kernel ignores SIGTERM. False means nothing was killed —
-    nothing to kill, several engines share the container, or the signal was survived (a
-    CUDA ioctl can leave a process unkillable). Counting those as restarts would let a
-    permanently wedged engine report as one being cured every grace period."""
-    pids = find_engine_pids()
-    if not pids.serve and not pids.engine_core:
+    """SIGKILL this watchdog's engine and report whether it is actually gone afterwards.
+    Only SIGKILL: a process stuck in a CUDA kernel ignores SIGTERM. False means nothing was
+    killed — nothing to kill, an engine that cannot be told apart from its siblings, or the
+    signal was survived (a CUDA ioctl can leave a process unkillable). Counting those as
+    restarts would let a permanently wedged engine report as one being cured every grace
+    period. The /proc scan is repeated here rather than reused from the poll: pids read a
+    minute ago may already belong to something else."""
+    engine = find_engine_processes()
+    if engine is None:
+        _log("wedge detected but this bundle's engine is ambiguous — killing nothing")
+        return False
+    if not engine.serve and not engine.engine_core:
         _log("wedge detected but no `vllm serve` process found — nothing to kill")
         return False
-    # The counters came from whichever engine answered first, so with several in one
+    # Unscoped, the counters came from whichever engine answered first, so with several in one
     # container there is no way to tell which one wedged. Refusing is the safe half of that
     # trade, and it holds however the image is launched — an entrypoint that only starts the
     # watchdog for a single engine cannot protect an image someone runs by hand.
-    if len(pids.serve) > 1:
-        _log(f"wedge detected but {len(pids.serve)} engines share this container — refusing")
+    if not GPU_SET and len(engine.serve) > 1:
+        _log(f"wedge detected but {len(engine.serve)} engines share this container — refusing")
         return False
 
-    _log(f"killing engine: serve={pids.serve} (EngineCore={pids.engine_core})")
-    _sigkill(pids.serve)
+    _log(f"killing engine ({SCOPE}): serve={engine.serve} (EngineCore={engine.engine_core})")
+    _sigkill(engine.serve)
     time.sleep(ENGINE_CORE_GRACE_S)
 
     # The child usually outlives its parent and keeps the whole model in VRAM; until it is
     # gone the respawned engine cannot allocate.
-    orphans = [pid for pid in pids.engine_core if _is_alive(pid)]
+    orphans = [pid for pid in engine.engine_core if _is_alive(pid)]
     if orphans:
         _log(f"EngineCore outlived its parent, killing directly: {orphans}")
         _sigkill(orphans)
         time.sleep(ORPHAN_SETTLE_S)
 
-    survivors = [pid for pid in pids.serve + pids.engine_core if _is_alive(pid)]
+    survivors = [pid for pid in engine.serve + engine.engine_core if _is_alive(pid)]
     if survivors:
         _log(f"WARNING: still alive after SIGKILL, not counting a restart: {survivors}")
         return False
@@ -222,10 +359,13 @@ def kill_engine() -> bool:
 
 def write_state(
     restarts_total: int, last_restart_timestamp: float, stall_seconds: float,
-    counters: EngineCounters | None,
+    counters: EngineCounters | None, engine_socket: str | None,
 ) -> None:
     # Written every tick, so its freshness doubles as the watchdog's own heartbeat: the
     # sidecar turns a stale file into dolphin_watchdog_up 0 instead of silence.
+    # gpus + engine_socket are what let the sidecar label N bundles apart and publish
+    # engine_found, so a watchdog that is running but cannot see its engine — the one state
+    # that guards nothing while looking alive — is not silent either.
     state = WatchdogState(
         updated=time.time(),
         max_write_gap_s=MAX_WRITE_GAP_S,
@@ -234,14 +374,16 @@ def write_state(
         stall_seconds=round(stall_seconds, 1),
         requests_running=counters.requests_running if counters else None,
         generated_tokens=counters.generated_tokens if counters else None,
+        gpus=",".join(GPU_SET) or None,
+        engine_socket=engine_socket,
     )
-    tmp_path = f"{WATCHDOG_STATE_PATH}.tmp"
+    tmp_path = f"{STATE_PATH}.tmp"
     try:
         with open(tmp_path, "w") as fh:
             json.dump(asdict(state), fh)
-        os.replace(tmp_path, WATCHDOG_STATE_PATH)  # atomic: the sidecar never reads a half file
+        os.replace(tmp_path, STATE_PATH)  # atomic: the sidecar never reads a half file
     except OSError as e:
-        _log(f"could not write state to {WATCHDOG_STATE_PATH}: {e}")
+        _log(f"could not write state to {STATE_PATH}: {e}")
 
 
 def load_previous_state() -> WatchdogState | None:
@@ -249,7 +391,7 @@ def load_previous_state() -> WatchdogState | None:
     # a machine that keeps wedging would then read as a machine that never wedged, and a
     # fresh watchdog would judge an engine still reloading from the last kill. Scope is the
     # container's lifetime — a new container starts from an empty directory anyway.
-    return WatchdogState.read(WATCHDOG_STATE_PATH)
+    return WatchdogState.read(STATE_PATH)
 
 
 def main() -> None:
@@ -257,8 +399,8 @@ def main() -> None:
     restarts_total = previous_state.restarts_total if previous_state else 0
     last_restart_timestamp = previous_state.last_restart_timestamp if previous_state else 0.0
     _log(
-        f"watching engine: poll {POLL_INTERVAL_S:.0f}s, stall limit {STALL_LIMIT_S:.0f}s, "
-        f"state {WATCHDOG_STATE_PATH}, {restarts_total} restart(s) so far this container"
+        f"watching {SCOPE}: poll {POLL_INTERVAL_S:.0f}s, stall limit {STALL_LIMIT_S:.0f}s, "
+        f"state {STATE_PATH}, {restarts_total} restart(s) so far this container"
     )
     last_generated_tokens: float | None = None
     tokens_last_moved_at = time.monotonic()
@@ -269,9 +411,17 @@ def main() -> None:
         0.0, RESTART_GRACE_S - (time.time() - last_restart_timestamp)
     )
     was_wedged = False
+    reported_socket: str | None = None
 
     while True:
-        poll = poll_engine()
+        # Only split mode needs the scan: with one engine per container the sidecar's socket
+        # discovery already points at the only engine there is.
+        engine = find_engine_processes() if GPU_SET else None
+        engine_socket = engine.socket if engine else None
+        if GPU_SET and engine_socket != reported_socket:
+            reported_socket = engine_socket
+            _log(f"engine for GPUs {','.join(GPU_SET)}: {engine_socket or 'not identified'}")
+        poll = poll_engine(sockets_to_poll(engine))
         counters = poll.counters
         now = time.monotonic()
 
@@ -319,7 +469,7 @@ def main() -> None:
                 wedged = False
 
         was_wedged = wedged
-        write_state(restarts_total, last_restart_timestamp, stall_seconds, counters)
+        write_state(restarts_total, last_restart_timestamp, stall_seconds, counters, engine_socket)
         time.sleep(POLL_INTERVAL_S)
 
 
