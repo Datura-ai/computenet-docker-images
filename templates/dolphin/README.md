@@ -86,15 +86,15 @@ Tests (no GPU needed):
 
 ```bash
 python3 tests/test_sidecar.py            # host run against the repo copy
-tests/run_in_image.sh daturaai/dolphin:0.0.6   # same tests inside the image + docker-stop cleanliness
+tests/run_in_image.sh daturaai/dolphin:0.0.8   # same tests inside the image + docker-stop cleanliness
 ```
 
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.6
-VERSION=0.0.6 docker buildx bake       # override the tag
+docker buildx bake                     # daturaai/dolphin:0.0.8
+VERSION=0.0.8 docker buildx bake       # override the tag
 ```
 
 ## Run
