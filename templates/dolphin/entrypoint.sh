@@ -46,15 +46,30 @@ LIVENESS_INTERVAL=30
 # Delay between initial worker spawns, AFTER the shared cache is seeded.
 SPLIT_STAGGER_SECONDS="${DOLPHIN_SPLIT_STAGGER_SECONDS:-30}"
 
-# How many workers share each VRAM bundle (DAH-2473). 1 = one worker per bundle, the shipped
-# behavior. >1 puts several engines on the SAME card(s): every extra worker pays a fresh ~31.5 GB
-# for its own copy of the weights out of the KV cache, so it only pays off where the pool, not
-# the card, is the limit. Never raise it without checking the bundle's VRAM budget.
-WORKERS_PER_BUNDLE="${DOLPHIN_WORKERS_PER_BUNDLE:-1}"
-if ! [[ "${WORKERS_PER_BUNDLE}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "[dolphin] DOLPHIN_WORKERS_PER_BUNDLE='${WORKERS_PER_BUNDLE}' is not a positive integer; using 1" >&2
-    WORKERS_PER_BUNDLE=1
+# How many workers share each VRAM bundle (DAH-2473). >1 puts several engines on the SAME card:
+# every extra worker pays a fresh ~31.5 GB for its own copy of the weights out of the KV cache,
+# so it only pays off where the pool, not the card, is the limit.
+#
+# "auto" (the default) derives it from the bundle — see derive_workers_per_bundle. A positive
+# integer forces it, which is the escape hatch for measuring a layout the rule would not pick;
+# it is NOT checked against the card's VRAM, so forcing 2 onto an 80 GB card gives two crippled
+# engines. "1" disables the split entirely.
+WORKERS_PER_BUNDLE_SETTING="${DOLPHIN_WORKERS_PER_BUNDLE:-auto}"
+if [[ "${WORKERS_PER_BUNDLE_SETTING}" != "auto" ]] && ! [[ "${WORKERS_PER_BUNDLE_SETTING}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[dolphin] DOLPHIN_WORKERS_PER_BUNDLE='${WORKERS_PER_BUNDLE_SETTING}' is neither 'auto' nor a positive integer; using auto" >&2
+    WORKERS_PER_BUNDLE_SETTING="auto"
 fi
+# Resolved per bundle at plan time; 1 until then so every helper has a sane value.
+WORKERS_PER_BUNDLE=1
+
+# What one worker needs on the card, in MB: its own copy of the weights plus a KV cache worth
+# having. Measured 2026-07-24 on a live H200 split in two — each engine reported 42 slots and ran
+# 16-21 concurrent requests at 17-19% KV usage, so ~35 slots (0.717 GB each) is a floor with room
+# above the load the pool actually sends, not a number that merely boots.
+WORKER_WEIGHTS_MB="${DOLPHIN_WORKER_WEIGHTS_MB:-32256}"
+WORKER_MIN_KV_MB="${DOLPHIN_WORKER_MIN_KV_MB:-25600}"
+# vLLM is launched with --gpu-memory-utilization 0.85, so this is what a bundle really offers.
+VRAM_USABLE_PERCENT="${DOLPHIN_VRAM_USABLE_PERCENT:-85}"
 
 # On a cold node the siblings wait for the FIRST instance to finish seeding the shared cache
 # instead of merely pausing a few seconds. Measured 2026-07-23: with a 30 s stagger both workers
@@ -79,6 +94,49 @@ DOLPHIN_LOCK_TIMEOUT="${DOLPHIN_LOCK_TIMEOUT:-900}"
 # One line per GPU: "<index>, <vram_mb>". Empty output when nvidia-smi is absent/failing.
 detect_gpus() {
     nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits 2>/dev/null || true
+}
+
+# How many workers this bundle can carry. Two conditions, and both must hold:
+#
+#   1. The bundle is ONE card. Bundles of several cards exist only because each card is too small
+#      to hold the model alone, i.e. the node is built from weak cards — and a weak card is
+#      limited by the card, not by the pool, so splitting it buys nothing. (Measured: an L40S
+#      worker's token rate stops dead at p99 1993 / max 2083, while an H200's median 1697 has a
+#      max of 5384 on the same hardware. Splitting the first is pointless, splitting the second
+#      is the whole point.) A 4x L40S bundle has the VRAM for a split and must still not get one,
+#      which is why VRAM alone is not the test.
+#   2. Every worker still gets its weights plus a real KV cache out of the usable VRAM.
+#
+# Everything the rule needs is already on hand from detect_gpus, so this costs no extra probing.
+derive_workers_per_bundle() {
+    local bundle_cards="$1" bundle_vram_mb="$2"
+    if [[ "${WORKERS_PER_BUNDLE_SETTING}" != "auto" ]]; then
+        echo "${WORKERS_PER_BUNDLE_SETTING}"
+        return
+    fi
+    if (( bundle_cards != 1 )) || (( bundle_vram_mb <= 0 )); then
+        echo 1
+        return
+    fi
+    local per_worker_mb=$(( WORKER_WEIGHTS_MB + WORKER_MIN_KV_MB ))
+    local workers=$(( bundle_vram_mb * VRAM_USABLE_PERCENT / 100 / per_worker_mb ))
+    (( workers < 1 )) && workers=1
+    echo "${workers}"
+}
+
+# "<cards> <total_vram_mb>" behind one plan line; "all" covers every GPU on the node.
+bundle_cards_and_vram() {
+    local gpu_set="$1" index vram cards=0 total=0
+    while IFS=',' read -r index vram; do
+        index="${index//[[:space:]]/}"
+        vram="${vram//[[:space:]]/}"
+        [[ -n "${index}" && -n "${vram}" ]] || continue
+        if [[ "${gpu_set}" == "all" || ",${gpu_set}," == *",${index},"* ]]; then
+            cards=$(( cards + 1 ))
+            total=$(( total + vram ))
+        fi
+    done < <(detect_gpus)
+    echo "${cards} ${total}"
 }
 
 # Print each bundle WORKERS_PER_BUNDLE times: an intra-card split is just the same bundle
@@ -161,13 +219,13 @@ instance_tag() {
 # node keeps the single all-GPUs worker.
 plan_worker_gpu_sets() {
     if [[ -n "${DOLPHIN_GPU_IDS:-}" ]]; then
-        emit_worker_plan "${DOLPHIN_GPU_IDS}"
+        echo "${DOLPHIN_GPU_IDS}"
         return
     fi
     local worker_per_gpu="${DOLPHIN_WORKER_PER_GPU:-1}"
     local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-71680}"
     if [[ "${worker_per_gpu}" != "1" ]]; then
-        emit_worker_plan "all"
+        echo "all"
         return
     fi
     local indices=() vram_values=() index vram
@@ -180,7 +238,7 @@ plan_worker_gpu_sets() {
     done < <(detect_gpus)
     local gpu_count=${#indices[@]}
     if (( gpu_count < 2 )); then
-        emit_worker_plan "all"
+        echo "all"
         return
     fi
     # The smallest card decides how many cards one worker needs (Lium nodes are homogeneous;
@@ -192,13 +250,13 @@ plan_worker_gpu_sets() {
         fi
     done
     if (( min_vram <= 0 )); then
-        emit_worker_plan "all"
+        echo "all"
         return
     fi
     local cards_per_worker=$(( (split_min_vram_mb + min_vram - 1) / min_vram ))
     local worker_count=$(( gpu_count / cards_per_worker ))
     if (( worker_count < 2 )); then
-        emit_worker_plan "all"
+        echo "all"
         return
     fi
     # Spread ALL cards evenly over the workers (bundle sizes differ by at most 1), then verify
@@ -218,13 +276,13 @@ plan_worker_gpu_sets() {
             bundle_vram=$(( bundle_vram + vram_values[i] ))
         done
         if (( bundle_vram < split_min_vram_mb )); then
-            emit_worker_plan "all"
+            echo "all"
             return
         fi
         bundles+=("${bundle}")
         cursor=$(( cursor + size ))
     done
-    emit_worker_plan "${bundles[@]}"
+    printf '%s\n' "${bundles[@]}"
 }
 
 # Render one worker.json into <config_dir>. gpu_set "all" -> gpu_ids null. 0600 up front:
@@ -352,16 +410,25 @@ main() {
     done < <(plan_worker_gpu_sets)
     local instance_count=${#gpu_sets[@]}
 
+    # Lium nodes are homogeneous, so the first bundle decides the layout for all of them.
+    local bundle_cards bundle_vram
+    read -r bundle_cards bundle_vram < <(bundle_cards_and_vram "${gpu_sets[0]}")
+    WORKERS_PER_BUNDLE="$(derive_workers_per_bundle "${bundle_cards}" "${bundle_vram}")"
+
     # Only an intra-card split needs the VRAM divided; one worker per bundle keeps the vendor's
     # own 0.85 of the whole card. If the runtime isn't downloaded yet there is nothing to wrap,
     # and running N engines that each claim the whole card just crash-loops N-1 of them — so
     # fall back to a single worker for this start and split once the cache is warm.
     if (( WORKERS_PER_BUNDLE > 1 )) && ! install_engine_memory_wrapper; then
         WORKERS_PER_BUNDLE=1
-        gpu_sets=()
+    fi
+    if (( WORKERS_PER_BUNDLE > 1 )); then
+        echo "[dolphin] bundle of ${bundle_cards} card(s), ${bundle_vram} MB -> ${WORKERS_PER_BUNDLE} workers per bundle" >&2
+        local expanded=()
         while IFS= read -r gpu_set_line; do
-            [[ -n "${gpu_set_line}" ]] && gpu_sets+=("${gpu_set_line}")
-        done < <(plan_worker_gpu_sets)
+            [[ -n "${gpu_set_line}" ]] && expanded+=("${gpu_set_line}")
+        done < <(emit_worker_plan "${gpu_sets[@]}")
+        gpu_sets=("${expanded[@]}")
         instance_count=${#gpu_sets[@]}
     fi
 

@@ -376,26 +376,46 @@ EOF
 # ---------------------------------------------------------------- intra-card split (DAH-2473)
 test_intra_card_plan() {
     make_sandbox
-    export DOLPHIN_WORKERS_PER_BUNDLE=2
+    unset DOLPHIN_WORKERS_PER_BUNDLE DOLPHIN_GPU_IDS DOLPHIN_WORKER_PER_GPU DOLPHIN_SPLIT_MIN_VRAM_MB || true
     load_entrypoint
-    unset DOLPHIN_GPU_IDS DOLPHIN_WORKER_PER_GPU DOLPHIN_SPLIT_MIN_VRAM_MB || true
+
+    # The rule must reproduce the fleet's real verdicts, most of all the ones that would hurt:
+    # 80 GB cards cannot hold two copies of the weights, and bundles of small cards are limited
+    # by the card rather than by the pool, so splitting them buys nothing.
+    assert_eq "H200 splits in two"              "2" "$(derive_workers_per_bundle 1 143771)"
+    assert_eq "B200 splits in two"              "2" "$(derive_workers_per_bundle 1 183359)"
+    assert_eq "B300 splits in four"             "4" "$(derive_workers_per_bundle 1 281600)"
+    assert_eq "H100 80GB is never split"        "1" "$(derive_workers_per_bundle 1 81559)"
+    assert_eq "RTX PRO 6000 96GB is not split"  "1" "$(derive_workers_per_bundle 1 97887)"
+    assert_eq "a 2-card L40S bundle is not split" "1" "$(derive_workers_per_bundle 2 92136)"
+    assert_eq "a 4-card bundle with H200-class VRAM is still not split" "1" \
+        "$(derive_workers_per_bundle 4 184272)"
+    assert_eq "a bundle of unknown size is not split" "1" "$(derive_workers_per_bundle 1 0)"
 
     mock_nvidia_smi "0:143771"
-    assert_eq "a lone H200 gets two workers on the same card" "all|all" "$(plan_as_line)"
+    assert_eq "'all' on a one-card node measures that card" "1 143771" "$(bundle_cards_and_vram all)"
+    mock_nvidia_smi "0:143771" "1:143771" "2:143771" "3:143771"
+    assert_eq "'all' on a four-card node measures all of them" "4 575084" "$(bundle_cards_and_vram all)"
+    assert_eq "a pinned bundle measures only its own cards" "2 287542" "$(bundle_cards_and_vram 1,2)"
+    assert_eq "card 10 is not matched by card 1" "1 143771" "$(bundle_cards_and_vram 1)"
 
-    mock_nvidia_smi "0:143771" "1:143771"
-    assert_eq "every card is claimed twice" "0|0|1|1" "$(plan_as_line)"
+    WORKERS_PER_BUNDLE=2
+    assert_eq "each bundle is claimed by two workers" "0|0|1|1" \
+        "$(emit_worker_plan 0 1 | paste -sd'|' -)"
     assert_eq "replicas of one card get distinct homes" "w0-gpu0 w1-gpu0" \
         "$(instance_tag 0 0) $(instance_tag 1 0)"
+    WORKERS_PER_BUNDLE=1
+    assert_eq "off: the plan is untouched" "0|1" "$(emit_worker_plan 0 1 | paste -sd'|' -)"
+    assert_eq "off: the shipped home name is untouched" "gpu0" "$(instance_tag 0 0)"
 
-    export DOLPHIN_WORKERS_PER_BUNDLE=1
+    # An explicit value is the escape hatch for measuring a layout the rule would not pick.
+    export DOLPHIN_WORKERS_PER_BUNDLE=3
     load_entrypoint
-    assert_eq "off by default: one worker per card" "0|1" "$(plan_as_line)"
-    assert_eq "off by default: the shipped home name is untouched" "gpu0" "$(instance_tag 0 0)"
-
+    assert_eq "an explicit count overrides the rule, VRAM and all" "3" \
+        "$(derive_workers_per_bundle 1 81559)"
     export DOLPHIN_WORKERS_PER_BUNDLE=oops
     load_entrypoint 2>/dev/null
-    assert_eq "a junk worker count falls back to one worker per card" "0|1" "$(plan_as_line)"
+    assert_eq "a junk value falls back to the rule" "2" "$(derive_workers_per_bundle 1 143771)"
     unset DOLPHIN_WORKERS_PER_BUNDLE
 }
 
@@ -404,9 +424,10 @@ test_intra_card_plan() {
 # init, a double wrapper and every engine claims a quarter of the card it should have halved.
 test_engine_memory_wrapper() {
     make_sandbox
-    export DOLPHIN_WORKERS_PER_BUNDLE=2
     export DOLPHIN_HOME="${SANDBOX}/dolphin"
     load_entrypoint
+    # main resolves this per bundle; the wrapper is what turns it into an actual VRAM fraction.
+    WORKERS_PER_BUNDLE=2
 
     if install_engine_memory_wrapper 2>/dev/null; then
         echo "FAIL a missing runtime must refuse so the caller can fall back"
@@ -444,7 +465,7 @@ test_engine_memory_wrapper() {
     assert_eq "re-running the install is idempotent" \
         "VENDOR2 serve m --gpu-memory-utilization 0.4250" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
-    unset DOLPHIN_WORKERS_PER_BUNDLE DOLPHIN_HOME
+    unset DOLPHIN_HOME
 }
 
 test_plan
