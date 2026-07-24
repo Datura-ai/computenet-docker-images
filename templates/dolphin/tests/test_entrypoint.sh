@@ -373,7 +373,83 @@ EOF
         "$(ls "${DOLPHIN_HOME}"/watchdog_state_gpu7.json 2>/dev/null)"
 }
 
+# ---------------------------------------------------------------- intra-card split (DAH-2473)
+test_intra_card_plan() {
+    make_sandbox
+    export DOLPHIN_WORKERS_PER_BUNDLE=2
+    load_entrypoint
+    unset DOLPHIN_GPU_IDS DOLPHIN_WORKER_PER_GPU DOLPHIN_SPLIT_MIN_VRAM_MB || true
+
+    mock_nvidia_smi "0:143771"
+    assert_eq "a lone H200 gets two workers on the same card" "all|all" "$(plan_as_line)"
+
+    mock_nvidia_smi "0:143771" "1:143771"
+    assert_eq "every card is claimed twice" "0|0|1|1" "$(plan_as_line)"
+    assert_eq "replicas of one card get distinct homes" "w0-gpu0 w1-gpu0" \
+        "$(instance_tag 0 0) $(instance_tag 1 0)"
+
+    export DOLPHIN_WORKERS_PER_BUNDLE=1
+    load_entrypoint
+    assert_eq "off by default: one worker per card" "0|1" "$(plan_as_line)"
+    assert_eq "off by default: the shipped home name is untouched" "gpu0" "$(instance_tag 0 0)"
+
+    export DOLPHIN_WORKERS_PER_BUNDLE=oops
+    load_entrypoint 2>/dev/null
+    assert_eq "a junk worker count falls back to one worker per card" "0|1" "$(plan_as_line)"
+    unset DOLPHIN_WORKERS_PER_BUNDLE
+}
+
+# The wrapper is the only lever we have over the closed worker's hardcoded VRAM claim, and
+# getting it wrong is expensive in both directions: no wrapper and the second engine dies at
+# init, a double wrapper and every engine claims a quarter of the card it should have halved.
+test_engine_memory_wrapper() {
+    make_sandbox
+    export DOLPHIN_WORKERS_PER_BUNDLE=2
+    export DOLPHIN_HOME="${SANDBOX}/dolphin"
+    load_entrypoint
+
+    if install_engine_memory_wrapper 2>/dev/null; then
+        echo "FAIL a missing runtime must refuse so the caller can fall back"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   a missing runtime refuses so the caller can fall back"
+    fi
+
+    local bin_dir="${DOLPHIN_HOME}/runtimes/text-v/bin"
+    mkdir -p "${bin_dir}"
+    printf 'import sys\nprint("VENDOR " + " ".join(sys.argv[1:]))\n' >"${bin_dir}/vllm"
+    install_engine_memory_wrapper 2>/dev/null
+
+    assert_eq "the vendor script is kept, not destroyed" "yes" \
+        "$([[ -f "${bin_dir}/vllm.real" ]] && echo yes)"
+    assert_eq "the claim is divided by the number of workers sharing the card" \
+        "VENDOR serve m --gpu-memory-utilization 0.4250 --moe-backend marlin" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 --moe-backend marlin)"
+    assert_eq "the --flag=value form is divided too" \
+        "VENDOR serve m --gpu-memory-utilization=0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization=0.85)"
+    assert_eq "a command without the flag is passed through untouched" \
+        "VENDOR serve m --kv-cache-dtype fp8" \
+        "$(python3 "${bin_dir}/vllm" serve m --kv-cache-dtype fp8)"
+
+    # A worker self-update overwrites our wrapper with a fresh vendor script. Re-wrapping must
+    # restage THAT script, and must not treat the previous wrapper as the vendor's.
+    printf 'import sys\nprint("VENDOR2 " + " ".join(sys.argv[1:]))\n' >"${bin_dir}/vllm"
+    install_engine_memory_wrapper 2>/dev/null
+    assert_eq "a vendor update is re-wrapped, never double-wrapped" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+
+    install_engine_memory_wrapper 2>/dev/null
+    assert_eq "re-running the install is idempotent" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+    unset DOLPHIN_WORKERS_PER_BUNDLE DOLPHIN_HOME
+}
+
 test_plan
+test_intra_card_plan
+test_engine_memory_wrapper
 test_render
 test_prepare_instance_home
 test_wait_for_cache_seed

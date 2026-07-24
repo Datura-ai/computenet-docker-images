@@ -46,6 +46,16 @@ LIVENESS_INTERVAL=30
 # Delay between initial worker spawns, AFTER the shared cache is seeded.
 SPLIT_STAGGER_SECONDS="${DOLPHIN_SPLIT_STAGGER_SECONDS:-30}"
 
+# How many workers share each VRAM bundle (DAH-2473). 1 = one worker per bundle, the shipped
+# behavior. >1 puts several engines on the SAME card(s): every extra worker pays a fresh ~31.5 GB
+# for its own copy of the weights out of the KV cache, so it only pays off where the pool, not
+# the card, is the limit. Never raise it without checking the bundle's VRAM budget.
+WORKERS_PER_BUNDLE="${DOLPHIN_WORKERS_PER_BUNDLE:-1}"
+if ! [[ "${WORKERS_PER_BUNDLE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[dolphin] DOLPHIN_WORKERS_PER_BUNDLE='${WORKERS_PER_BUNDLE}' is not a positive integer; using 1" >&2
+    WORKERS_PER_BUNDLE=1
+fi
+
 # On a cold node the siblings wait for the FIRST instance to finish seeding the shared cache
 # instead of merely pausing a few seconds. Measured 2026-07-23: with a 30 s stagger both workers
 # downloaded the ~12 GB runtime into their own staging directories side by side, doubling the
@@ -71,6 +81,75 @@ detect_gpus() {
     nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits 2>/dev/null || true
 }
 
+# Print each bundle WORKERS_PER_BUNDLE times: an intra-card split is just the same bundle
+# claimed by more than one worker, so it composes with every path in the planner below.
+emit_worker_plan() {
+    local bundle rep
+    for bundle in "$@"; do
+        for (( rep = 0; rep < WORKERS_PER_BUNDLE; rep++ )); do
+            echo "${bundle}"
+        done
+    done
+}
+
+# Marker that tells our wrapper apart from the vendor's console script.
+ENGINE_WRAPPER_MARKER="dolphin-intra-card-vram-wrapper"
+
+# The worker execs `<runtime>/bin/vllm serve ... --gpu-memory-utilization 0.85`, and vLLM sizes
+# that fraction against the card's TOTAL memory. So the second worker on a card asks for memory
+# the first one already holds and dies at init — the reproducible blocker DAH-2473 hit. The
+# fraction is hardcoded in the closed worker binary and worker.json exposes no knob for it, but
+# the runtime lives inside DOLPHIN_HOME, which is our volume, so the file the worker execs can be
+# wrapped. The wrapper only divides that one flag and then defers to the untouched vendor script
+# via runpy, so a vendor change to its contents cannot break us.
+install_engine_memory_wrapper() {
+    local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
+    local wrapper="${bin_dir}/vllm" real="${bin_dir}/vllm.real"
+    if [[ ! -f "${wrapper}" ]]; then
+        # First boot on a cold node: the worker downloads its runtime only once it starts, so
+        # there is nothing to wrap yet. The node runs unsplit until the next container start.
+        echo "[dolphin] engine runtime not present yet; VRAM wrapper installs on the next start" >&2
+        return 1
+    fi
+    if ! grep -q "${ENGINE_WRAPPER_MARKER}" "${wrapper}"; then
+        # Vendor script in place: either the first install, or a self-update overwrote us.
+        cp -p "${wrapper}" "${real}"
+    fi
+    cat >"${wrapper}" <<EOF
+#!${bin_dir}/python
+# ${ENGINE_WRAPPER_MARKER} (DAH-2473)
+"""Claim only this worker's share of the card, then run the vendor's launcher unchanged."""
+import runpy
+import sys
+
+SHARE = ${WORKERS_PER_BUNDLE}
+REAL = "${real}"
+
+argv = sys.argv
+for i, arg in enumerate(argv):
+    if arg == "--gpu-memory-utilization" and i + 1 < len(argv):
+        argv[i + 1] = "%.4f" % (float(argv[i + 1]) / SHARE)
+    elif arg.startswith("--gpu-memory-utilization="):
+        argv[i] = "--gpu-memory-utilization=%.4f" % (float(arg.split("=", 1)[1]) / SHARE)
+
+runpy.run_path(REAL, run_name="__main__")
+EOF
+    chmod +x "${wrapper}"
+    echo "[dolphin] engine VRAM wrapper installed: each of ${WORKERS_PER_BUNDLE} workers claims 1/${WORKERS_PER_BUNDLE} of the card" >&2
+}
+
+# Name one instance's private files (HOME, watchdog state). The card set stays in the name for
+# readability; the index is only prepended when cards alone cannot separate instances, so the
+# single-worker-per-bundle layout keeps the exact paths it has always used.
+instance_tag() {
+    local index="$1" gpu_set="$2"
+    if (( WORKERS_PER_BUNDLE > 1 )); then
+        echo "w${index}-gpu${gpu_set//,/-}"
+    else
+        echo "gpu${gpu_set//,/-}"
+    fi
+}
+
 # Emit one line per worker to spawn: a comma-separated gpu_ids list, or the literal "all"
 # (worker.json gpu_ids: null -> the worker auto-scales to every GPU on the node).
 #
@@ -82,13 +161,13 @@ detect_gpus() {
 # node keeps the single all-GPUs worker.
 plan_worker_gpu_sets() {
     if [[ -n "${DOLPHIN_GPU_IDS:-}" ]]; then
-        echo "${DOLPHIN_GPU_IDS}"
+        emit_worker_plan "${DOLPHIN_GPU_IDS}"
         return
     fi
     local worker_per_gpu="${DOLPHIN_WORKER_PER_GPU:-1}"
     local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-71680}"
     if [[ "${worker_per_gpu}" != "1" ]]; then
-        echo "all"
+        emit_worker_plan "all"
         return
     fi
     local indices=() vram_values=() index vram
@@ -101,7 +180,7 @@ plan_worker_gpu_sets() {
     done < <(detect_gpus)
     local gpu_count=${#indices[@]}
     if (( gpu_count < 2 )); then
-        echo "all"
+        emit_worker_plan "all"
         return
     fi
     # The smallest card decides how many cards one worker needs (Lium nodes are homogeneous;
@@ -113,13 +192,13 @@ plan_worker_gpu_sets() {
         fi
     done
     if (( min_vram <= 0 )); then
-        echo "all"
+        emit_worker_plan "all"
         return
     fi
     local cards_per_worker=$(( (split_min_vram_mb + min_vram - 1) / min_vram ))
     local worker_count=$(( gpu_count / cards_per_worker ))
     if (( worker_count < 2 )); then
-        echo "all"
+        emit_worker_plan "all"
         return
     fi
     # Spread ALL cards evenly over the workers (bundle sizes differ by at most 1), then verify
@@ -139,13 +218,13 @@ plan_worker_gpu_sets() {
             bundle_vram=$(( bundle_vram + vram_values[i] ))
         done
         if (( bundle_vram < split_min_vram_mb )); then
-            echo "all"
+            emit_worker_plan "all"
             return
         fi
         bundles+=("${bundle}")
         cursor=$(( cursor + size ))
     done
-    printf '%s\n' "${bundles[@]}"
+    emit_worker_plan "${bundles[@]}"
 }
 
 # Render one worker.json into <config_dir>. gpu_set "all" -> gpu_ids null. 0600 up front:
@@ -273,6 +352,19 @@ main() {
     done < <(plan_worker_gpu_sets)
     local instance_count=${#gpu_sets[@]}
 
+    # Only an intra-card split needs the VRAM divided; one worker per bundle keeps the vendor's
+    # own 0.85 of the whole card. If the runtime isn't downloaded yet there is nothing to wrap,
+    # and running N engines that each claim the whole card just crash-loops N-1 of them — so
+    # fall back to a single worker for this start and split once the cache is warm.
+    if (( WORKERS_PER_BUNDLE > 1 )) && ! install_engine_memory_wrapper; then
+        WORKERS_PER_BUNDLE=1
+        gpu_sets=()
+        while IFS= read -r gpu_set_line; do
+            [[ -n "${gpu_set_line}" ]] && gpu_sets+=("${gpu_set_line}")
+        done < <(plan_worker_gpu_sets)
+        instance_count=${#gpu_sets[@]}
+    fi
+
     local base_home="${HOME:-/root}"
     local shared_cache="${base_home}/.cache"
     export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${shared_cache}}"
@@ -284,7 +376,9 @@ main() {
         instance_homes=("${base_home}")
     else
         for i in "${!gpu_sets[@]}"; do
-            instance_homes+=("${base_home}/dolphin-workers/gpu${gpu_sets[$i]//,/-}")
+            # With WORKERS_PER_BUNDLE > 1 the same cards appear more than once, so the card set
+            # alone no longer names a home; the instance index is what keeps them apart.
+            instance_homes+=("${base_home}/dolphin-workers/$(instance_tag "${i}" "${gpu_sets[$i]}")")
             prepare_instance_home "${instance_homes[$i]}" "${shared_cache}"
         done
     fi
@@ -334,7 +428,7 @@ main() {
             watchdog_state="${DOLPHIN_HOME}/watchdog_state.json"
             if (( instance_count > 1 )); then
                 watchdog_gpu_set="${gpu_sets[$i]}"
-                watchdog_state="${DOLPHIN_HOME}/watchdog_state_gpu${gpu_sets[$i]//,/-}.json"
+                watchdog_state="${DOLPHIN_HOME}/watchdog_state_$(instance_tag "${i}" "${gpu_sets[$i]}").json"
             fi
             (
                 while true; do
