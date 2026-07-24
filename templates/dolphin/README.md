@@ -41,12 +41,21 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_GPU_IDS`     | no       | (empty → `null`)                 | Comma-separated GPU indices, e.g. `0,1`. Empty → `null` → the worker uses all GPUs on the node. |
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
+| `DOLPHIN_WORKER_PER_GPU` | no    | `1`                              | `0` forces the single all-GPUs worker — the exact pre-split behavior. |
+| `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                        | VRAM floor one worker's bundle must clear (the full model needs ~70 GB). Each worker gets the smallest card group above it. |
+| `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                      | Delay between initial worker spawns, once the shared cache is seeded. |
+| `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. `0` = no wait, plain stagger. |
 | `METRICS_TOKEN`       | no       | —                                | Bearer token for the metrics sidecar on `:9101`. Unset → the sidecar answers 503 to everything (fail closed). |
+| `DOLPHIN_ENGINES_EXPECTED` | no  | (set by the entrypoint)          | How many engines this container runs. The sidecar publishes it next to `dolphin_engines_up`, and above 1 it tags every engine's series with `dolphin_engine`. |
 | `DOLPHIN_WATCHDOG_ENABLED` | no  | `1`                              | `0` stops the entrypoint from starting any engine watchdog. |
 | `DOLPHIN_WATCHDOG_GPU_SET` | no | (set per bundle by the entrypoint) | Cards this watchdog owns, e.g. `0` or `2,3`. Empty = the single-engine container, where every vLLM process belongs to the one engine. |
 | `DOLPHIN_WATCHDOG_STALL_SECONDS` | no | `300`                  | How long the token counter may stand still, with requests in flight, before the engine is restarted. |
 | `DOLPHIN_WATCHDOG_POLL_SECONDS` | no | `60`                    | How often the watchdog reads the engine's counters. |
 | `DOLPHIN_WATCHDOG_GRACE_SECONDS` | no | `300`                  | Quiet period after a restart, while the engine reloads weights. |
+| `DOLPHIN_WATCHDOG_ENGINE_CORE_SECONDS` | no | `20`             | How long the `VLLM::EngineCore` child gets to die with its parent before it is killed directly. |
+| `DOLPHIN_WATCHDOG_STATE` | no | `/tmp/dolphin_watchdog_state.json` | Where one watchdog writes its state; the entrypoint names one file per bundle in split mode. Keep it OFF `DOLPHIN_HOME`: that is a cache volume shared by every filler container on the node, and one state file per node would mix the counters of every watchdog on it. |
+| `DOLPHIN_WATCHDOG_STATE_DIR` | no | `/tmp` | Directory the entrypoint names those files in, one per bundle. |
+| `DOLPHIN_WATCHDOG_STATE_GLOB` | no | `/tmp/dolphin_watchdog_state*.json` | Where the sidecar looks for those files, so it exports the series below for every bundle. It must match the names the entrypoint hands out. |
 
 The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
 live), so one key drives the whole fleet. `worker.json` is written `0600`; the worker refuses a
@@ -89,7 +98,7 @@ What running N instances in one container costs, and how each cost is paid:
 | configs collide | per-instance `HOME`, so each worker reads its own `worker.json` |
 | N copies of the ~35 GB model + runtime | each instance's `HOME/.cache` is a **symlink** to the shared cache. The closed worker binary scrubs its child's environment, so `HF_HOME`/`XDG_CACHE_HOME` alone cannot be relied on — a path that resolves to one directory can. |
 | siblings corrupt the shared binary | every write to `DOLPHIN_HOME` goes through `flock`, staged to a temp file and renamed atomically (DAH-2475) |
-| cold start stampede | initial spawns are staggered `DOLPHIN_SPLIT_STAGGER_SECONDS` (default 30) apart, so the first instance warms the shared cache before its siblings hit the same downloads |
+| cold start stampede | the siblings wait for the first instance's engine socket (`DOLPHIN_SEED_WAIT_SECONDS`, default 5400) instead of merely pausing: once it serves, the runtime and the weights are on disk, so 2..N start warm. Measured 2026-07-23 — with a plain 30 s stagger both workers downloaded the same ~12 GB side by side over a link the miner throttles. `DOLPHIN_SPLIT_STAGGER_SECONDS` (default 30) then spaces the warm starts. |
 | metrics undercount | the sidecar scrapes **every** engine socket and tags each with its own `dolphin_engine` label (see below) |
 | one wedge kills all | one watchdog per bundle, each scoped to its own cards, so a wedged engine is killed on its cards alone and the siblings keep serving (see below) |
 
@@ -141,16 +150,19 @@ check.
 
 The only honest signal is vLLM's own `generation_tokens_total`: it stops moving while
 `num_requests_running` stays above zero. The watchdog polls that over the same unix socket
-the sidecar proxies, and after `DOLPHIN_WATCHDOG_STALL_SECONDS` of no tokens it kills
-`vllm serve` — SIGKILL, because a wedged process ignores SIGTERM — then kills the
+the sidecar proxies, and after `DOLPHIN_WATCHDOG_STALL_SECONDS` of no tokens with
+requests in flight it kills `vllm serve` — SIGKILL, because a wedged process ignores
+SIGTERM — then kills the
 `VLLM::EngineCore` child, which outlived its parent in 12 of 12 production cases while
 holding ~70 GB of VRAM that blocks the respawn. The worker brings the engine back from the
 warm cache and tokens return 2-3 minutes after the kill; the container and its `filler_run`
 row are untouched, so there is no cold start and no launch backoff.
 
-Two cases are deliberately left alone: no socket at all (a cold start legitimately takes
-30-60 minutes, and a restart would only send it back to the beginning) and an empty queue
-(no demand is not a fault).
+Three cases are deliberately left alone: no socket at all (a cold start legitimately takes
+30-60 minutes, and a restart would only send it back to the beginning), an empty queue (no
+demand is not a fault, and idle time never arms the stall clock — the first request after a
+quiet stretch gets the full window), and any engine the watchdog cannot prove is its own —
+an ambiguous match kills nothing, because a wrong guess costs a healthy bundle.
 
 ### One watchdog per bundle
 
@@ -179,28 +191,30 @@ engine):
 | Series | Meaning |
 |---|---|
 | `dolphin_watchdog_up` | `0` when the watchdog stopped ticking — a dead watchdog must not look like a healthy one |
-| `dolphin_watchdog_restarts_total` | Engine restarts since the container started |
+| `dolphin_watchdog_restarts_total` | Engine restarts since the container was created — the count survives the watchdog's own restart, and only a kill that actually removed the process is counted |
 | `dolphin_watchdog_last_restart_timestamp` | Unix time of the last restart |
-| `dolphin_watchdog_stall_seconds` | How long the token counter has been standing still |
+| `dolphin_watchdog_stall_seconds` | How long the token counter has been standing still with requests in flight (an idle queue holds it at zero) |
 | `dolphin_watchdog_engine_found` | Split mode only: `0` when the watchdog cannot identify its engine, i.e. it is running and guarding nothing |
 
-The series are absent entirely when no watchdog is running, so zeros never claim a
-watchdog that does not exist.
+The series are absent entirely until a watchdog has written its state file even once, so
+zeros never claim a watchdog that was never installed. Once the file exists the series stay,
+and a watchdog that ran and died reports `dolphin_watchdog_up 0` with its last known
+numbers — silence would read as health.
 
 Tests (no GPU needed):
 
 ```bash
 python3 tests/test_sidecar.py            # host run against the repo copy
 python3 tests/test_watchdog.py           # same; the kill tests need /proc and SKIP on macOS
-tests/run_in_image.sh daturaai/dolphin:0.0.8   # both suites inside the image + docker-stop cleanliness
+tests/run_in_image.sh daturaai/dolphin:0.0.11  # both suites inside the image + docker-stop cleanliness
 ```
 
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.8
-VERSION=0.0.9 docker buildx bake       # override the tag
+docker buildx bake                     # daturaai/dolphin:0.0.11
+VERSION=0.0.11 docker buildx bake      # override the tag
 ```
 
 ## Run

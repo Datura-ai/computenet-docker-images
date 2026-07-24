@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # In-image verification for daturaai/dolphin: run the sidecar and watchdog
 # contract tests with the image's python3 + shipped copies (catches stdlib
-# gaps a host run would hide), then prove the entrypoint supervises both and
-# `docker stop` stays clean (trap kills them, no SIGKILL).
+# gaps a host run would hide), then prove the entrypoint starts both and that
+# `docker stop` returns promptly with exit code 0 (no SIGKILL after the grace).
 #
 # The watchdog's kill tests are skipped on a macOS host for want of /proc, so
 # this is the only place they actually run — do not skip it.
 set -euo pipefail
-IMAGE="${1:-daturaai/dolphin:0.0.8}"
+IMAGE="${1:-daturaai/dolphin:0.0.11}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "== [1/4] sidecar tests inside ${IMAGE} =="
