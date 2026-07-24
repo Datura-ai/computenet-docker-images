@@ -23,6 +23,9 @@
 #   - metrics undercount -> the sidecar scrapes EVERY engine socket and tags each with its own
 #                           dolphin_engine label; DOLPHIN_ENGINES_EXPECTED lets it report a
 #                           dead engine as a gap instead of as a smaller token count
+#   - one wedge kills all -> one watchdog per bundle, scoped by DOLPHIN_WATCHDOG_GPU_SET, so a
+#                           wedged engine is killed on its own cards and its siblings keep
+#                           serving
 set -euo pipefail
 
 DOLPHIN_HOME="${DOLPHIN_HOME:-/opt/dolphinpod}"
@@ -311,42 +314,40 @@ main() {
     # flight, token counter frozen, GPU pinned at 100% on a third of normal power — observed
     # live on this image 2026-07-23).
     #
-    # Today it kills EVERY `vllm serve` it finds in the container, which is right for one engine
-    # and catastrophic for N: one wedge would take down every bundle. So with more than one
-    # instance it stays off rather than ship that blast radius — at the cost of no wedge cure on
-    # exactly the nodes this split targets. That trade is temporary and is the release blocker
-    # tracked in the plan.
+    # One watchdog per bundle, each told its own cards. It reads only its own engine's socket
+    # and kills only its own processes, so a wedge on one bundle no longer takes the others
+    # down: the worker exports CUDA_VISIBLE_DEVICES per engine and runs `vllm serve --uds
+    # <socket>`, which gives /proc a GPU set <-> pid <-> socket mapping (measured). When that
+    # mapping is ambiguous the watchdog kills nothing and publishes engine_found 0.
     #
-    # When the watchdog learns to target a single engine, set DOLPHIN_WATCHDOG_MULTI_ENGINE=1:
-    # one watchdog is then started per bundle with DOLPHIN_WATCHDOG_GPU_SET naming its cards.
-    # It can find its own engine from that — the worker runs `vllm serve --uds <socket>` with
-    # CUDA_VISIBLE_DEVICES set per engine, so /proc gives socket <-> pid <-> GPU set (measured).
-    # No change to this file is needed to switch it on.
+    # A single instance gets the unscoped watchdog and the original state path, so the
+    # single-worker fleet keeps exactly the behavior it runs today.
+    #
+    # DOLPHIN_HOME is a shared volume, so state files outlive the container: clear them before
+    # starting, or a previous run's split publishes stale bundles as dead watchdogs forever.
     local watchdog_pids=()
     if [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]]; then
-        if (( instance_count == 1 )); then
+        rm -f "${DOLPHIN_HOME}"/watchdog_state*.json
+        local watchdog_gpu_set watchdog_state
+        for i in "${!gpu_sets[@]}"; do
+            watchdog_gpu_set=""
+            watchdog_state="${DOLPHIN_HOME}/watchdog_state.json"
+            if (( instance_count > 1 )); then
+                watchdog_gpu_set="${gpu_sets[$i]}"
+                watchdog_state="${DOLPHIN_HOME}/watchdog_state_gpu${gpu_sets[$i]//,/-}.json"
+            fi
             (
                 while true; do
-                    python3 "${DOLPHIN_HOME}/watchdog.py" || true
+                    DOLPHIN_WATCHDOG_GPU_SET="${watchdog_gpu_set}" \
+                    DOLPHIN_WATCHDOG_STATE="${watchdog_state}" \
+                        python3 "${DOLPHIN_HOME}/watchdog.py" || true
                     sleep 5
                 done
             ) &
-            watchdog_pids=($!)
-        elif [[ "${DOLPHIN_WATCHDOG_MULTI_ENGINE:-0}" == "1" ]]; then
-            for i in "${!gpu_sets[@]}"; do
-                (
-                    while true; do
-                        DOLPHIN_WATCHDOG_GPU_SET="${gpu_sets[$i]}" \
-                        DOLPHIN_WATCHDOG_STATE="${DOLPHIN_HOME}/watchdog_state_gpu${gpu_sets[$i]//,/-}.json" \
-                            python3 "${DOLPHIN_HOME}/watchdog.py" || true
-                        sleep 5
-                    done
-                ) &
-                watchdog_pids+=($!)
-            done
+            watchdog_pids+=($!)
+        done
+        if (( instance_count > 1 )); then
             echo "[dolphin] ${#watchdog_pids[@]} per-engine watchdog(s) started" >&2
-        else
-            echo "[dolphin] watchdog disabled: ${instance_count} engines, and it cannot yet restart just one" >&2
         fi
     fi
 

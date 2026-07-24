@@ -7,7 +7,7 @@
 # The watchdog's kill tests are skipped on a macOS host for want of /proc, so
 # this is the only place they actually run — do not skip it.
 set -euo pipefail
-IMAGE="${1:-daturaai/dolphin:0.0.7}"
+IMAGE="${1:-daturaai/dolphin:0.0.8}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "== [1/4] sidecar tests inside ${IMAGE} =="
@@ -28,7 +28,8 @@ echo "== [3/4] entrypoint integration: sidecar + watchdog up, clean docker stop 
 CT="dolphin-sidecar-test-$$"
 docker rm -f "${CT}" >/dev/null 2>&1 || true
 # DOLPHIN_WORKER_PER_GPU=0 pins the single-worker mode: on a multi-GPU host the entrypoint
-# would otherwise split, and the split mode deliberately runs no watchdog (checked in [4/4]).
+# would otherwise split, and split mode labels its watchdog series per bundle ([4/4] covers
+# that shape) — here the point is that the unlabelled single-engine contract is unchanged.
 docker run -d --name "${CT}" \
     -e DOLPHIN_API_KEY=dp-dummy-key \
     -e DOLPHIN_WORKER_URL=http://127.0.0.1:1/unreachable \
@@ -57,7 +58,7 @@ echo "docker stop took ${STOP_SECONDS}s, exit code ${EXIT_CODE}"
 [ "${STOP_SECONDS}" -le 9 ] || { echo "FAIL: stop hit the kill grace (trap broken)"; exit 1; }
 echo "OK: entrypoint integration clean"
 
-echo "== [4/4] split mode: two workers, engine count exported, watchdog held back =="
+echo "== [4/4] split mode: two workers, engine count exported, a watchdog per bundle =="
 # A fake nvidia-smi makes the split deterministic without needing real GPUs, so this runs
 # identically on a laptop and on a filler node.
 SPLIT_CT="dolphin-split-test-$$"
@@ -81,10 +82,15 @@ SPLIT_BODY="$(docker exec "${SPLIT_CT}" curl -sf -H "Authorization: Bearer stub-
     http://127.0.0.1:9101/metrics || true)"
 echo "${SPLIT_BODY}" | grep -q "dolphin_engines_expected 2" \
     || { echo "FAIL: sidecar was not told to expect 2 engines"; docker logs "${SPLIT_CT}"; docker rm -f "${SPLIT_CT}"; rm -f "${FAKE_SMI}"; exit 1; }
-# The watchdog SIGKILLs every `vllm serve` in the container, so with N engines one wedge would
-# take down every bundle. Until it can target a single engine it must stay down here.
-echo "${SPLIT_BODY}" | grep -q "dolphin_watchdog_up" \
-    && { echo "FAIL: watchdog running in split mode (blast radius: one wedge kills every bundle)"; docker rm -f "${SPLIT_CT}"; rm -f "${FAKE_SMI}"; exit 1; }
+# One watchdog per bundle, each labelled with the cards it owns: an unlabelled series here
+# would mean a single container-wide watchdog, whose kill takes down every bundle at once.
+for GPU_LABEL in 0 1; do
+    echo "${SPLIT_BODY}" | grep -q "dolphin_watchdog_up{dolphin_watchdog_gpus=\"${GPU_LABEL}\"} 1" \
+        || { echo "FAIL: no watchdog for GPU ${GPU_LABEL}"; echo "${SPLIT_BODY}" | grep watchdog; docker rm -f "${SPLIT_CT}"; rm -f "${FAKE_SMI}"; exit 1; }
+    # The stub worker starts no engine, so each watchdog must say so rather than look armed.
+    echo "${SPLIT_BODY}" | grep -q "dolphin_watchdog_engine_found{dolphin_watchdog_gpus=\"${GPU_LABEL}\"} 0" \
+        || { echo "FAIL: watchdog for GPU ${GPU_LABEL} claims an engine it cannot have"; echo "${SPLIT_BODY}" | grep watchdog; docker rm -f "${SPLIT_CT}"; rm -f "${FAKE_SMI}"; exit 1; }
+done
 docker logs "${SPLIT_CT}" 2>&1 | grep -q "spawning 2 worker(s)" \
     || { echo "FAIL: entrypoint did not spawn 2 workers"; docker logs "${SPLIT_CT}"; docker rm -f "${SPLIT_CT}"; rm -f "${FAKE_SMI}"; exit 1; }
 SPLIT_START=$(date +%s)

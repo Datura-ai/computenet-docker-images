@@ -23,8 +23,9 @@ good response wins") would have silently published 1/N of the tokens.
 - Total upstream budget per request stays under the scraper's client timeout
   even when falling through several stale sockets.
 - Read-only: the sidecar observes and republishes, it never acts on the worker.
-  Acting is watchdog.py's job; this file only exposes the state file it writes
-  as dolphin_watchdog_* series, so the restarts reach the scraper.
+  Acting is watchdog.py's job; this file only exposes the state files it writes
+  (one per GPU bundle in split mode) as dolphin_watchdog_* series, so the
+  restarts reach the scraper.
 """
 
 import glob
@@ -41,9 +42,12 @@ PORT = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN = os.environ.get("METRICS_TOKEN", "")
 SOCKET_GLOB = os.environ.get("METRICS_SOCKET_GLOB", "/tmp/dp-*/v.sock")
 # Written every tick by watchdog.py; absent when the watchdog is disabled or not shipped.
-WATCHDOG_STATE_PATH = os.environ.get(
-    "DOLPHIN_WATCHDOG_STATE",
-    os.path.join(os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state.json"),
+# Split mode runs one watchdog — and one state file — per GPU bundle, so the default is a
+# glob; DOLPHIN_WATCHDOG_STATE pins a single file when the caller knows which one it wants.
+WATCHDOG_STATE_PATH = os.environ.get("DOLPHIN_WATCHDOG_STATE", "")
+WATCHDOG_STATE_GLOB = os.environ.get(
+    "DOLPHIN_WATCHDOG_STATE_GLOB",
+    os.path.join(os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state*.json"),
 )
 # How many engines the entrypoint spawned. Exported so a missing engine reads as a gap
 # (up < expected) instead of as a smaller token number that looks like a quiet machine.
@@ -322,23 +326,63 @@ def sidecar_series(sockets_found: int, proxy_ok: bool, engines_up: int = 0) -> b
     ).encode()
 
 
+def watchdog_state_paths() -> list[str]:
+    # Globbed per request, not at import: in split mode the files appear as each bundle's
+    # watchdog starts, and a list captured at boot would miss them.
+    if WATCHDOG_STATE_PATH:
+        return [WATCHDOG_STATE_PATH]
+    return sorted(glob.glob(WATCHDOG_STATE_GLOB))
+
+
+def watchdog_values(state: dict) -> list[tuple[str, str]]:
+    poll_s = float(state.get("poll_interval_s") or 60.0)
+    age_s = time.time() - float(state.get("updated") or 0.0)
+    values = [
+        ("dolphin_watchdog_up", str(int(age_s <= 3 * poll_s))),
+        ("dolphin_watchdog_restarts_total", str(int(state.get("restarts_total") or 0))),
+        (
+            "dolphin_watchdog_last_restart_timestamp",
+            str(int(state.get("last_restart_timestamp") or 0)),
+        ),
+        ("dolphin_watchdog_stall_seconds", f"{float(state.get('stall_seconds') or 0.0):.0f}"),
+    ]
+    if state.get("gpus"):
+        # Split mode only. A watchdog that cannot identify its own engine is running and
+        # guarding nothing — indistinguishable from a healthy one without this series.
+        values.append(
+            ("dolphin_watchdog_engine_found", str(int(bool(state.get("engine_socket")))))
+        )
+    return values
+
+
 def watchdog_series() -> bytes:
     # Empty when there is no watchdog at all — better than zeros, which would claim a
     # healthy watchdog that does not exist. A watchdog that ran and died is a different
     # story and must be visible, so a stale state file reports up 0 with its last numbers.
-    try:
-        with open(WATCHDOG_STATE_PATH) as fh:
-            state = json.load(fh)
-    except (OSError, ValueError):
+    #
+    # With one watchdog per bundle every state is published, labelled by the cards it owns.
+    # Samples are grouped by metric name rather than by state: emitting one bundle's whole
+    # block after another's would split each family in two, which is invalid exposition —
+    # the same reason merge_engine_bodies() regroups the engine bodies.
+    grouped: dict[str, list[str]] = {}
+    order: list[str] = []
+    for path in watchdog_state_paths():
+        try:
+            with open(path) as fh:
+                state = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        gpus = state.get("gpus")
+        # Unlabelled with a single engine: the shipped fleet's series must not change shape.
+        label = f'{{dolphin_watchdog_gpus="{gpus}"}}' if gpus else ""
+        for name, value in watchdog_values(state):
+            if name not in grouped:
+                grouped[name] = []
+                order.append(name)
+            grouped[name].append(f"{name}{label} {value}")
+    if not order:
         return b""
-    poll_s = float(state.get("poll_interval_s") or 60.0)
-    age_s = time.time() - float(state.get("updated") or 0.0)
-    return (
-        f"dolphin_watchdog_up {int(age_s <= 3 * poll_s)}\n"
-        f"dolphin_watchdog_restarts_total {int(state.get('restarts_total') or 0)}\n"
-        f"dolphin_watchdog_last_restart_timestamp {int(state.get('last_restart_timestamp') or 0)}\n"
-        f"dolphin_watchdog_stall_seconds {float(state.get('stall_seconds') or 0.0):.0f}\n"
-    ).encode()
+    return ("\n".join(line for name in order for line in grouped[name]) + "\n").encode()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):

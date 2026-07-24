@@ -111,7 +111,9 @@ test_render() {
     render_worker_config "${dir}" "all"
     assert_eq "config gpu_ids null for 'all'" "null" "$(jq -c '.gpu_ids' "${dir}/worker.json")"
     assert_eq "config api_key" "dp-test" "$(jq -r '.api_key' "${dir}/worker.json")"
-    assert_eq "config mode 0600" "600" "$(stat -f '%Lp' "${dir}/worker.json" 2>/dev/null || stat -c '%a' "${dir}/worker.json")"
+    # GNU first: `stat -f` means "the filesystem" there and succeeds with unrelated output,
+    # so probing BSD-style first would silently pass garbage into the comparison.
+    assert_eq "config mode 0600" "600" "$(stat -c '%a' "${dir}/worker.json" 2>/dev/null || stat -f '%Lp' "${dir}/worker.json")"
 
     dir="${SANDBOX}/cfg-split"
     render_worker_config "${dir}" "3"
@@ -273,14 +275,14 @@ EOF
     local log="${SANDBOX}/python.log"
     assert_eq "sidecar told how many engines to expect" "metrics_sidecar.py expected=2" \
         "$(grep metrics_sidecar "${log}" 2>/dev/null | head -1)"
-    # The watchdog SIGKILLs every `vllm serve` in the container, so with N engines one wedge
-    # would take down every bundle. It must stay off until it can target a single engine.
-    assert_eq "watchdog stays off with 2 engines" "" \
-        "$(grep watchdog "${log}" 2>/dev/null | head -1)"
+    # One watchdog per bundle: it kills only the engine on its own cards, so a wedge no
+    # longer costs the siblings. A single container-wide watchdog is what had to stay off.
+    assert_eq "one watchdog per engine" "2" \
+        "$(grep -c watchdog "${log}" 2>/dev/null || echo 0)"
 }
 
-# ------------------------------------------- per-engine watchdog hook (off by default)
-test_per_engine_watchdog_hook() {
+# ------------------------------------------------- per-engine watchdog scoping in split mode
+test_per_engine_watchdog_in_split_mode() {
     make_sandbox
     export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}"
@@ -307,10 +309,9 @@ exit 0
 EOF
     chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
 
-    # The flag is what the watchdog task flips once it can target a single engine; until then
-    # the default path (tested above) runs none. Each instance must get its own GPU set AND its
-    # own state file, since one file cannot describe N engines.
-    DOLPHIN_API_KEY="dp-test" DOLPHIN_SPLIT_STAGGER_SECONDS=0 DOLPHIN_WATCHDOG_MULTI_ENGINE=1 \
+    # Each instance must get its own GPU set AND its own state file: the GPU set is how the
+    # watchdog finds the one engine it may kill, and one file cannot describe N engines.
+    DOLPHIN_API_KEY="dp-test" DOLPHIN_SPLIT_STAGGER_SECONDS=0 \
         METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock" bash "${ENTRYPOINT}" >/dev/null 2>&1 &
     local entry_pid=$!
     local waited=0
@@ -326,11 +327,58 @@ watchdog.py gpus=1 state=watchdog_state_gpu1.json" \
         "$(grep watchdog "${SANDBOX}/python.log" 2>/dev/null | sort)"
 }
 
+# --------------------------- single engine keeps the unscoped watchdog, and stale state goes
+test_single_engine_watchdog() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}"
+    mock_nvidia_smi "0:97887"
+    cat >"${SANDBOX}/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/curl"
+    touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
+    # DOLPHIN_HOME is a volume, so a previous run's split leaves state files behind. They
+    # would publish as dead watchdogs for bundles that no longer exist.
+    echo '{}' >"${DOLPHIN_HOME}/watchdog_state_gpu7.json"
+    cat >"${SANDBOX}/bin/python3" <<EOF
+#!/usr/bin/env bash
+echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
+exec sleep 300
+EOF
+    chmod +x "${SANDBOX}/bin/python3"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<EOF
+#!/usr/bin/env bash
+[[ "\$1" == "start" ]] && exec sleep 300
+exit 0
+EOF
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+
+    DOLPHIN_API_KEY="dp-test" bash "${ENTRYPOINT}" >/dev/null 2>&1 &
+    local entry_pid=$!
+    local waited=0
+    while [[ "$(grep -c watchdog "${SANDBOX}/python.log" 2>/dev/null || echo 0)" -lt 1 ]] && (( waited < 20 )); do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    kill -TERM "${entry_pid}" 2>/dev/null
+    wait "${entry_pid}" 2>/dev/null
+
+    # No GPU set: with one engine per container every vLLM process is that engine's, which is
+    # the behavior the whole single-worker fleet runs today.
+    assert_eq "single engine gets the unscoped watchdog" "watchdog.py gpus=none state=watchdog_state.json" \
+        "$(grep watchdog "${SANDBOX}/python.log" 2>/dev/null)"
+    assert_eq "stale bundle state is cleared at boot" "" \
+        "$(ls "${DOLPHIN_HOME}"/watchdog_state_gpu7.json 2>/dev/null)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
 test_wait_for_cache_seed
-test_per_engine_watchdog_hook
+test_per_engine_watchdog_in_split_mode
+test_single_engine_watchdog
 test_split_sidecar_and_watchdog_wiring
 test_spawn_smoke
 
