@@ -50,14 +50,19 @@ SPLIT_STAGGER_SECONDS="${DOLPHIN_SPLIT_STAGGER_SECONDS:-30}"
 # every extra worker pays a fresh ~31.5 GB for its own copy of the weights out of the KV cache,
 # so it only pays off where the pool, not the card, is the limit.
 #
-# "auto" (the default) derives it from the bundle — see derive_workers_per_bundle. A positive
-# integer forces it, which is the escape hatch for measuring a layout the rule would not pick;
-# it is NOT checked against the card's VRAM, so forcing 2 onto an 80 GB card gives two crippled
-# engines. "1" disables the split entirely.
-WORKERS_PER_BUNDLE_SETTING="${DOLPHIN_WORKERS_PER_BUNDLE:-auto}"
+# "auto" derives it from the bundle — see derive_workers_per_bundle. A positive integer forces it,
+# which is the escape hatch for measuring a layout the rule would not pick; it is NOT checked
+# against the card's VRAM, so forcing 2 onto an 80 GB card gives two crippled engines. "1"
+# disables the split entirely.
+#
+# The default is 1, and it has to stay 1 until the DAH-2465 watchdog is re-keyed off the engine
+# socket instead of the card set: two workers on one card produce two engines with identical card
+# sets, which is the ambiguous case the watchdog refuses to act on, so a wedge on a split card
+# stays wedged. Splitting is opt-in ("auto" or an explicit count) until then.
+WORKERS_PER_BUNDLE_SETTING="${DOLPHIN_WORKERS_PER_BUNDLE:-1}"
 if [[ "${WORKERS_PER_BUNDLE_SETTING}" != "auto" ]] && ! [[ "${WORKERS_PER_BUNDLE_SETTING}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "[dolphin] DOLPHIN_WORKERS_PER_BUNDLE='${WORKERS_PER_BUNDLE_SETTING}' is neither 'auto' nor a positive integer; using auto" >&2
-    WORKERS_PER_BUNDLE_SETTING="auto"
+    echo "[dolphin] DOLPHIN_WORKERS_PER_BUNDLE='${WORKERS_PER_BUNDLE_SETTING}' is neither 'auto' nor a positive integer; not splitting" >&2
+    WORKERS_PER_BUNDLE_SETTING=1
 fi
 # Resolved per bundle at plan time; 1 until then so every helper has a sane value.
 WORKERS_PER_BUNDLE=1
@@ -194,6 +199,27 @@ runpy.run_path(REAL, run_name="__main__")
 EOF
     chmod +x "${wrapper}"
     echo "[dolphin] engine VRAM wrapper installed: each of ${WORKERS_PER_BUNDLE} workers claims 1/${WORKERS_PER_BUNDLE} of the card" >&2
+}
+
+# The off-switch has to undo the wrapper as well. DOLPHIN_HOME survives container restarts, so a
+# wrapper left over from an earlier split would keep dividing the claim after the split is off —
+# a single worker silently running on 1/N of the card, which is worse than the split it replaced.
+# A node that was never split has nothing to restore and this is a no-op.
+remove_engine_memory_wrapper() {
+    local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
+    local wrapper="${bin_dir}/vllm" real="${bin_dir}/vllm.real"
+    if [[ ! -f "${wrapper}" ]] || ! grep -q "${ENGINE_WRAPPER_MARKER}" "${wrapper}"; then
+        return 0
+    fi
+    if [[ ! -f "${real}" ]]; then
+        # Only reachable if someone deleted the staged vendor script by hand; leaving the wrapper
+        # divides the claim, removing it leaves no launcher at all, so keep it and say so.
+        echo "[dolphin] engine VRAM wrapper is installed but ${real} is gone; leaving it in place" >&2
+        return 0
+    fi
+    mv -f "${real}" "${wrapper}"
+    chmod +x "${wrapper}"
+    echo "[dolphin] engine VRAM wrapper removed: the worker claims the vendor's share of the card" >&2
 }
 
 # Name one instance's private files (HOME, watchdog state). The card set stays in the name for
@@ -421,6 +447,9 @@ main() {
     # fall back to a single worker for this start and split once the cache is warm.
     if (( WORKERS_PER_BUNDLE > 1 )) && ! install_engine_memory_wrapper; then
         WORKERS_PER_BUNDLE=1
+    fi
+    if (( WORKERS_PER_BUNDLE == 1 )); then
+        remove_engine_memory_wrapper
     fi
     if (( WORKERS_PER_BUNDLE > 1 )); then
         echo "[dolphin] bundle of ${bundle_cards} card(s), ${bundle_vram} MB -> ${WORKERS_PER_BUNDLE} workers per bundle" >&2

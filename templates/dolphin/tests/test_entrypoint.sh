@@ -379,6 +379,14 @@ test_intra_card_plan() {
     unset DOLPHIN_WORKERS_PER_BUNDLE DOLPHIN_GPU_IDS DOLPHIN_WORKER_PER_GPU DOLPHIN_SPLIT_MIN_VRAM_MB || true
     load_entrypoint
 
+    # Splitting disarms the DAH-2465 watchdog until it is re-keyed off the engine socket, so a
+    # plain deploy must not enable it: no env, no split, on the cards the rule likes most.
+    assert_eq "the default does not split an H200" "1" "$(derive_workers_per_bundle 1 143771)"
+    assert_eq "the default does not split a B300"  "1" "$(derive_workers_per_bundle 1 281600)"
+
+    export DOLPHIN_WORKERS_PER_BUNDLE=auto
+    load_entrypoint
+
     # The rule must reproduce the fleet's real verdicts, most of all the ones that would hurt:
     # 80 GB cards cannot hold two copies of the weights, and bundles of small cards are limited
     # by the card rather than by the pool, so splitting them buys nothing.
@@ -415,7 +423,7 @@ test_intra_card_plan() {
         "$(derive_workers_per_bundle 1 81559)"
     export DOLPHIN_WORKERS_PER_BUNDLE=oops
     load_entrypoint 2>/dev/null
-    assert_eq "a junk value falls back to the rule" "2" "$(derive_workers_per_bundle 1 143771)"
+    assert_eq "a junk value falls back to not splitting" "1" "$(derive_workers_per_bundle 1 143771)"
     unset DOLPHIN_WORKERS_PER_BUNDLE
 }
 
@@ -464,6 +472,20 @@ test_engine_memory_wrapper() {
     install_engine_memory_wrapper 2>/dev/null
     assert_eq "re-running the install is idempotent" \
         "VENDOR2 serve m --gpu-memory-utilization 0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+
+    # Turning the split off must give the card back: DOLPHIN_HOME outlives the container, so a
+    # leftover wrapper would run the single worker on half a card without saying anything.
+    WORKERS_PER_BUNDLE=1
+    remove_engine_memory_wrapper 2>/dev/null
+    assert_eq "off: the vendor's claim is restored in full" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.85" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+    assert_eq "off: the staged copy is gone, so the next install restages the vendor script" "" \
+        "$([[ -f "${bin_dir}/vllm.real" ]] && echo yes)"
+    remove_engine_memory_wrapper 2>/dev/null
+    assert_eq "off: removing again leaves the vendor script alone" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.85" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
     unset DOLPHIN_HOME
 }
