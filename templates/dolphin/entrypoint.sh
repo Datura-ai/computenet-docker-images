@@ -44,14 +44,45 @@ jq -n \
     '{schema_version: 1, api_key: $api, model: $model, worker_type: $worker_type, gpu_ids: $gpu_ids}' \
     >"${config_path}"
 
+# DAH-2475: DOLPHIN_HOME is a cache volume SHARED by every filler container on the node, so the
+# binary download and the worker's self-update are cross-container critical sections — two cold
+# workers writing the same path at once produce a corrupted binary and a crash loop. Serialize them
+# behind a lock file inside that volume; the first container populates it and the rest wait, then
+# find it ready. Writes are also staged + atomically renamed, so even a lock timeout can never expose
+# a half-written binary to a sibling. `flock` ships in the CUDA base image (util-linux is a required
+# package), so nothing extra is installed for it.
+# The model weights under HOME/.cache are shared too, but huggingface_hub does its own file locking.
+DOLPHIN_LOCK="${DOLPHIN_HOME}/.dolphinpod.lock"
+# A cold download on a slow miner link takes minutes; this only bounds a stuck holder, and on timeout
+# we proceed anyway rather than fail the container.
+DOLPHIN_LOCK_TIMEOUT="${DOLPHIN_LOCK_TIMEOUT:-900}"
+
+with_dolphin_lock() {
+    (
+        flock -w "${DOLPHIN_LOCK_TIMEOUT}" 9 || echo "[dolphin] cache lock wait timed out; proceeding" >&2
+        "$@"
+    ) 9>"${DOLPHIN_LOCK}"
+}
+
+download_worker_binary() {
+    # Re-check under the lock: whoever held it may have just downloaded the binary for us.
+    if [[ -x "${WORKER_BIN}" ]]; then
+        return 0
+    fi
+    local staged
+    staged="$(mktemp "${DOLPHIN_HOME}/.dolphinpod-worker.XXXXXX")"
+    curl -fsSL "${WORKER_URL}" -o "${staged}"
+    chmod +x "${staged}"
+    mv -f "${staged}" "${WORKER_BIN}"
+}
+
 if [[ ! -x "${WORKER_BIN}" ]]; then
     if [[ -z "${WORKER_URL}" ]]; then
         echo "[dolphin] dolphinpod-worker not found and DOLPHIN_WORKER_URL is unset." >&2
         echo "[dolphin] Provide the binary URL from your v2.dphn.ai install script." >&2
         exit 1
     fi
-    curl -fsSL "${WORKER_URL}" -o "${WORKER_BIN}"
-    chmod +x "${WORKER_BIN}"
+    with_dolphin_lock download_worker_binary
 fi
 
 # How often (seconds) to check WORKER_URL for a newly published binary while the worker runs.
@@ -98,7 +129,9 @@ cd "${DOLPHIN_HOME}"
 # poll is the fallback for when that self-update path does not fire: a changed etag on WORKER_URL
 # means a new binary was published, so restart the worker through `update`.
 while true; do
-    "${WORKER_BIN}" update || echo "[dolphin] update failed; starting current version" >&2
+    # Also under the lock: `update` rewrites the binary in the SHARED cache volume, so two siblings
+    # updating at once would race on the same file.
+    with_dolphin_lock "${WORKER_BIN}" update || echo "[dolphin] update failed; starting current version" >&2
     running_etag="$(published_etag || true)"
     "${WORKER_BIN}" start &
     worker_pid=$!
