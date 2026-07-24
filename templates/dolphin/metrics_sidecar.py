@@ -34,9 +34,14 @@ PORT = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN = os.environ.get("METRICS_TOKEN", "")
 SOCKET_GLOB = os.environ.get("METRICS_SOCKET_GLOB", "/tmp/dp-*/v.sock")
 # Written every tick by watchdog.py; absent when the watchdog is disabled or not shipped.
+# NOT under DOLPHIN_HOME: since lium-io#1161 that directory is a cache volume the platform
+# mounts into EVERY filler container on the node, so a state file there is one file shared by
+# every watchdog on the host — each overwriting the others' counters, and each inheriting a
+# neighbour's last_restart_timestamp on startup, which suppresses its own kill for a grace
+# period. /tmp is the container's own filesystem (the engine's unix socket lives there for the
+# same reason), so one state file belongs to exactly one watchdog and dies with its container.
 WATCHDOG_STATE_PATH = os.environ.get(
-    "DOLPHIN_WATCHDOG_STATE",
-    os.path.join(os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state.json"),
+    "DOLPHIN_WATCHDOG_STATE", "/tmp/dolphin_watchdog_state.json"
 )
 SIDECAR_VERSION = 1
 TOTAL_BUDGET_S = 4.0

@@ -429,6 +429,29 @@ def test_no_watchdog_means_no_series() -> None:
     assert b"dolphin_watchdog" not in body, "zeros would claim a watchdog that is not running"
 
 
+def test_default_state_path_is_not_on_the_shared_cache_volume() -> None:
+    # DOLPHIN_HOME is a cache volume the platform mounts into EVERY filler container on the
+    # node (lium-io#1161), so a state file under it is ONE file shared by every watchdog on
+    # the host: each overwrites the others' counters, and each inherits a neighbour's
+    # last_restart_timestamp on startup, which holds off its own kill for a grace period.
+    shared_home = "/opt/dolphinpod"
+    previous = {key: os.environ.get(key) for key in ("DOLPHIN_HOME", "DOLPHIN_WATCHDOG_STATE")}
+    os.environ["DOLPHIN_HOME"] = shared_home
+    os.environ.pop("DOLPHIN_WATCHDOG_STATE", None)
+    try:
+        default_path = _load_shipped_sidecar().WATCHDOG_STATE_PATH
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert not default_path.startswith(shared_home), (
+        f"state path {default_path} sits on the shared cache volume — every watchdog on the "
+        "node would write that one file"
+    )
+
+
 def main() -> None:
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")]
     failed = skipped = 0
