@@ -38,6 +38,8 @@ import socket
 import sys
 import time
 
+from dataclasses import dataclass
+
 PORT = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN = os.environ.get("METRICS_TOKEN", "")
 SOCKET_GLOB = os.environ.get("METRICS_SOCKET_GLOB", "/tmp/dp-*/v.sock")
@@ -326,6 +328,55 @@ def sidecar_series(sockets_found: int, proxy_ok: bool, engines_up: int = 0) -> b
     ).encode()
 
 
+def _optional_float(value: object) -> float | None:
+    return None if value is None else float(value)
+
+
+@dataclass(frozen=True)
+class WatchdogState:
+    """What watchdog.py writes every tick, one file per GPU bundle in split mode. Declared
+    here because both sides read these names — the sidecar below and the watchdog after its
+    own restart — and a key renamed on one side only makes the dolphin_watchdog_* group
+    silently wrong instead of absent, which on a dashboard is indistinguishable from a
+    watchdog that was never installed. gpus + engine_socket are the split-mode additions that
+    let N per-bundle states be told apart and labelled."""
+
+    updated: float
+    poll_interval_s: float
+    restarts_total: int
+    last_restart_timestamp: float
+    stall_seconds: float
+    # None when the engine did not answer this tick. requests_running is what tells an idle
+    # queue apart from a wedge, so a high stall_seconds cannot be read without it.
+    requests_running: float | None
+    generated_tokens: float | None
+    # Split mode only (both None in the single-engine image). engine_socket None means a
+    # watchdog that is running but cannot see its engine — guarding nothing.
+    gpus: str | None
+    engine_socket: str | None
+
+    @classmethod
+    def read(cls, path: str) -> "WatchdogState | None":
+        # None for every shape we cannot use: absent, unparsable, or a key renamed on the
+        # writer side. Callers turn that into an empty series, never into invented zeros.
+        try:
+            with open(path) as fh:
+                raw = json.load(fh)
+            return cls(
+                updated=float(raw["updated"]),
+                poll_interval_s=float(raw["poll_interval_s"]),
+                restarts_total=int(raw["restarts_total"]),
+                last_restart_timestamp=float(raw["last_restart_timestamp"]),
+                stall_seconds=float(raw["stall_seconds"]),
+                requests_running=_optional_float(raw["requests_running"]),
+                generated_tokens=_optional_float(raw["generated_tokens"]),
+                gpus=raw["gpus"],
+                engine_socket=raw["engine_socket"],
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
+
 def watchdog_state_paths() -> list[str]:
     # Globbed per request, not at import: in split mode the files appear as each bundle's
     # watchdog starts, and a list captured at boot would miss them.
@@ -334,24 +385,18 @@ def watchdog_state_paths() -> list[str]:
     return sorted(glob.glob(WATCHDOG_STATE_GLOB))
 
 
-def watchdog_values(state: dict) -> list[tuple[str, str]]:
-    poll_s = float(state.get("poll_interval_s") or 60.0)
-    age_s = time.time() - float(state.get("updated") or 0.0)
+def watchdog_values(state: WatchdogState) -> list[tuple[str, str]]:
+    age_s = time.time() - state.updated
     values = [
-        ("dolphin_watchdog_up", str(int(age_s <= 3 * poll_s))),
-        ("dolphin_watchdog_restarts_total", str(int(state.get("restarts_total") or 0))),
-        (
-            "dolphin_watchdog_last_restart_timestamp",
-            str(int(state.get("last_restart_timestamp") or 0)),
-        ),
-        ("dolphin_watchdog_stall_seconds", f"{float(state.get('stall_seconds') or 0.0):.0f}"),
+        ("dolphin_watchdog_up", str(int(age_s <= 3 * state.poll_interval_s))),
+        ("dolphin_watchdog_restarts_total", str(state.restarts_total)),
+        ("dolphin_watchdog_last_restart_timestamp", str(int(state.last_restart_timestamp))),
+        ("dolphin_watchdog_stall_seconds", f"{state.stall_seconds:.0f}"),
     ]
-    if state.get("gpus"):
+    if state.gpus:
         # Split mode only. A watchdog that cannot identify its own engine is running and
         # guarding nothing — indistinguishable from a healthy one without this series.
-        values.append(
-            ("dolphin_watchdog_engine_found", str(int(bool(state.get("engine_socket")))))
-        )
+        values.append(("dolphin_watchdog_engine_found", str(int(bool(state.engine_socket)))))
     return values
 
 
@@ -367,14 +412,11 @@ def watchdog_series() -> bytes:
     grouped: dict[str, list[str]] = {}
     order: list[str] = []
     for path in watchdog_state_paths():
-        try:
-            with open(path) as fh:
-                state = json.load(fh)
-        except (OSError, ValueError):
+        state = WatchdogState.read(path)
+        if state is None:
             continue
-        gpus = state.get("gpus")
         # Unlabelled with a single engine: the shipped fleet's series must not change shape.
-        label = f'{{dolphin_watchdog_gpus="{gpus}"}}' if gpus else ""
+        label = f'{{dolphin_watchdog_gpus="{state.gpus}"}}' if state.gpus else ""
         for name, value in watchdog_values(state):
             if name not in grouped:
                 grouped[name] = []

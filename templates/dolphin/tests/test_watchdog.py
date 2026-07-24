@@ -192,7 +192,9 @@ def test_growing_counter_is_left_alone() -> None:
 
 
 def test_idle_queue_is_not_a_wedge() -> None:
-    # counters frozen because there is nothing to do — a demand problem, not a fault
+    # counters frozen because there is nothing to do — a demand problem, not a fault. The
+    # clock must stay at zero, not merely be masked: stall banked while idle would fire the
+    # moment the first request lands (see the mid-prefill test).
     engine = Engine(generated=1000.0, running=0.0)
     with tempfile.TemporaryDirectory() as tmp:
         sock = pathlib.Path(tmp) / "dp-1" / "v.sock"
@@ -202,7 +204,7 @@ def test_idle_queue_is_not_a_wedge() -> None:
             time.sleep(STALL_S * 4)
             final = read_state(state)
     assert final["restarts_total"] == 0, "an idle engine must not be restarted"
-    assert final["stall_seconds"] >= STALL_S, "the stall clock still runs, it just does not fire"
+    assert final["stall_seconds"] < STALL_S, "idle time must not arm the stall clock"
 
 
 def test_missing_socket_is_not_a_wedge() -> None:
@@ -218,6 +220,31 @@ def test_missing_socket_is_not_a_wedge() -> None:
 
 
 # --- kill half: does it restart the right processes? ------------------------------
+
+
+def test_first_request_after_idle_is_not_killed_mid_prefill() -> None:
+    # The false positive this guards: stall banked during a quiet stretch, then the first
+    # request lands and a poll catches it mid-prefill — requests running, no tokens generated
+    # yet. The clock may only start counting from the last poll that saw the queue empty, so
+    # the engine gets the full stall window, not the remainder of one that expired while
+    # nothing was asked of it.
+    require_proc()
+    engine = Engine(generated=1000.0, running=0.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = pathlib.Path(tmp) / "dp-1" / "v.sock"
+        sock.parent.mkdir()
+        state = pathlib.Path(tmp) / "state.json"
+        with fake_process("vllm serve --model fake") as serve, fake_engine(sock, engine):
+            with watchdog(f"{tmp}/dp-*/v.sock", state):
+                time.sleep(STALL_S * 4)  # idle long past the stall limit
+                with engine.lock:
+                    engine.running = 8.0  # first request arrives; prefill: no tokens yet
+                time.sleep(STALL_S / 2)  # a poll lands inside the prefill window
+                assert not dead(serve), "prefill after idle must get the full stall window"
+                engine.produce(500.0)  # generation starts; the engine was healthy all along
+                time.sleep(STALL_S / 2)
+                assert not dead(serve), "a producing engine must never be restarted"
+                assert read_state(state)["restarts_total"] == 0
 
 
 def test_frozen_counter_with_requests_restarts_engine() -> None:
@@ -455,8 +482,9 @@ def test_state_reaches_the_sidecar_as_series() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         state = pathlib.Path(tmp) / "state.json"
         state.write_text(json.dumps({
-            "version": 1, "updated": time.time(), "poll_interval_s": 60,
+            "updated": time.time(), "poll_interval_s": 60,
             "restarts_total": 3, "last_restart_timestamp": 1769000000, "stall_seconds": 12.4,
+            "requests_running": 2, "generated_tokens": 5000, "gpus": None, "engine_socket": None,
         }))
         os.environ["DOLPHIN_WATCHDOG_STATE"] = str(state)
         try:
@@ -475,8 +503,9 @@ def test_state_reaches_the_sidecar_as_series() -> None:
 
 def bundle_state(gpus: str, socket: str | None, restarts: int) -> str:
     return json.dumps({
-        "version": 1, "updated": time.time(), "poll_interval_s": 60,
+        "updated": time.time(), "poll_interval_s": 60,
         "restarts_total": restarts, "last_restart_timestamp": 1769000000, "stall_seconds": 0,
+        "requests_running": None, "generated_tokens": None,
         "gpus": gpus, "engine_socket": socket,
     })
 
@@ -526,8 +555,9 @@ def test_dead_watchdog_reports_itself_down() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         state = pathlib.Path(tmp) / "state.json"
         state.write_text(json.dumps({
-            "version": 1, "updated": time.time() - 3600, "poll_interval_s": 60,
+            "updated": time.time() - 3600, "poll_interval_s": 60,
             "restarts_total": 2, "last_restart_timestamp": 1769000000, "stall_seconds": 0,
+            "requests_running": None, "generated_tokens": None, "gpus": None, "engine_socket": None,
         }))
         os.environ["DOLPHIN_WATCHDOG_STATE"] = str(state)
         try:

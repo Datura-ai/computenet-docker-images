@@ -43,11 +43,12 @@ import signal
 import sys
 import time
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
-# The sidecar owns the unix-socket client and the socket-discovery order; importing it
-# keeps one implementation. Its module body only reads env — nothing starts on import.
-from metrics_sidecar import discover_sockets, fetch_vllm_metrics
+# The sidecar owns the unix-socket client, the socket-discovery order and the state schema
+# (WatchdogState); importing it keeps one implementation of each. Its module body only reads
+# env — nothing starts on import.
+from metrics_sidecar import WatchdogState, discover_sockets, fetch_vllm_metrics
 
 POLL_INTERVAL_S = float(os.environ.get("DOLPHIN_WATCHDOG_POLL_SECONDS", "60"))
 # How long the token counter may stand still, with requests in flight, before the engine
@@ -62,7 +63,6 @@ STATE_PATH = os.environ.get(
     "DOLPHIN_WATCHDOG_STATE",
     os.path.join(os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state.json"),
 )
-STATE_VERSION = 1
 
 SERVE_MARKER = "vllm serve"
 ENGINE_MARKER = "VLLM::EngineCore"
@@ -258,13 +258,14 @@ def find_engine_processes() -> EngineProcesses | None:
 
 
 def _alive(pid: int) -> bool:
+    # Reads /proc rather than signal 0, which a zombie still answers: an engine killed but not
+    # yet reaped by its parent has already released its VRAM and counts as dead here.
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            process_state = fh.read().rpartition(b")")[2].split()[0]
+    except (OSError, IndexError):
         return False
-    except PermissionError:
-        return True
-    return True
+    return process_state != b"Z"
 
 
 def _kill(pids: list[int]) -> list[int]:
@@ -279,10 +280,11 @@ def _kill(pids: list[int]) -> list[int]:
 
 
 def restart_engine() -> bool:
-    # SIGKILL only: a process stuck in a CUDA kernel ignores SIGTERM. Returns False when
-    # there was no engine to kill, which the caller reports instead of counting a restart.
-    # The scan is repeated here rather than reused from the poll: pids read a minute ago may
-    # already belong to something else.
+    # SIGKILL only: a process stuck in a CUDA kernel ignores SIGTERM. Returns False when there
+    # was nothing to kill or the engine survived the signal (a CUDA ioctl can leave a process
+    # unkillable) — counting either as a restart would let a permanently wedged engine report
+    # as cured every grace period. The scan is repeated here rather than reused from the poll:
+    # pids read a minute ago may already belong to something else.
     found = find_engine_processes()
     if found is None:
         _log("wedge detected but this bundle's engine is ambiguous — killing nothing")
@@ -306,7 +308,8 @@ def restart_engine() -> bool:
 
     still_alive = [pid for pid in serve + engine if _alive(pid)]
     if still_alive:
-        _log(f"WARNING: still alive after SIGKILL: {still_alive}")
+        _log(f"WARNING: still alive after SIGKILL, not counting a restart: {still_alive}")
+        return False
     return True
 
 
@@ -322,22 +325,21 @@ def write_state(
     # gpus + engine_socket are what let the sidecar label N bundles apart and publish
     # engine_found, so a watchdog that is running but cannot see its engine — the one state
     # that guards nothing while looking alive — is not silent.
-    state = {
-        "version": STATE_VERSION,
-        "updated": time.time(),
-        "poll_interval_s": POLL_INTERVAL_S,
-        "restarts_total": restarts,
-        "last_restart_timestamp": last_restart,
-        "stall_seconds": round(stall_s, 1),
-        "requests_running": sample.running if sample else None,
-        "generated_tokens": sample.generated if sample else None,
-        "gpus": ",".join(GPU_SET) or None,
-        "engine_socket": socket_path,
-    }
+    state = WatchdogState(
+        updated=time.time(),
+        poll_interval_s=POLL_INTERVAL_S,
+        restarts_total=restarts,
+        last_restart_timestamp=last_restart,
+        stall_seconds=round(stall_s, 1),
+        requests_running=sample.running if sample else None,
+        generated_tokens=sample.generated if sample else None,
+        gpus=",".join(GPU_SET) or None,
+        engine_socket=socket_path,
+    )
     tmp_path = f"{STATE_PATH}.tmp"
     try:
         with open(tmp_path, "w") as fh:
-            json.dump(state, fh)
+            json.dump(asdict(state), fh)
         os.replace(tmp_path, STATE_PATH)  # atomic: the sidecar never reads a half file
     except OSError as e:
         _log(f"could not write state to {STATE_PATH}: {e}")
@@ -347,12 +349,10 @@ def load_state() -> tuple[int, float]:
     # The watchdog's own restart (a crash, its supervisor loop) must not erase the count:
     # a machine that keeps wedging would then read as a machine that never wedged. Scope is
     # the container's lifetime — a new container starts from an empty directory anyway.
-    try:
-        with open(STATE_PATH) as fh:
-            state = json.load(fh)
-        return int(state.get("restarts_total") or 0), float(state.get("last_restart_timestamp") or 0.0)
-    except (OSError, ValueError, TypeError):
+    state = WatchdogState.read(STATE_PATH)
+    if state is None:
         return 0, 0.0
+    return state.restarts_total, state.last_restart_timestamp
 
 
 def main() -> None:
@@ -380,6 +380,13 @@ def main() -> None:
 
         if sample is None or sample.generated != last_generated:
             last_generated = sample.generated if sample else None
+            last_change = now
+            reported_stall = False
+        elif sample.running == 0:
+            # An idle queue holds the clock at zero rather than merely failing the wedge test
+            # below: stall banked while nothing was asked of the engine would otherwise fire
+            # the moment the first request lands, when a poll can catch it mid-prefill
+            # (running > 0, no tokens yet) and SIGKILL a healthy engine.
             last_change = now
             reported_stall = False
 
