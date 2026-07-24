@@ -158,6 +158,11 @@ emit_worker_plan() {
 # Marker that tells our wrapper apart from the vendor's console script.
 ENGINE_WRAPPER_MARKER="dolphin-intra-card-vram-wrapper"
 
+engine_memory_wrapper_installed() {
+    local wrapper="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin/vllm"
+    [[ -f "${wrapper}" ]] && grep -q "${ENGINE_WRAPPER_MARKER}" "${wrapper}"
+}
+
 # The worker execs `<runtime>/bin/vllm serve ... --gpu-memory-utilization 0.85`, and vLLM sizes
 # that fraction against the card's TOTAL memory. So the second worker on a card asks for memory
 # the first one already holds and dies at init — the reproducible blocker DAH-2473 hit. The
@@ -174,11 +179,17 @@ install_engine_memory_wrapper() {
         echo "[dolphin] engine runtime not present yet; VRAM wrapper installs on the next start" >&2
         return 1
     fi
-    if ! grep -q "${ENGINE_WRAPPER_MARKER}" "${wrapper}"; then
-        # Vendor script in place: either the first install, or a self-update overwrote us.
-        cp -p "${wrapper}" "${real}"
+    if ! engine_memory_wrapper_installed; then
+        # Vendor script in place: either the first install, or a self-update overwrote us. If it
+        # cannot be staged, refuse — a wrapper whose vllm.real is missing launches nothing at all.
+        if ! cp -p "${wrapper}" "${real}"; then
+            echo "[dolphin] cannot stage ${real}; leaving the vendor engine script alone" >&2
+            return 1
+        fi
     fi
-    cat >"${wrapper}" <<EOF
+    local staged
+    staged="$(mktemp "${bin_dir}/.vllm.XXXXXX")"
+    cat >"${staged}" <<EOF
 #!${bin_dir}/python
 # ${ENGINE_WRAPPER_MARKER} (DAH-2473)
 """Claim only this worker's share of the card, then run the vendor's launcher unchanged."""
@@ -197,7 +208,10 @@ for i, arg in enumerate(argv):
 
 runpy.run_path(REAL, run_name="__main__")
 EOF
-    chmod +x "${wrapper}"
+    # Staged and renamed rather than written in place (DAH-2475): a worker in a sibling container
+    # can exec this path at any moment, and a half-written script is not a launcher.
+    chmod +x "${staged}"
+    mv -f "${staged}" "${wrapper}"
     echo "[dolphin] engine VRAM wrapper installed: each of ${WORKERS_PER_BUNDLE} workers claims 1/${WORKERS_PER_BUNDLE} of the card" >&2
 }
 
@@ -208,17 +222,13 @@ EOF
 remove_engine_memory_wrapper() {
     local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
     local wrapper="${bin_dir}/vllm" real="${bin_dir}/vllm.real"
-    if [[ ! -f "${wrapper}" ]] || ! grep -q "${ENGINE_WRAPPER_MARKER}" "${wrapper}"; then
-        return 0
-    fi
+    engine_memory_wrapper_installed || return 0
     if [[ ! -f "${real}" ]]; then
-        # Only reachable if someone deleted the staged vendor script by hand; leaving the wrapper
-        # divides the claim, removing it leaves no launcher at all, so keep it and say so.
+        # Keeping the wrapper only divides the claim; removing it would leave no launcher at all.
         echo "[dolphin] engine VRAM wrapper is installed but ${real} is gone; leaving it in place" >&2
         return 0
     fi
     mv -f "${real}" "${wrapper}"
-    chmod +x "${wrapper}"
     echo "[dolphin] engine VRAM wrapper removed: the worker claims the vendor's share of the card" >&2
 }
 
@@ -445,11 +455,16 @@ main() {
     # own 0.85 of the whole card. If the runtime isn't downloaded yet there is nothing to wrap,
     # and running N engines that each claim the whole card just crash-loops N-1 of them — so
     # fall back to a single worker for this start and split once the cache is warm.
-    if (( WORKERS_PER_BUNDLE > 1 )) && ! install_engine_memory_wrapper; then
+    # Both paths write the engine launcher inside the shared DOLPHIN_HOME, so they take the same
+    # lock as the binary download: two containers on one node, one installing while the other
+    # removes, would otherwise race on vllm/vllm.real (DAH-2475). Removal is pre-checked outside
+    # the lock like ensure_worker_binary does, so the unsplit fleet — every node, every start —
+    # does not queue behind a sibling's download just to find nothing to undo.
+    if (( WORKERS_PER_BUNDLE > 1 )) && ! with_dolphin_lock install_engine_memory_wrapper; then
         WORKERS_PER_BUNDLE=1
     fi
-    if (( WORKERS_PER_BUNDLE == 1 )); then
-        remove_engine_memory_wrapper
+    if (( WORKERS_PER_BUNDLE == 1 )) && engine_memory_wrapper_installed; then
+        with_dolphin_lock remove_engine_memory_wrapper
     fi
     if (( WORKERS_PER_BUNDLE > 1 )); then
         echo "[dolphin] bundle of ${bundle_cards} card(s), ${bundle_vram} MB -> ${WORKERS_PER_BUNDLE} workers per bundle" >&2

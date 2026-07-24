@@ -19,6 +19,17 @@ assert_eq() {
     fi
 }
 
+assert_fails() {
+    local label="$1"
+    shift
+    if "$@" 2>/dev/null; then
+        echo "FAIL ${label}"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   ${label}"
+    fi
+}
+
 make_sandbox() {
     SANDBOX="$(mktemp -d)"
     mkdir -p "${SANDBOX}/bin"
@@ -437,12 +448,8 @@ test_engine_memory_wrapper() {
     # main resolves this per bundle; the wrapper is what turns it into an actual VRAM fraction.
     WORKERS_PER_BUNDLE=2
 
-    if install_engine_memory_wrapper 2>/dev/null; then
-        echo "FAIL a missing runtime must refuse so the caller can fall back"
-        FAILURES=$((FAILURES + 1))
-    else
-        echo "ok   a missing runtime refuses so the caller can fall back"
-    fi
+    assert_fails "a missing runtime refuses so the caller can fall back" \
+        install_engine_memory_wrapper
 
     local bin_dir="${DOLPHIN_HOME}/runtimes/text-v/bin"
     mkdir -p "${bin_dir}"
@@ -460,6 +467,25 @@ test_engine_memory_wrapper() {
     assert_eq "a command without the flag is passed through untouched" \
         "VENDOR serve m --kv-cache-dtype fp8" \
         "$(python3 "${bin_dir}/vllm" serve m --kv-cache-dtype fp8)"
+
+    # Staging the vendor script is what makes the wrapper reversible AND runnable: if the copy
+    # fails, overwriting the launcher would leave a wrapper pointing at a file that never existed.
+    cat >"${SANDBOX}/bin/cp" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/cp"
+    hash -r
+    rm -f "${bin_dir}/vllm.real"
+    printf 'import sys\nprint("VENDOR " + " ".join(sys.argv[1:]))\n' >"${bin_dir}/vllm"
+    assert_fails "a failed stage refuses instead of destroying the vendor script" \
+        install_engine_memory_wrapper
+    assert_eq "the vendor script survives a failed stage" \
+        "VENDOR serve m --gpu-memory-utilization 0.85" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+    rm -f "${SANDBOX}/bin/cp"
+    hash -r
+    install_engine_memory_wrapper 2>/dev/null
 
     # A worker self-update overwrites our wrapper with a fresh vendor script. Re-wrapping must
     # restage THAT script, and must not treat the previous wrapper as the vendor's.
