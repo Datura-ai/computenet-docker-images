@@ -158,7 +158,7 @@ def sidecar_with_state_glob(state_dir: pathlib.Path, glob_pattern: str):
     # split mode: no single path to pin, the sidecar finds one state file per bundle
     extra = {
         "DOLPHIN_WATCHDOG_STATE": "",
-        "DOLPHIN_WATCHDOG_STATE_GLOB": f"{state_dir}/watchdog_state*.json",
+        "DOLPHIN_WATCHDOG_STATE_GLOB": f"{state_dir}/dolphin_watchdog_state*.json",
     }
     with sidecar_tests.sidecar(glob_pattern, sidecar_tests.TOKEN, extra) as base:
         yield base
@@ -569,11 +569,11 @@ def test_every_bundles_watchdog_reaches_the_sidecar() -> None:
     # N-1 bundles would vanish from the scrape
     with tempfile.TemporaryDirectory() as tmp:
         write_state_file(
-            pathlib.Path(tmp) / "watchdog_state_gpu0.json", updated=time.time(),
+            pathlib.Path(tmp) / "dolphin_watchdog_state_gpu0.json", updated=time.time(),
             restarts=2, stall_s=0.0, gpus="0", engine_socket=f"{tmp}/dp-a/v.sock",
         )
         write_state_file(
-            pathlib.Path(tmp) / "watchdog_state_gpu1.json", updated=time.time(),
+            pathlib.Path(tmp) / "dolphin_watchdog_state_gpu1.json", updated=time.time(),
             restarts=0, stall_s=0.0, gpus="1", engine_socket=None,
         )
         with sidecar_with_state_glob(pathlib.Path(tmp), f"{tmp}/dp-*/v.sock") as base:
@@ -591,7 +591,7 @@ def test_bundle_series_stay_grouped_by_metric() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         for index in range(3):
             write_state_file(
-                pathlib.Path(tmp) / f"watchdog_state_gpu{index}.json", updated=time.time(),
+                pathlib.Path(tmp) / f"dolphin_watchdog_state_gpu{index}.json", updated=time.time(),
                 restarts=index, stall_s=0.0, gpus=str(index),
                 engine_socket=f"{tmp}/dp-{index}/v.sock",
             )
@@ -639,6 +639,34 @@ def test_no_watchdog_means_no_series() -> None:
         with sidecar_with_state_file(absent, f"{tmp}/dp-*/v.sock") as base:
             _, body, _ = sidecar_tests.get(f"{base}/metrics")
     assert b"dolphin_watchdog" not in body, "zeros would claim a watchdog that is not running"
+
+
+def test_default_state_paths_are_not_on_the_shared_cache_volume() -> None:
+    # DOLPHIN_HOME is a cache volume the platform mounts into EVERY filler container on the
+    # node (lium-io#1161), so a state file under it is ONE file shared by every watchdog on
+    # the host: each overwrites the others' counters, and each inherits a neighbour's
+    # last_restart_timestamp on startup, which holds off its own kill for a grace period.
+    # Split mode makes it worse — N bundles per container, all globbing the same directory.
+    shared_home = "/opt/dolphinpod"
+    tracked = ("DOLPHIN_HOME", "DOLPHIN_WATCHDOG_STATE", "DOLPHIN_WATCHDOG_STATE_GLOB")
+    previous = {key: os.environ.get(key) for key in tracked}
+    os.environ["DOLPHIN_HOME"] = shared_home
+    for key in tracked[1:]:
+        os.environ.pop(key, None)
+    try:
+        sidecar = _load_shipped_sidecar()
+        default_paths = [sidecar.SINGLE_ENGINE_STATE_PATH, sidecar.WATCHDOG_STATE_GLOB]
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    for path in default_paths:
+        assert not path.startswith(shared_home), (
+            f"state path {path} sits on the shared cache volume — every watchdog on the "
+            "node would write that one file"
+        )
 
 
 def main() -> None:

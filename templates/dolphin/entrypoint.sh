@@ -30,6 +30,9 @@ set -euo pipefail
 
 DOLPHIN_HOME="${DOLPHIN_HOME:-/opt/dolphinpod}"
 WORKER_BIN="${DOLPHIN_HOME}/dolphinpod-worker"
+# Where the per-bundle watchdogs write their state. The container's own filesystem, so the
+# names below stay private to this container; the sidecar globs the same directory.
+WATCHDOG_STATE_DIR="${DOLPHIN_WATCHDOG_STATE_DIR:-/tmp}"
 
 API_KEY="${DOLPHIN_API_KEY:-}"
 MODEL="${DOLPHIN_MODEL:-nvidia/Qwen3.6-35B-A3B-NVFP4}"
@@ -323,18 +326,21 @@ main() {
     # A single instance gets the unscoped watchdog and the original state path, so the
     # single-worker fleet keeps exactly the behavior it runs today.
     #
-    # DOLPHIN_HOME is a shared volume, so state files outlive the container: clear them before
-    # starting, or a previous run's split publishes stale bundles as dead watchdogs forever.
+    # State lives in the container's own /tmp, never on DOLPHIN_HOME: that volume is shared by
+    # every filler container on the node, so state there would mix the counters of every
+    # watchdog on the host (lium-io#1161). A restarted container keeps its /tmp, so a previous
+    # run's split is still cleared before starting — stale files would otherwise publish
+    # forever as dead watchdogs for bundles that no longer exist.
     local watchdog_pids=()
     if [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]]; then
-        rm -f "${DOLPHIN_HOME}"/watchdog_state*.json
+        rm -f "${WATCHDOG_STATE_DIR}"/dolphin_watchdog_state*.json
         local watchdog_gpu_set watchdog_state
         for i in "${!gpu_sets[@]}"; do
             watchdog_gpu_set=""
-            watchdog_state="${DOLPHIN_HOME}/watchdog_state.json"
+            watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state.json"
             if (( instance_count > 1 )); then
                 watchdog_gpu_set="${gpu_sets[$i]}"
-                watchdog_state="${DOLPHIN_HOME}/watchdog_state_gpu${gpu_sets[$i]//,/-}.json"
+                watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state_gpu${gpu_sets[$i]//,/-}.json"
             fi
             (
                 while true; do

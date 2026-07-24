@@ -48,7 +48,9 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_WATCHDOG_POLL_SECONDS` | no | `60`                    | How often the watchdog reads the engine's counters. |
 | `DOLPHIN_WATCHDOG_GRACE_SECONDS` | no | `300`                  | Quiet period after a restart, while the engine reloads weights. |
 | `DOLPHIN_WATCHDOG_ENGINE_CORE_SECONDS` | no | `20`             | How long the `VLLM::EngineCore` child gets to die with its parent before it is killed directly. |
-| `DOLPHIN_WATCHDOG_STATE` | no | `${DOLPHIN_HOME}/watchdog_state.json` | Where the watchdog writes its state; the entrypoint names one file per bundle in split mode. The sidecar reads the same directory to export the series below, so both processes must agree on it. |
+| `DOLPHIN_WATCHDOG_STATE` | no | `/tmp/dolphin_watchdog_state.json` | Where one watchdog writes its state; the entrypoint names one file per bundle in split mode. Keep it OFF `DOLPHIN_HOME`: that is a cache volume shared by every filler container on the node, and one state file per node would mix the counters of every watchdog on it. |
+| `DOLPHIN_WATCHDOG_STATE_DIR` | no | `/tmp` | Directory the entrypoint names those files in, one per bundle. |
+| `DOLPHIN_WATCHDOG_STATE_GLOB` | no | `/tmp/dolphin_watchdog_state*.json` | Where the sidecar looks for those files, so it exports the series below for every bundle. It must match the names the entrypoint hands out. |
 
 The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
 live), so one key drives the whole fleet. `worker.json` is written `0600`; the worker refuses a
@@ -199,14 +201,14 @@ Tests (no GPU needed):
 ```bash
 python3 tests/test_sidecar.py            # host run against the repo copy
 python3 tests/test_watchdog.py           # same; the kill tests need /proc and SKIP on macOS
-tests/run_in_image.sh daturaai/dolphin:0.0.10  # both suites inside the image + docker-stop cleanliness
+tests/run_in_image.sh daturaai/dolphin:0.0.11  # both suites inside the image + docker-stop cleanliness
 ```
 
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.10
+docker buildx bake                     # daturaai/dolphin:0.0.11
 VERSION=0.0.11 docker buildx bake      # override the tag
 ```
 

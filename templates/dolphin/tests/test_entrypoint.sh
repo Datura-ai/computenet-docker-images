@@ -24,7 +24,8 @@ make_sandbox() {
     mkdir -p "${SANDBOX}/bin"
     export PATH="${SANDBOX}/bin:${PATH}"
     export HOME="${SANDBOX}/home"
-    mkdir -p "${HOME}"
+    export DOLPHIN_WATCHDOG_STATE_DIR="${SANDBOX}/state"
+    mkdir -p "${HOME}" "${DOLPHIN_WATCHDOG_STATE_DIR}"
 }
 
 mock_nvidia_smi() {
@@ -322,8 +323,8 @@ EOF
     kill -TERM "${entry_pid}" 2>/dev/null
     wait "${entry_pid}" 2>/dev/null
 
-    assert_eq "one watchdog per bundle, each told its cards" "watchdog.py gpus=0 state=watchdog_state_gpu0.json
-watchdog.py gpus=1 state=watchdog_state_gpu1.json" \
+    assert_eq "one watchdog per bundle, each told its cards" "watchdog.py gpus=0 state=dolphin_watchdog_state_gpu0.json
+watchdog.py gpus=1 state=dolphin_watchdog_state_gpu1.json" \
         "$(grep watchdog "${SANDBOX}/python.log" 2>/dev/null | sort)"
 }
 
@@ -339,9 +340,9 @@ exit 1
 EOF
     chmod +x "${SANDBOX}/bin/curl"
     touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
-    # DOLPHIN_HOME is a volume, so a previous run's split leaves state files behind. They
-    # would publish as dead watchdogs for bundles that no longer exist.
-    echo '{}' >"${DOLPHIN_HOME}/watchdog_state_gpu7.json"
+    # A restarted container keeps its /tmp, so a previous run's split leaves state files
+    # behind. They would publish as dead watchdogs for bundles that no longer exist.
+    echo '{}' >"${DOLPHIN_WATCHDOG_STATE_DIR}/dolphin_watchdog_state_gpu7.json"
     cat >"${SANDBOX}/bin/python3" <<EOF
 #!/usr/bin/env bash
 echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
@@ -367,10 +368,10 @@ EOF
 
     # No GPU set: with one engine per container every vLLM process is that engine's, which is
     # the behavior the whole single-worker fleet runs today.
-    assert_eq "single engine gets the unscoped watchdog" "watchdog.py gpus=none state=watchdog_state.json" \
+    assert_eq "single engine gets the unscoped watchdog" "watchdog.py gpus=none state=dolphin_watchdog_state.json" \
         "$(grep watchdog "${SANDBOX}/python.log" 2>/dev/null)"
     assert_eq "stale bundle state is cleared at boot" "" \
-        "$(ls "${DOLPHIN_HOME}"/watchdog_state_gpu7.json 2>/dev/null)"
+        "$(ls "${DOLPHIN_WATCHDOG_STATE_DIR}"/dolphin_watchdog_state_gpu7.json 2>/dev/null)"
 }
 
 test_plan

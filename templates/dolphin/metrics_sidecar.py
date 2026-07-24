@@ -44,16 +44,19 @@ PORT = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN = os.environ.get("METRICS_TOKEN", "")
 SOCKET_GLOB = os.environ.get("METRICS_SOCKET_GLOB", "/tmp/dp-*/v.sock")
 # Written every tick by watchdog.py; absent when the watchdog is disabled or not shipped.
+# NOT under DOLPHIN_HOME: since lium-io#1161 that directory is a cache volume the platform
+# mounts into EVERY filler container on the node, so a state file there is one file shared by
+# every watchdog on the host — each overwriting the others' counters, and each inheriting a
+# neighbour's last_restart_timestamp on startup, which suppresses its own kill for a grace
+# period. /tmp is the container's own filesystem (the engine's unix socket lives there for the
+# same reason), so a state file belongs to exactly one watchdog and dies with its container.
 # Split mode runs one watchdog — and one state file — per GPU bundle, so the default is a
 # glob; DOLPHIN_WATCHDOG_STATE pins a single file when the caller knows which one it wants,
 # and SINGLE_ENGINE_STATE_PATH is where an unscoped watchdog writes.
-SINGLE_ENGINE_STATE_PATH = os.path.join(
-    os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state.json"
-)
+SINGLE_ENGINE_STATE_PATH = "/tmp/dolphin_watchdog_state.json"
 WATCHDOG_STATE_PATH = os.environ.get("DOLPHIN_WATCHDOG_STATE", "")
 WATCHDOG_STATE_GLOB = os.environ.get(
-    "DOLPHIN_WATCHDOG_STATE_GLOB",
-    os.path.join(os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state*.json"),
+    "DOLPHIN_WATCHDOG_STATE_GLOB", "/tmp/dolphin_watchdog_state*.json"
 )
 # How many engines the entrypoint spawned. Exported so a missing engine reads as a gap
 # (up < expected) instead of as a smaller token number that looks like a quiet machine.

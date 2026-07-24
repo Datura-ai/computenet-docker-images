@@ -7,7 +7,7 @@
 # The watchdog's kill tests are skipped on a macOS host for want of /proc, so
 # this is the only place they actually run — do not skip it.
 set -euo pipefail
-IMAGE="${1:-daturaai/dolphin:0.0.10}"
+IMAGE="${1:-daturaai/dolphin:0.0.11}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "== [1/4] sidecar tests inside ${IMAGE} =="
