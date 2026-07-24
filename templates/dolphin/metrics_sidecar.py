@@ -13,6 +13,9 @@ Design constraints (DAH-2468):
   published to the internet, never serve it unauthenticated.
 - Total upstream budget per request stays under the scraper's client timeout
   even when falling through several stale sockets.
+- Read-only: the sidecar observes and republishes, it never acts on the worker.
+  Acting is watchdog.py's job; this file only exposes the state file it writes
+  as dolphin_watchdog_* series, so the restarts reach the scraper.
 """
 
 import glob
@@ -25,22 +28,72 @@ import socket
 import sys
 import time
 
+from dataclasses import dataclass
+
 PORT = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN = os.environ.get("METRICS_TOKEN", "")
 SOCKET_GLOB = os.environ.get("METRICS_SOCKET_GLOB", "/tmp/dp-*/v.sock")
+# Written every tick by watchdog.py; absent when the watchdog is disabled or not shipped.
+WATCHDOG_STATE_PATH = os.environ.get(
+    "DOLPHIN_WATCHDOG_STATE",
+    os.path.join(os.environ.get("DOLPHIN_HOME", "/opt/dolphinpod"), "watchdog_state.json"),
+)
 SIDECAR_VERSION = 1
 TOTAL_BUDGET_S = 4.0
 CONNECT_TIMEOUT_S = 1.0
 MAX_BODY_BYTES = 5 * 1024 * 1024
 LOG_INTERVAL_S = 10.0
-# Prometheus text exposition format version — NOT the image version (which also
-# happens to be 0.0.4). Do not bump this when bumping the image tag.
+# Prometheus text exposition format version — NOT the image version, which it once
+# coincided with. Do not bump this when bumping the image tag.
 PROM_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 _last_ok_ts: float = 0.0
 _last_socket: str = ""
 _last_error: str | None = None
 _last_log_ts: float = 0.0
+
+
+def _optional_float(value: object) -> float | None:
+    return None if value is None else float(value)
+
+
+@dataclass(frozen=True)
+class WatchdogState:
+    """What watchdog.py writes every tick. Declared here because three parties read these
+    names — the sidecar below, the watchdog itself after its own restart, and the tests —
+    and a key renamed on one side only makes the whole dolphin_watchdog_* group disappear,
+    which on a dashboard is indistinguishable from a watchdog that was never installed."""
+
+    updated: float
+    # Widest gap a healthy watchdog may leave between writes; the watchdog owns the number
+    # because only it knows how long its slowest tick (the one that kills an engine) takes.
+    max_write_gap_s: float
+    restarts_total: int
+    last_restart_timestamp: float
+    stall_seconds: float
+    # None when the engine did not answer this tick. requests_running is what tells an idle
+    # queue apart from a wedge, so a high stall_seconds cannot be read without it.
+    requests_running: float | None
+    generated_tokens: float | None
+
+    @classmethod
+    def read(cls, path: str) -> "WatchdogState | None":
+        # None for every shape we cannot use: absent, unparsable, or written by something
+        # else. Callers turn that into silence, never into invented zeros.
+        try:
+            with open(path) as fh:
+                raw = json.load(fh)
+            return cls(
+                updated=float(raw["updated"]),
+                max_write_gap_s=float(raw["max_write_gap_s"]),
+                restarts_total=int(raw["restarts_total"]),
+                last_restart_timestamp=float(raw["last_restart_timestamp"]),
+                stall_seconds=float(raw["stall_seconds"]),
+                requests_running=_optional_float(raw["requests_running"]),
+                generated_tokens=_optional_float(raw["generated_tokens"]),
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
 
 
 def _log(msg: str) -> None:
@@ -130,6 +183,24 @@ def sidecar_series(sockets_found: int, proxy_ok: bool) -> bytes:
     ).encode()
 
 
+def watchdog_series() -> bytes:
+    # Empty when there is no readable state at all — better than zeros, which would claim a
+    # healthy watchdog that does not exist. A watchdog that ran and died is a different
+    # story and must be visible, so a stale state file reports up 0 with its last numbers.
+    state = WatchdogState.read(WATCHDOG_STATE_PATH)
+    if state is None:
+        return b""
+    # Three missed writes mean it is gone. The bound comes from the file rather than from
+    # the poll interval, because the tick that kills an engine blocks far longer than a poll.
+    age_s = time.time() - state.updated
+    return (
+        f"dolphin_watchdog_up {int(age_s <= 3 * state.max_write_gap_s)}\n"
+        f"dolphin_watchdog_restarts_total {state.restarts_total}\n"
+        f"dolphin_watchdog_last_restart_timestamp {int(state.last_restart_timestamp)}\n"
+        f"dolphin_watchdog_stall_seconds {state.stall_seconds:.0f}\n"
+    ).encode()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "dolphin-sidecar"
 
@@ -178,7 +249,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not body.endswith(b"\n"):
                 body += b"\n"
             out = body + sidecar_series(len(sockets), proxy_ok=True)
-        self._reply(200, out, PROM_CONTENT_TYPE)
+        self._reply(200, out + watchdog_series(), PROM_CONTENT_TYPE)
 
     def _get_health(self) -> None:
         sockets = discover_sockets()
