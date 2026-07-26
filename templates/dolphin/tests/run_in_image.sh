@@ -7,7 +7,7 @@
 # The watchdog's kill tests are skipped on a macOS host for want of /proc, so
 # this is the only place they actually run — do not skip it.
 set -euo pipefail
-IMAGE="${1:-daturaai/dolphin:0.0.11}"
+IMAGE="${1:-daturaai/dolphin:0.0.14}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "== [1/4] sidecar tests inside ${IMAGE} =="
@@ -82,13 +82,15 @@ SPLIT_BODY="$(docker exec "${SPLIT_CT}" curl -sf -H "Authorization: Bearer stub-
     http://127.0.0.1:9101/metrics || true)"
 echo "${SPLIT_BODY}" | grep -q "dolphin_engines_expected 2" \
     || { echo "FAIL: sidecar was not told to expect 2 engines"; docker logs "${SPLIT_CT}"; docker rm -f "${SPLIT_CT}"; rm -f "${FAKE_SMI}"; exit 1; }
-# One watchdog per bundle, each labelled with the cards it owns: an unlabelled series here
-# would mean a single container-wide watchdog, whose kill takes down every bundle at once.
+# One watchdog per instance, labelled with the instance it guards and the cards it sits on:
+# an unlabelled series here would mean a single container-wide watchdog, whose kill takes down
+# every engine at once. The instance label is the one that stays unique when workers share a card.
 for GPU_LABEL in 0 1; do
-    echo "${SPLIT_BODY}" | grep -q "dolphin_watchdog_up{dolphin_watchdog_gpus=\"${GPU_LABEL}\"} 1" \
+    LABELS="{dolphin_watchdog_gpus=\"${GPU_LABEL}\",dolphin_watchdog_instance=\"gpu${GPU_LABEL}\"}"
+    echo "${SPLIT_BODY}" | grep -q "dolphin_watchdog_up${LABELS} 1" \
         || { echo "FAIL: no watchdog for GPU ${GPU_LABEL}"; echo "${SPLIT_BODY}" | grep watchdog; docker rm -f "${SPLIT_CT}"; rm -f "${FAKE_SMI}"; exit 1; }
     # The stub worker starts no engine, so each watchdog must say so rather than look armed.
-    echo "${SPLIT_BODY}" | grep -q "dolphin_watchdog_engine_found{dolphin_watchdog_gpus=\"${GPU_LABEL}\"} 0" \
+    echo "${SPLIT_BODY}" | grep -q "dolphin_watchdog_engine_found${LABELS} 0" \
         || { echo "FAIL: watchdog for GPU ${GPU_LABEL} claims an engine it cannot have"; echo "${SPLIT_BODY}" | grep watchdog; docker rm -f "${SPLIT_CT}"; rm -f "${FAKE_SMI}"; exit 1; }
 done
 docker logs "${SPLIT_CT}" 2>&1 | grep -q "spawning 2 worker(s)" \

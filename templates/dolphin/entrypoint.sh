@@ -23,9 +23,9 @@
 #   - metrics undercount -> the sidecar scrapes EVERY engine socket and tags each with its own
 #                           dolphin_engine label; DOLPHIN_ENGINES_EXPECTED lets it report a
 #                           dead engine as a gap instead of as a smaller token count
-#   - one wedge kills all -> one watchdog per bundle, scoped by DOLPHIN_WATCHDOG_GPU_SET, so a
-#                           wedged engine is killed on its own cards and its siblings keep
-#                           serving
+#   - one wedge kills all -> one watchdog per instance, scoped by DOLPHIN_WATCHDOG_INSTANCE_HOME,
+#                           so a wedged engine is killed on its own and its siblings — including
+#                           siblings sharing its card — keep serving
 set -euo pipefail
 
 DOLPHIN_HOME="${DOLPHIN_HOME:-/opt/dolphinpod}"
@@ -58,10 +58,9 @@ SPLIT_STAGGER_SECONDS="${DOLPHIN_SPLIT_STAGGER_SECONDS:-30}"
 # against the card's VRAM, so forcing 2 onto an 80 GB card gives two crippled engines. "1"
 # disables the split entirely.
 #
-# The default is 1, and it has to stay 1 until the DAH-2465 watchdog is re-keyed off the engine
-# socket instead of the card set: two workers on one card produce two engines with identical card
-# sets, which is the ambiguous case the watchdog refuses to act on, so a wedge on a split card
-# stays wedged. Splitting is opt-in ("auto" or an explicit count) until then.
+# The default is 1: splitting is opt-in ("auto" or an explicit count), because what each layout
+# earns is still being measured. The watchdog is no longer the reason — it identifies its engine
+# by the instance HOME, so a wedge on a split card is cured like any other.
 WORKERS_PER_BUNDLE_SETTING="${DOLPHIN_WORKERS_PER_BUNDLE:-1}"
 if [[ "${WORKERS_PER_BUNDLE_SETTING}" != "auto" ]] && ! [[ "${WORKERS_PER_BUNDLE_SETTING}" =~ ^[1-9][0-9]*$ ]]; then
     echo "[dolphin] DOLPHIN_WORKERS_PER_BUNDLE='${WORKERS_PER_BUNDLE_SETTING}' is neither 'auto' nor a positive integer; not splitting" >&2
@@ -630,11 +629,13 @@ main() {
     # flight, token counter frozen, GPU pinned at 100% on a third of normal power — observed
     # live on this image 2026-07-23).
     #
-    # One watchdog per bundle, each told its own cards. It reads only its own engine's socket
-    # and kills only its own processes, so a wedge on one bundle no longer takes the others
-    # down: the worker exports CUDA_VISIBLE_DEVICES per engine and runs `vllm serve --uds
-    # <socket>`, which gives /proc a GPU set <-> pid <-> socket mapping (measured). When that
-    # mapping is ambiguous the watchdog kills nothing and publishes engine_found 0.
+    # One watchdog per instance, each told its own HOME. It reads only its own engine's socket
+    # and kills only its own processes, so a wedge on one instance no longer takes the others
+    # down: every worker is spawned with a HOME of its own, which /proc reports for the engine
+    # it exec'd and for the children below it, giving a home <-> pid <-> socket mapping. The
+    # cards cannot serve as that key — N workers on one card share them (DAH-2473) — so they
+    # ride along as a label only. When the mapping is ambiguous the watchdog kills nothing and
+    # publishes engine_found 0.
     #
     # A single instance gets the unscoped watchdog and the original state path, so the
     # single-worker fleet keeps exactly the behavior it runs today.
@@ -647,17 +648,20 @@ main() {
     local watchdog_pids=()
     if [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]]; then
         rm -f "${WATCHDOG_STATE_DIR}"/dolphin_watchdog_state*.json
-        local watchdog_gpu_set watchdog_state
+        local watchdog_gpu_set watchdog_instance_home watchdog_state
         for i in "${!gpu_sets[@]}"; do
             watchdog_gpu_set=""
+            watchdog_instance_home=""
             watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state.json"
             if (( instance_count > 1 )); then
                 watchdog_gpu_set="${gpu_sets[$i]}"
+                watchdog_instance_home="${instance_homes[$i]}"
                 watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state_$(instance_tag "${i}" "${gpu_sets[$i]}").json"
             fi
             (
                 while true; do
                     DOLPHIN_WATCHDOG_GPU_SET="${watchdog_gpu_set}" \
+                    DOLPHIN_WATCHDOG_INSTANCE_HOME="${watchdog_instance_home}" \
                     DOLPHIN_WATCHDOG_STATE="${watchdog_state}" \
                         python3 "${DOLPHIN_HOME}/watchdog.py" || true
                     sleep 5

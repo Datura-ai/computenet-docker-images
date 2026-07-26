@@ -51,7 +51,8 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `METRICS_TOKEN`       | no       | —                                | Bearer token for the metrics sidecar on `:9101`. Unset → the sidecar answers 503 to everything (fail closed). |
 | `DOLPHIN_ENGINES_EXPECTED` | no  | (set by the entrypoint)          | How many engines this container runs. The sidecar publishes it next to `dolphin_engines_up`, and above 1 it tags every engine's series with `dolphin_engine`. |
 | `DOLPHIN_WATCHDOG_ENABLED` | no  | `1`                              | `0` stops the entrypoint from starting any engine watchdog. |
-| `DOLPHIN_WATCHDOG_GPU_SET` | no | (set per bundle by the entrypoint) | Cards this watchdog owns, e.g. `0` or `2,3`. Empty = the single-engine container, where every vLLM process belongs to the one engine. |
+| `DOLPHIN_WATCHDOG_GPU_SET` | no | (set per instance by the entrypoint) | Cards this watchdog's engine sits on, e.g. `0` or `2,3`. A label only — several workers can share one card, so this identifies nothing on its own. |
+| `DOLPHIN_WATCHDOG_INSTANCE_HOME` | no | (set per instance by the entrypoint) | HOME of the worker instance this watchdog owns; how it tells its engine from its siblings'. Empty = the single-engine container, where every vLLM process belongs to the one engine. |
 | `DOLPHIN_WATCHDOG_STALL_SECONDS` | no | `300`                  | How long the token counter may stand still, with requests in flight, before the engine is restarted. |
 | `DOLPHIN_WATCHDOG_POLL_SECONDS` | no | `60`                    | How often the watchdog reads the engine's counters. |
 | `DOLPHIN_WATCHDOG_GRACE_SECONDS` | no | `300`                  | Quiet period after a restart, while the engine reloads weights. |
@@ -103,7 +104,7 @@ What running N instances in one container costs, and how each cost is paid:
 | siblings corrupt the shared binary | every write to `DOLPHIN_HOME` goes through `flock`, staged to a temp file and renamed atomically (DAH-2475) |
 | cold start stampede | the siblings wait for the first instance's engine socket (`DOLPHIN_SEED_WAIT_SECONDS`, default 5400) instead of merely pausing: once it serves, the runtime and the weights are on disk, so 2..N start warm. Measured 2026-07-23 — with a plain 30 s stagger both workers downloaded the same ~12 GB side by side over a link the miner throttles. `DOLPHIN_SPLIT_STAGGER_SECONDS` (default 30) then spaces the warm starts. |
 | metrics undercount | the sidecar scrapes **every** engine socket and tags each with its own `dolphin_engine` label (see below) |
-| one wedge kills all | one watchdog per bundle, each scoped to its own cards, so a wedged engine is killed on its cards alone and the siblings keep serving (see below) |
+| one wedge kills all | one watchdog per worker instance, each scoped to its own HOME, so a wedged engine is killed on its own and the siblings — including siblings sharing its card — keep serving (see below) |
 
 ## Intra-card split (DAH-2473)
 
@@ -136,10 +137,9 @@ split was unreachable in prod — the refill scheduler creates a new container e
 restarts one, so "installs on the next start" never arrived (measured 2026-07-24: `auto` fired on
 zero nodes).
 
-The default is `1`, and it stays `1` until the watchdog is re-keyed off the engine socket
-instead of the card set: two workers on one card produce two engines with identical card sets,
-which is the ambiguous case the watchdog refuses to act on, so a wedge on a split card stays
-wedged.
+The default is `1`: splitting stays opt-in while what each layout earns is being measured.
+The watchdog is no longer a reason to keep it off — it identifies its engine by the instance
+HOME (below), so a wedge on a split card is cured like any other.
 
 ## GPU selection & eligibility
 
@@ -201,31 +201,38 @@ Three cases are deliberately left alone: no socket at all (a cold start legitima
 30-60 minutes, and a restart would only send it back to the beginning), an empty queue (no
 demand is not a fault, and idle time never arms the stall clock — the first request after a
 quiet stretch gets the full window), and any engine the watchdog cannot prove is its own —
-an ambiguous match kills nothing, because a wrong guess costs a healthy bundle.
+an ambiguous match kills nothing, because a wrong guess costs a healthy engine.
 
-### One watchdog per bundle
+### One watchdog per worker instance
 
 In split mode a container holds N engines, and killing every `vllm serve` in it would turn
-one wedge into N. So the entrypoint starts **one watchdog per bundle**, each given its cards
-in `DOLPHIN_WATCHDOG_GPU_SET`, and each acts on that bundle alone:
+one wedge into N. So the entrypoint starts **one watchdog per instance**, each given that
+instance's HOME in `DOLPHIN_WATCHDOG_INSTANCE_HOME`, and each acts on its own engine alone:
 
-- it finds its engine by matching `CUDA_VISIBLE_DEVICES` in `/proc/<pid>/environ` against its
-  own cards, then reads the socket off the `vllm serve --uds <socket>` command line — the same
-  socket the sidecar scrapes. Both facts were measured on live engines.
+- it finds its engine by matching `HOME` in `/proc/<pid>/environ` against its own instance
+  home, walking up the parent chain for a process that carries none, then reads the socket off
+  the `vllm serve --uds <socket>` command line — the same socket the sidecar scrapes.
 - it polls **only that socket**, so a sibling's frozen counter is not its wedge and a
   sibling's healthy one cannot mask its own.
 - it SIGKILLs **only that engine's** processes: its `vllm serve` and the `VLLM::EngineCore`
-  children claimed either by the same cards or by the parent link.
-- when two engines claim the same cards the match is ambiguous, and it then kills **nothing**
-  and publishes `dolphin_watchdog_engine_found 0`. A wrong guess would cost a healthy bundle,
+  children, which vLLM relaunches with an environment of its own and which are therefore
+  claimed through the parent link.
+- when two engines run under one home the match is ambiguous, and it then kills **nothing**
+  and publishes `dolphin_watchdog_engine_found 0`. A wrong guess would cost a healthy engine,
   so refusing is the only safe answer.
+
+The cards cannot serve as that key: with several workers per card (DAH-2473) every engine
+reports the same `CUDA_VISIBLE_DEVICES`, so a card-keyed watchdog would call each of them
+ambiguous and guard nothing — on exactly the layout the split exists for. Cards stay on the
+metrics as a label, and `DOLPHIN_WATCHDOG_GPU_SET` now only feeds that label.
 
 A single-instance container gets the unscoped watchdog and the original state path, so the
 single-worker fleet keeps exactly the behavior it runs today.
 
 Restarts reach the platform through the sidecar, which appends every watchdog's state to
-`/metrics` (labelled `dolphin_watchdog_gpus="<cards>"` in split mode, unlabelled with one
-engine):
+`/metrics` (labelled `dolphin_watchdog_gpus="<cards>",dolphin_watchdog_instance="<instance>"`
+in split mode, unlabelled with one engine — two workers on one card share the cards, so the
+instance is what keeps their series apart):
 
 | Series | Meaning |
 |---|---|
@@ -245,15 +252,15 @@ Tests (no GPU needed):
 ```bash
 python3 tests/test_sidecar.py            # host run against the repo copy
 python3 tests/test_watchdog.py           # same; the kill tests need /proc and SKIP on macOS
-tests/run_in_image.sh daturaai/dolphin:0.0.13  # both suites inside the image + docker-stop cleanliness
+tests/run_in_image.sh daturaai/dolphin:0.0.14  # both suites inside the image + docker-stop cleanliness
 ```
 
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.13
-VERSION=0.0.13 docker buildx bake      # override the tag
+docker buildx bake                     # daturaai/dolphin:0.0.14
+VERSION=0.0.14 docker buildx bake      # override the tag
 ```
 
 ## Run

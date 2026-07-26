@@ -325,7 +325,7 @@ EOF
     touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
     cat >"${SANDBOX}/bin/python3" <<EOF
 #!/usr/bin/env bash
-echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
+echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} home=\$(basename "\${DOLPHIN_WATCHDOG_INSTANCE_HOME:-none}") state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
 exec sleep 300
 EOF
     chmod +x "${SANDBOX}/bin/python3"
@@ -339,8 +339,9 @@ exit 0
 EOF
     chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
 
-    # Each instance must get its own GPU set AND its own state file: the GPU set is how the
-    # watchdog finds the one engine it may kill, and one file cannot describe N engines.
+    # Each instance must get its own HOME AND its own state file: the HOME is how the watchdog
+    # finds the one engine it may kill, and one file cannot describe N engines. The cards ride
+    # along as a label — they cannot identify anything once two workers share a card.
     DOLPHIN_API_KEY="dp-test" DOLPHIN_SPLIT_STAGGER_SECONDS=0 \
         METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock" bash "${ENTRYPOINT}" >/dev/null 2>&1 &
     local entry_pid=$!
@@ -352,8 +353,9 @@ EOF
     kill -TERM "${entry_pid}" 2>/dev/null
     wait "${entry_pid}" 2>/dev/null
 
-    assert_eq "one watchdog per bundle, each told its cards" "watchdog.py gpus=0 state=dolphin_watchdog_state_gpu0.json
-watchdog.py gpus=1 state=dolphin_watchdog_state_gpu1.json" \
+    assert_eq "one watchdog per instance, each told its home" \
+        "watchdog.py gpus=0 home=gpu0 state=dolphin_watchdog_state_gpu0.json
+watchdog.py gpus=1 home=gpu1 state=dolphin_watchdog_state_gpu1.json" \
         "$(grep watchdog "${SANDBOX}/python.log" 2>/dev/null | sort)"
 }
 
@@ -374,7 +376,7 @@ EOF
     echo '{}' >"${DOLPHIN_WATCHDOG_STATE_DIR}/dolphin_watchdog_state_gpu7.json"
     cat >"${SANDBOX}/bin/python3" <<EOF
 #!/usr/bin/env bash
-echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
+echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} home=\$(basename "\${DOLPHIN_WATCHDOG_INSTANCE_HOME:-none}") state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
 exec sleep 300
 EOF
     chmod +x "${SANDBOX}/bin/python3"
@@ -397,7 +399,8 @@ EOF
 
     # No GPU set: with one engine per container every vLLM process is that engine's, which is
     # the behavior the whole single-worker fleet runs today.
-    assert_eq "single engine gets the unscoped watchdog" "watchdog.py gpus=none state=dolphin_watchdog_state.json" \
+    assert_eq "single engine gets the unscoped watchdog" \
+        "watchdog.py gpus=none home=none state=dolphin_watchdog_state.json" \
         "$(grep watchdog "${SANDBOX}/python.log" 2>/dev/null)"
     assert_eq "stale bundle state is cleared at boot" "" \
         "$(ls "${DOLPHIN_WATCHDOG_STATE_DIR}"/dolphin_watchdog_state_gpu7.json 2>/dev/null)"
@@ -409,8 +412,8 @@ test_intra_card_plan() {
     unset DOLPHIN_WORKERS_PER_BUNDLE DOLPHIN_GPU_IDS DOLPHIN_WORKER_PER_GPU DOLPHIN_SPLIT_MIN_VRAM_MB || true
     load_entrypoint
 
-    # Splitting disarms the DAH-2465 watchdog until it is re-keyed off the engine socket, so a
-    # plain deploy must not enable it: no env, no split, on the cards the rule likes most.
+    # What each layout earns is still being measured, so a plain deploy must not enable it:
+    # no env, no split, on the cards the rule likes most.
     assert_eq "the default does not split an H200" "1" "$(derive_workers_per_bundle 1 143771)"
     assert_eq "the default does not split a B300"  "1" "$(derive_workers_per_bundle 1 281600)"
 
@@ -662,11 +665,64 @@ ${SANDBOX}/home/dolphin-workers/w1-gpuall" \
     unset DOLPHIN_HOME
 }
 
+# ------------------------------- the watchdogs of two workers sharing ONE card (DAH-2473)
+# The case the card set cannot answer: both instances own card 0, so a card-keyed watchdog
+# would call every engine ambiguous and guard nothing. Each must be told its own home, and
+# each must write its own state file — one file cannot describe two engines.
+test_intra_card_watchdogs_get_distinct_homes() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}"
+    mock_nvidia_smi "0:143771"
+    cat >"${SANDBOX}/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/curl"
+    touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
+    cat >"${SANDBOX}/bin/python3" <<EOF
+#!/usr/bin/env bash
+echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} home=\$(basename "\${DOLPHIN_WATCHDOG_INSTANCE_HOME:-none}") state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
+exec sleep 300
+EOF
+    chmod +x "${SANDBOX}/bin/python3"
+    local engine_dir="${DOLPHIN_HOME}/runtimes/text-v/bin"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "start" ]]; then
+    ( sleep 1; mkdir -p "${engine_dir}"; printf 'import sys\n' >"${engine_dir}/vllm" ) &
+    mkdir -p "${SANDBOX}/dp-\$\$" && touch "${SANDBOX}/dp-\$\$/v.sock"
+    exec sleep 300
+fi
+exit 0
+EOF
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+
+    DOLPHIN_API_KEY="dp-test" DOLPHIN_WORKERS_PER_BUNDLE=2 DOLPHIN_SPLIT_STAGGER_SECONDS=0 \
+        METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock" bash "${ENTRYPOINT}" >/dev/null 2>&1 &
+    local entry_pid=$!
+    local waited=0
+    while [[ "$(grep -c watchdog "${SANDBOX}/python.log" 2>/dev/null || echo 0)" -lt 2 ]] && (( waited < 40 )); do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    kill -TERM "${entry_pid}" 2>/dev/null
+    wait "${entry_pid}" 2>/dev/null
+
+    # Identical cards, different homes: that difference is the whole re-key.
+    assert_eq "co-tenants on one card get their own homes and state files" \
+        "watchdog.py gpus=all home=w0-gpuall state=dolphin_watchdog_state_w0-gpuall.json
+watchdog.py gpus=all home=w1-gpuall state=dolphin_watchdog_state_w1-gpuall.json" \
+        "$(grep watchdog "${SANDBOX}/python.log" 2>/dev/null | sort)"
+    unset DOLPHIN_HOME
+}
+
 test_plan
 test_intra_card_plan
 test_engine_memory_wrapper
 test_prime_engine_runtime
 test_cold_intra_card_split_smoke
+test_intra_card_watchdogs_get_distinct_homes
 test_render
 test_prepare_instance_home
 test_wait_for_cache_seed

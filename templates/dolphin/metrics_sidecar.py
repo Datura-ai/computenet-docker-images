@@ -91,8 +91,8 @@ class WatchdogState:
     names — the sidecar below, the watchdog itself after its own restart, and the tests —
     and a key renamed on one side only makes the whole dolphin_watchdog_* group disappear,
     which on a dashboard is indistinguishable from a watchdog that was never installed.
-    In split mode one of these is written per GPU bundle, which is what gpus + engine_socket
-    are for: telling N states apart and labelling them."""
+    In split mode one of these is written per worker instance, which is what instance +
+    engine_socket are for: telling N states apart and labelling them."""
 
     updated: float
     # Widest gap a healthy watchdog may leave between writes; the watchdog owns the number
@@ -105,9 +105,12 @@ class WatchdogState:
     # queue apart from a wedge, so a high stall_seconds cannot be read without it.
     requests_running: float | None
     generated_tokens: float | None
-    # Split mode only (both None in the single-engine image). engine_socket None means a
-    # watchdog that is running but cannot see its engine — guarding nothing.
+    # Split mode only (all three None in the single-engine image). engine_socket None means a
+    # watchdog that is running but cannot see its engine — guarding nothing. instance is what
+    # keeps the series apart: N workers on one card share a card set, so gpus alone would emit
+    # the same label twice and collapse N watchdogs into one contradictory pair of samples.
     gpus: str | None
+    instance: str | None
     engine_socket: str | None
 
     @classmethod
@@ -126,6 +129,7 @@ class WatchdogState:
                 requests_running=_optional_float(raw["requests_running"]),
                 generated_tokens=_optional_float(raw["generated_tokens"]),
                 gpus=raw["gpus"],
+                instance=raw["instance"],
                 engine_socket=raw["engine_socket"],
             )
         except (OSError, ValueError, TypeError, KeyError):
@@ -432,7 +436,12 @@ def watchdog_series() -> bytes:
         if state is None:
             continue
         # Unlabelled with a single engine: the shipped fleet's series must not change shape.
-        label = f'{{dolphin_watchdog_gpus="{state.gpus}"}}' if state.gpus else ""
+        # With a split, instance is the one label guaranteed unique — siblings on one card
+        # carry the same gpus, and a repeated label set is invalid exposition, not two series.
+        labels = [f'dolphin_watchdog_gpus="{state.gpus}"'] if state.gpus else []
+        if state.instance:
+            labels.append(f'dolphin_watchdog_instance="{state.instance}"')
+        label = "{" + ",".join(labels) + "}" if labels else ""
         for name, value in watchdog_samples(state):
             if name not in grouped:
                 grouped[name] = []

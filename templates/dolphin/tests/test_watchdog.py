@@ -121,11 +121,13 @@ def watchdog(
     state_path: pathlib.Path,
     stall_s: float = STALL_S,
     gpu_set: str = "",
+    instance_home: str = "",
 ):
     env = dict(os.environ)
     env["METRICS_SOCKET_GLOB"] = glob_pattern
     env["DOLPHIN_WATCHDOG_STATE"] = str(state_path)
     env["DOLPHIN_WATCHDOG_GPU_SET"] = gpu_set
+    env["DOLPHIN_WATCHDOG_INSTANCE_HOME"] = instance_home
     env["DOLPHIN_WATCHDOG_POLL_SECONDS"] = str(POLL_S)
     env["DOLPHIN_WATCHDOG_STALL_SECONDS"] = str(stall_s)
     env["DOLPHIN_WATCHDOG_GRACE_SECONDS"] = str(GRACE_S)
@@ -166,7 +168,8 @@ def sidecar_with_state_glob(state_dir: pathlib.Path, glob_pattern: str):
 
 def write_state_file(
     path: pathlib.Path, updated: float, restarts: int, stall_s: float,
-    gpus: str | None = None, engine_socket: str | None = None,
+    gpus: str | None = None, instance: str | None = None,
+    engine_socket: str | None = None,
 ) -> None:
     path.write_text(json.dumps(dataclasses.asdict(WatchdogState(
         updated=updated,
@@ -177,6 +180,7 @@ def write_state_file(
         requests_running=None,
         generated_tokens=None,
         gpus=gpus,
+        instance=instance,
         engine_socket=engine_socket,
     ))))
 
@@ -207,14 +211,17 @@ def require_proc() -> None:
 
 
 @contextlib.contextmanager
-def fake_process(argv0: str, gpus: str | None = None):
+def fake_process(argv0: str, home: str | None = None, gpus: str | None = None):
     # a process whose /proc cmdline looks like the engine's, so the watchdog finds it the
     # same way it does in production; `exec -a` is what makes the fake name stick, and the
-    # inherited CUDA_VISIBLE_DEVICES is what puts it in one bundle rather than another
+    # HOME it is exec'd with is what puts it in one instance rather than another. gpus is
+    # set only where a test needs two engines to agree on their cards.
     env = dict(os.environ)
-    if gpus is None:
-        env.pop("CUDA_VISIBLE_DEVICES", None)
+    if home is None:
+        env.pop("HOME", None)
     else:
+        env["HOME"] = home
+    if gpus is not None:
         env["CUDA_VISIBLE_DEVICES"] = gpus
     proc = subprocess.Popen(["bash", "-c", f"exec -a '{argv0}' sleep 300"], env=env)
     try:
@@ -224,6 +231,46 @@ def fake_process(argv0: str, gpus: str | None = None):
             proc.kill()
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
+
+
+@contextlib.contextmanager
+def fake_engine_with_core(argv0: str, home: str, tmp: str):
+    # vLLM relaunches EngineCore with an environment of its own, so the child carries no HOME
+    # and only the parent link can claim it — the one case a HOME check alone would miss.
+    # Yields (serve, core_pid): the child is not a Popen, it belongs to the bash below.
+    pid_file = pathlib.Path(tmp) / f"core-{abs(hash(argv0))}.pid"
+    env = dict(os.environ)
+    env["HOME"] = home
+    proc = subprocess.Popen(
+        ["bash", "-c",
+         f"env -u HOME bash -c 'echo $$ > {pid_file}; exec -a \"VLLM::EngineCore\" sleep 300' & "
+         f"exec -a '{argv0}' sleep 300"],
+        env=env,
+    )
+    core_pid = 0
+    try:
+        wait_for(lambda: pid_file.exists() and pid_file.read_text().strip(), 5.0, "the core's pid")
+        core_pid = int(pid_file.read_text().strip())
+        yield proc, core_pid
+    finally:
+        if core_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(core_pid, 9)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+
+
+def pid_alive(pid: int) -> bool:
+    # A killed orphan stays in /proc as a zombie until pid 1 reaps it, and pid 1 in the test
+    # container is this runner, which reaps only its own children. So presence in /proc proves
+    # nothing; the state field is what tells a zombie from a process still holding VRAM.
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return False
+    return stat.rpartition(b")")[2].split()[0] != b"Z"
 
 
 def is_dead(proc: subprocess.Popen) -> bool:
@@ -409,8 +456,10 @@ def test_restart_count_survives_a_watchdog_restart() -> None:
 
 # --- split mode: N engines in one container ---------------------------------------
 # The property under test is always the same one: whatever this watchdog does, the OTHER
-# bundle keeps serving. Before DAH-2465 the kill was container-wide, which is why the
+# instance keeps serving. Before DAH-2465 the kill was container-wide, which is why the
 # entrypoint refused to run a watchdog at all once a container held more than one engine.
+# The instances are told apart by HOME, which is the only key that still separates them when
+# they share a card (DAH-2473).
 
 
 def test_split_kills_only_the_wedged_engine() -> None:
@@ -423,23 +472,25 @@ def test_split_kills_only_the_wedged_engine() -> None:
         theirs = pathlib.Path(tmp) / "dp-theirs" / "v.sock"
         theirs.parent.mkdir()
         state = pathlib.Path(tmp) / "state.json"
-        with fake_process(f"vllm serve --uds {mine} --model fake", gpus="0") as my_serve, \
-             fake_process(f"vllm serve --uds {theirs} --model fake", gpus="1") as their_serve, \
+        with fake_process(f"vllm serve --uds {mine} --model fake", home=f"{tmp}/w0-gpu0") as my_serve, \
+             fake_process(f"vllm serve --uds {theirs} --model fake", home=f"{tmp}/w1-gpu0") as their_serve, \
              fake_engine(mine, wedged), fake_engine(theirs, healthy):
-            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0"):
+            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0",
+                          instance_home=f"{tmp}/w0-gpu0"):
                 # the sibling produces throughout: a watchdog reading the wrong socket would
                 # see a growing counter and never fire
                 def wedged_engine_killed() -> bool:
                     healthy.produce(300.0)
                     return is_dead(my_serve)
 
-                wait_for(wedged_engine_killed, 8.0, "the wedged bundle's engine to be killed")
+                wait_for(wedged_engine_killed, 8.0, "the wedged instance's engine to be killed")
                 time.sleep(1.0)
                 final = read_watchdog_state(state)
-                assert not is_dead(their_serve), "a healthy bundle must survive its neighbour's wedge"
+                assert not is_dead(their_serve), "a healthy sibling must survive its neighbour's wedge"
                 assert final.restarts_total == 1, final
-                # the restart is attributed to the bundle, so N of them stay distinguishable
+                # the restart is attributed to the instance, so N of them stay distinguishable
                 # in the scrape (engine_socket is empty here: the process is gone by design)
+                assert final.instance == "w0-gpu0", final
                 assert final.gpus == "0", final
 
 
@@ -452,10 +503,11 @@ def test_split_reports_the_engine_it_guards() -> None:
         mine = pathlib.Path(tmp) / "dp-mine" / "v.sock"
         mine.parent.mkdir()
         state = pathlib.Path(tmp) / "state.json"
-        with fake_process(f"vllm serve --uds {mine} --model fake", gpus="0"), \
-             fake_process("vllm serve --uds /tmp/dp-theirs/v.sock --model fake", gpus="1"), \
+        with fake_process(f"vllm serve --uds {mine} --model fake", home=f"{tmp}/w0-gpu0"), \
+             fake_process("vllm serve --uds /tmp/dp-theirs/v.sock --model fake", home=f"{tmp}/w1-gpu0"), \
              fake_engine(mine, engine):
-            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0"):
+            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0",
+                          instance_home=f"{tmp}/w0-gpu0"):
                 wait_for(
                     lambda: read_watchdog_state(state).engine_socket == str(mine),
                     8.0,
@@ -476,10 +528,11 @@ def test_split_ignores_a_wedge_that_is_not_its_own() -> None:
         theirs = pathlib.Path(tmp) / "dp-theirs" / "v.sock"
         theirs.parent.mkdir()
         state = pathlib.Path(tmp) / "state.json"
-        with fake_process(f"vllm serve --uds {mine} --model fake", gpus="0") as my_serve, \
-             fake_process(f"vllm serve --uds {theirs} --model fake", gpus="1") as their_serve, \
+        with fake_process(f"vllm serve --uds {mine} --model fake", home=f"{tmp}/w0-gpu0") as my_serve, \
+             fake_process(f"vllm serve --uds {theirs} --model fake", home=f"{tmp}/w1-gpu0") as their_serve, \
              fake_engine(mine, mine_engine), fake_engine(theirs, their_engine):
-            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0"):
+            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0",
+                          instance_home=f"{tmp}/w0-gpu0"):
                 for _ in range(12):
                     time.sleep(POLL_S)
                     mine_engine.produce(500.0)
@@ -490,28 +543,32 @@ def test_split_ignores_a_wedge_that_is_not_its_own() -> None:
 
 
 def test_split_kills_only_its_own_engine_core() -> None:
-    # the orphaned EngineCore holds ~70 GB of VRAM, so it must die — but only the one on my
-    # cards; the sibling's core is holding the memory its own engine is still using
+    # the orphaned EngineCore holds ~70 GB of VRAM, so it must die — but only mine; the
+    # sibling's core is holding the memory its own engine is still using. Neither core
+    # carries a HOME of its own, so both are claimed (or not) through their parent.
     require_proc()
     engine = Engine(generated=1000.0, running=12.0)
     with tempfile.TemporaryDirectory() as tmp:
         mine = pathlib.Path(tmp) / "dp-mine" / "v.sock"
         mine.parent.mkdir()
         state = pathlib.Path(tmp) / "state.json"
-        with fake_process(f"vllm serve --uds {mine} --model fake", gpus="0") as my_serve, \
-             fake_process("VLLM::EngineCore", gpus="0") as my_core, \
-             fake_process("VLLM::EngineCore", gpus="1") as their_core, \
+        with fake_engine_with_core(
+                f"vllm serve --uds {mine} --model fake", f"{tmp}/w0-gpu0", tmp) as (my_serve, my_core), \
+             fake_engine_with_core(
+                 "vllm serve --uds /tmp/dp-theirs/v.sock --model fake", f"{tmp}/w1-gpu0", tmp
+             ) as (_their_serve, their_core), \
              fake_engine(mine, engine):
-            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0"):
+            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0",
+                          instance_home=f"{tmp}/w0-gpu0"):
                 wait_for(lambda: is_dead(my_serve), 8.0, "my `vllm serve` to be killed")
-                wait_for(lambda: is_dead(my_core), 8.0, "my EngineCore to be killed")
+                wait_for(lambda: not pid_alive(my_core), 8.0, "my EngineCore to be killed")
                 time.sleep(1.0)
-                assert not is_dead(their_core), "the sibling's EngineCore must be left alone"
+                assert pid_alive(their_core), "the sibling's EngineCore must be left alone"
 
 
-def test_ambiguous_gpu_match_kills_nothing() -> None:
-    # Two engines claiming the same cards means the environment does not separate the bundles
-    # the way it was measured to. Refusing beats guessing: a wrong guess costs a healthy bundle.
+def test_ambiguous_instance_match_kills_nothing() -> None:
+    # Two engines under one HOME means the container does not separate the instances the way
+    # it was measured to. Refusing beats guessing: a wrong guess costs a healthy engine.
     require_proc()
     engine = Engine(generated=1000.0, running=12.0)
     with tempfile.TemporaryDirectory() as tmp:
@@ -520,10 +577,11 @@ def test_ambiguous_gpu_match_kills_nothing() -> None:
         second = pathlib.Path(tmp) / "dp-second" / "v.sock"
         second.parent.mkdir()
         state = pathlib.Path(tmp) / "state.json"
-        with fake_process(f"vllm serve --uds {first} --model fake", gpus="0") as one, \
-             fake_process(f"vllm serve --uds {second} --model fake", gpus="0") as two, \
+        with fake_process(f"vllm serve --uds {first} --model fake", home=f"{tmp}/w0-gpu0") as one, \
+             fake_process(f"vllm serve --uds {second} --model fake", home=f"{tmp}/w0-gpu0") as two, \
              fake_engine(first, engine):
-            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0"):
+            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0",
+                          instance_home=f"{tmp}/w0-gpu0"):
                 time.sleep(STALL_S * 5)
                 final = read_watchdog_state(state)
                 assert not is_dead(one) and not is_dead(two), "an ambiguous match must kill nothing"
@@ -531,19 +589,37 @@ def test_ambiguous_gpu_match_kills_nothing() -> None:
                 assert final.engine_socket is None, "an unidentified engine must be reported"
 
 
-def test_gpu_set_order_does_not_matter() -> None:
-    # a bundle is a set of cards: "3,2" from the plan and "2,3" in the engine's environment
-    # name the same engine, and a watchdog that missed that would guard nothing
+def test_two_workers_on_one_card_are_told_apart() -> None:
+    # DAH-2473, the case the card set cannot answer: both engines run on card 0 and report the
+    # same CUDA_VISIBLE_DEVICES. Keyed on the cards this is the ambiguous match above and the
+    # wedge is never cured; keyed on HOME the wedged one dies and its neighbour serves on.
     require_proc()
-    engine = Engine(generated=1000.0, running=12.0)
+    wedged = Engine(generated=1000.0, running=12.0)
+    healthy = Engine(generated=1000.0, running=8.0)
     with tempfile.TemporaryDirectory() as tmp:
-        sock = pathlib.Path(tmp) / "dp-mine" / "v.sock"
-        sock.parent.mkdir()
+        mine = pathlib.Path(tmp) / "dp-mine" / "v.sock"
+        mine.parent.mkdir()
+        theirs = pathlib.Path(tmp) / "dp-theirs" / "v.sock"
+        theirs.parent.mkdir()
         state = pathlib.Path(tmp) / "state.json"
-        with fake_process(f"vllm serve --uds {sock} --model fake", gpus="2,3") as serve, \
-             fake_engine(sock, engine):
-            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="3,2"):
-                wait_for(lambda: is_dead(serve), 8.0, "the engine on cards 2,3 to be killed")
+        # both engines name card 0, exactly as the split produces them
+        with fake_process(f"vllm serve --uds {mine} --model fake",
+                          home=f"{tmp}/w0-gpu0", gpus="0") as my_serve, \
+             fake_process(f"vllm serve --uds {theirs} --model fake",
+                          home=f"{tmp}/w1-gpu0", gpus="0") as their_serve, \
+             fake_engine(mine, wedged), fake_engine(theirs, healthy):
+            with watchdog(f"{tmp}/dp-*/v.sock", state, gpu_set="0",
+                          instance_home=f"{tmp}/w0-gpu0"):
+                def wedged_engine_killed() -> bool:
+                    healthy.produce(300.0)
+                    return is_dead(my_serve)
+
+                wait_for(wedged_engine_killed, 8.0, "the wedged engine on the shared card to die")
+                time.sleep(1.0)
+                final = read_watchdog_state(state)
+                assert not is_dead(their_serve), "the co-tenant on the same card must survive"
+                assert final.restarts_total == 1, final
+                assert final.instance == "w0-gpu0", final
 
 
 # --- what the scraper sees --------------------------------------------------------
@@ -561,28 +637,52 @@ def test_state_reaches_the_sidecar_as_series() -> None:
     assert b"dolphin_watchdog_last_restart_timestamp 1769000000\n" in body
     assert b"dolphin_watchdog_stall_seconds 12\n" in body
     assert b"dolphin_watchdog_gpus" not in body, "the single-engine fleet's series must stay unlabelled"
-    assert b"dolphin_watchdog_engine_found" not in body, "no bundles, nothing to attribute"
+    assert b"dolphin_watchdog_instance" not in body, "one engine needs no instance label"
+    assert b"dolphin_watchdog_engine_found" not in body, "one engine, nothing to attribute"
 
 
-def test_every_bundles_watchdog_reaches_the_sidecar() -> None:
-    # one state file per bundle; without the label they would collapse into one series and
-    # N-1 bundles would vanish from the scrape
+def test_every_instances_watchdog_reaches_the_sidecar() -> None:
+    # one state file per instance; without the label they would collapse into one series and
+    # N-1 instances would vanish from the scrape
     with tempfile.TemporaryDirectory() as tmp:
         write_state_file(
             pathlib.Path(tmp) / "dolphin_watchdog_state_gpu0.json", updated=time.time(),
-            restarts=2, stall_s=0.0, gpus="0", engine_socket=f"{tmp}/dp-a/v.sock",
+            restarts=2, stall_s=0.0, gpus="0", instance="gpu0",
+            engine_socket=f"{tmp}/dp-a/v.sock",
         )
         write_state_file(
             pathlib.Path(tmp) / "dolphin_watchdog_state_gpu1.json", updated=time.time(),
-            restarts=0, stall_s=0.0, gpus="1", engine_socket=None,
+            restarts=0, stall_s=0.0, gpus="1", instance="gpu1", engine_socket=None,
         )
         with sidecar_with_state_glob(pathlib.Path(tmp), f"{tmp}/dp-*/v.sock") as base:
             _, body, _ = sidecar_tests.get(f"{base}/metrics")
-    assert b'dolphin_watchdog_restarts_total{dolphin_watchdog_gpus="0"} 2\n' in body, body[-400:]
-    assert b'dolphin_watchdog_restarts_total{dolphin_watchdog_gpus="1"} 0\n' in body
-    # the bundle that could not identify its engine is running and guarding nothing
-    assert b'dolphin_watchdog_engine_found{dolphin_watchdog_gpus="0"} 1\n' in body
-    assert b'dolphin_watchdog_engine_found{dolphin_watchdog_gpus="1"} 0\n' in body
+    prefix = b'dolphin_watchdog_restarts_total{dolphin_watchdog_gpus='
+    assert prefix + b'"0",dolphin_watchdog_instance="gpu0"} 2\n' in body, body[-400:]
+    assert prefix + b'"1",dolphin_watchdog_instance="gpu1"} 0\n' in body
+    # the instance that could not identify its engine is running and guarding nothing
+    found = b'dolphin_watchdog_engine_found{dolphin_watchdog_gpus='
+    assert found + b'"0",dolphin_watchdog_instance="gpu0"} 1\n' in body
+    assert found + b'"1",dolphin_watchdog_instance="gpu1"} 0\n' in body
+
+
+def test_two_instances_on_one_card_get_distinct_labels() -> None:
+    # DAH-2473: the cards no longer separate them, so gpus alone would emit the same label set
+    # twice — invalid exposition, and on a dashboard one watchdog silently replacing the other.
+    with tempfile.TemporaryDirectory() as tmp:
+        for index in (0, 1):
+            write_state_file(
+                pathlib.Path(tmp) / f"dolphin_watchdog_state_w{index}-gpu0.json",
+                updated=time.time(), restarts=index, stall_s=0.0, gpus="0",
+                instance=f"w{index}-gpu0", engine_socket=f"{tmp}/dp-{index}/v.sock",
+            )
+        with sidecar_with_state_glob(pathlib.Path(tmp), f"{tmp}/dp-*/v.sock") as base:
+            _, body, _ = sidecar_tests.get(f"{base}/metrics")
+    labels = [line.split(b" ")[0] for line in body.split(b"\n")
+              if line.startswith(b"dolphin_watchdog_restarts_total")]
+    assert len(labels) == 2, labels
+    assert len(set(labels)) == 2, f"both instances published the same series: {labels}"
+    assert b'dolphin_watchdog_instance="w0-gpu0"' in body
+    assert b'dolphin_watchdog_instance="w1-gpu0"' in body
 
 
 def test_bundle_series_stay_grouped_by_metric() -> None:
