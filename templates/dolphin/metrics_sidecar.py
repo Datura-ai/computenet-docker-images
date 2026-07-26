@@ -425,7 +425,8 @@ def watchdog_series() -> bytes:
     # healthy watchdog that does not exist. A watchdog that ran and died is a different
     # story and must be visible, so a stale state file reports up 0 with its last numbers.
     #
-    # With one watchdog per bundle every state is published, labelled by the cards it owns.
+    # With one watchdog per instance every state is published, labelled by the instance it
+    # guards (and the cards it sits on, which siblings may share).
     # Samples are grouped by metric name rather than by state: emitting one bundle's whole
     # block after another's would split each family in two, which is invalid exposition —
     # the same reason merge_engine_bodies() regroups the engine bodies.
