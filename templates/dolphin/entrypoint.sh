@@ -177,9 +177,10 @@ install_engine_memory_wrapper() {
     local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
     local wrapper="${bin_dir}/vllm" real="${bin_dir}/vllm.real"
     if [[ ! -f "${wrapper}" ]]; then
-        # First boot on a cold node: the worker downloads its runtime only once it starts, so
-        # there is nothing to wrap yet. The node runs unsplit until the next container start.
-        echo "[dolphin] engine runtime not present yet; VRAM wrapper installs on the next start" >&2
+        # The worker writes its runtime only once it starts, which is what prime_engine_runtime is
+        # for. Reaching this means priming did not produce the launcher either, so this start runs
+        # unsplit rather than crash-looping N-1 engines that each claim the whole card.
+        echo "[dolphin] engine runtime still not present after priming; running unsplit" >&2
         return 1
     fi
     if ! engine_memory_wrapper_installed; then
@@ -386,6 +387,101 @@ wait_for_cache_seed() {
     echo "[dolphin] cache not seeded after ${SEED_WAIT_SECONDS}s; starting siblings anyway" >&2
 }
 
+# Memory in use on the cards behind one plan line, in MB. Empty when nvidia-smi is absent, which
+# callers read as "nothing to verify" rather than as an empty card.
+gpu_memory_used_mb() {
+    local gpu_set="$1" index used total=0 seen=0
+    while IFS=',' read -r index used; do
+        index="${index//[[:space:]]/}"
+        used="${used//[[:space:]]/}"
+        [[ -n "${index}" && -n "${used}" ]] || continue
+        if [[ "${gpu_set}" == "all" || ",${gpu_set}," == *",${index},"* ]]; then
+            total=$(( total + used ))
+            seen=1
+        fi
+    done < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null || true)
+    (( seen )) && echo "${total}"
+}
+
+# The priming worker below may already have started claiming the card, and phase 2's engines size
+# their divided claim against a card they expect to be free. Refuse the split rather than launch
+# into memory that is still held: one unsplit worker is a safe outcome, an OOM at init is not.
+wait_for_gpu_memory_release() {
+    local gpu_set="$1"
+    local limit_mb="${DOLPHIN_PRIME_RELEASE_MB:-2048}"
+    local timeout="${DOLPHIN_PRIME_RELEASE_SECONDS:-300}"
+    local waited=0 used
+    while true; do
+        used="$(gpu_memory_used_mb "${gpu_set}")"
+        [[ -n "${used}" ]] || return 0
+        (( used <= limit_mb )) && return 0
+        if (( waited >= timeout )); then
+            echo "[dolphin] ${used} MB still held on [${gpu_set}] after ${waited}s; not splitting this start" >&2
+            return 1
+        fi
+        sleep 5 &
+        wait $! || true
+        waited=$((waited + 5))
+    done
+}
+
+# The priming worker is spawned before the container's own TERM trap exists, so it is reaped here:
+# a stop during phase 1 must not leave an unwrapped engine holding the whole card.
+PRIME_WORKER_PID=""
+stop_prime_worker() {
+    [[ -n "${PRIME_WORKER_PID}" ]] || return 0
+    kill -TERM "${PRIME_WORKER_PID}" 2>/dev/null || true
+    wait "${PRIME_WORKER_PID}" 2>/dev/null || true
+    PRIME_WORKER_PID=""
+}
+
+# Phase 1 of the split (DAH-2473). install_engine_memory_wrapper can only wrap a file the worker
+# writes itself, and the worker writes it only after `start` — so on a cold container the check
+# always precedes the file and the split degrades to a single worker for the life of that
+# container. Measured in prod 2026-07-24: the refill scheduler CREATES a container every tick and
+# never restarts one, so the "installs on the next start" that comment promised never arrived, and
+# `auto` fired on exactly zero nodes.
+#
+# Breaking that ordering needs one throwaway worker whose only job is to put the launcher on disk.
+# It must die before the real instances start: it came up UNWRAPPED and claims the vendor's 0.85 of
+# the card, so its share plus N divided shares exceeds the card and the last engine would fail at
+# init. Waiting for the FILE rather than for the engine is both sufficient and much earlier — on
+# prod nodes the launcher's mtime preceded the first tokens by 3-5 minutes.
+prime_engine_runtime() {
+    local gpu_set="$1" prime_home="$2" shared_cache="$3"
+    local engine_script="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin/vllm"
+
+    prepare_instance_home "${prime_home}" "${shared_cache}"
+    render_worker_config "${prime_home}/.config/dolphinpod" "${gpu_set}"
+
+    echo "[dolphin] priming the engine runtime with one throwaway worker on [${gpu_set}]" >&2
+    (cd "${DOLPHIN_HOME}" && HOME="${prime_home}" exec "${WORKER_BIN}" start) &
+    PRIME_WORKER_PID=$!
+    trap 'stop_prime_worker; exit 0' TERM INT
+
+    local waited=0
+    while [[ ! -f "${engine_script}" ]]; do
+        if ! kill -0 "${PRIME_WORKER_PID}" 2>/dev/null; then
+            echo "[dolphin] the priming worker exited before writing the engine launcher" >&2
+            break
+        fi
+        if (( waited >= SEED_WAIT_SECONDS )); then
+            echo "[dolphin] no engine launcher after ${waited}s; not splitting this start" >&2
+            break
+        fi
+        sleep 10 &
+        wait $! || true
+        waited=$((waited + 10))
+    done
+
+    stop_prime_worker
+    trap - TERM INT
+
+    [[ -f "${engine_script}" ]] || return 1
+    echo "[dolphin] engine launcher on disk after ${waited}s; priming worker stopped" >&2
+    wait_for_gpu_memory_release "${gpu_set}"
+}
+
 published_etag() {
     curl -fsSI --max-time 30 "${WORKER_URL}" | awk 'tolower($1) == "etag:" {print $2}' | tr -d '\r'
 }
@@ -457,10 +553,24 @@ main() {
     read -r bundle_cards bundle_vram < <(bundle_cards_and_vram "${gpu_sets[0]}")
     WORKERS_PER_BUNDLE="$(derive_workers_per_bundle "${bundle_cards}" "${bundle_vram}")"
 
+    local base_home="${HOME:-/root}"
+    local shared_cache="${base_home}/.cache"
+    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${shared_cache}}"
+    export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
+
+    # Phase 1: on a cold container there is no engine launcher to wrap yet, so one throwaway
+    # worker puts it on disk and is stopped again before the real instances start. A container
+    # whose DOLPHIN_HOME already holds the runtime skips straight to the install below.
+    if (( WORKERS_PER_BUNDLE > 1 )) && [[ ! -f "${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin/vllm" ]]; then
+        if ! prime_engine_runtime "${gpu_sets[0]}" "${base_home}/dolphin-workers/prime" "${shared_cache}"; then
+            WORKERS_PER_BUNDLE=1
+        fi
+    fi
+
     # Only an intra-card split needs the VRAM divided; one worker per bundle keeps the vendor's
-    # own 0.85 of the whole card. If the runtime isn't downloaded yet there is nothing to wrap,
-    # and running N engines that each claim the whole card just crash-loops N-1 of them — so
-    # fall back to a single worker for this start and split once the cache is warm.
+    # own 0.85 of the whole card. Running N engines that each claim the whole card just
+    # crash-loops N-1 of them, so a launcher that is still missing after phase 1 falls back to a
+    # single worker for this start.
     # Both paths write the engine launcher inside the shared DOLPHIN_HOME, so they take the same
     # lock as the binary download: two containers on one node, one installing while the other
     # removes, would otherwise race on vllm/vllm.real (DAH-2475). Removal is pre-checked outside
@@ -481,11 +591,6 @@ main() {
         gpu_sets=("${expanded[@]}")
         instance_count=${#gpu_sets[@]}
     fi
-
-    local base_home="${HOME:-/root}"
-    local shared_cache="${base_home}/.cache"
-    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${shared_cache}}"
-    export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
 
     local instance_homes=() i
     if (( instance_count == 1 )); then

@@ -40,19 +40,37 @@ make_sandbox() {
 }
 
 mock_nvidia_smi() {
-    # Args: one "index:vram_mb" pair per GPU; exit 1 when none given.
-    local spec_file="${SANDBOX}/bin/gpus.txt"
+    # Args: one "index:vram_mb" pair per GPU; exit 1 when none given. memory.used answers from a
+    # separate file (idle cards by default) so a caller can pretend the priming worker still
+    # holds the card.
+    local spec_file="${SANDBOX}/bin/gpus.txt" used_file="${SANDBOX}/bin/gpus_used.txt"
     : >"${spec_file}"
+    : >"${used_file}"
     local pair
     for pair in "$@"; do
         echo "${pair%%:*}, ${pair##*:}" >>"${spec_file}"
+        echo "${pair%%:*}, 0" >>"${used_file}"
     done
     cat >"${SANDBOX}/bin/nvidia-smi" <<EOF
 #!/usr/bin/env bash
 [[ -s "${spec_file}" ]] || exit 1
-cat "${spec_file}"
+if [[ "\$*" == *memory.used* ]]; then
+    cat "${used_file}"
+else
+    cat "${spec_file}"
+fi
 EOF
     chmod +x "${SANDBOX}/bin/nvidia-smi"
+}
+
+mock_gpu_memory_used() {
+    # Args: one "index:used_mb" pair per GPU; overrides the idle default above.
+    local used_file="${SANDBOX}/bin/gpus_used.txt"
+    : >"${used_file}"
+    local pair
+    for pair in "$@"; do
+        echo "${pair%%:*}, ${pair##*:}" >>"${used_file}"
+    done
 }
 
 # Source the entrypoint's function definitions only (main is guarded by BASH_SOURCE).
@@ -521,9 +539,134 @@ EOF
     unset DOLPHIN_HOME
 }
 
+# Phase 1 of the split. The wrapper needs a launcher that only the worker writes, and only after
+# `start` — so before this existed every cold container silently ran unsplit, which is why `auto`
+# fired on zero prod nodes on 2026-07-24. Priming must produce the launcher, stop the worker it
+# borrowed, and refuse the split whenever either half fails.
+test_prime_engine_runtime() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}"
+    mock_nvidia_smi "0:143771"
+    load_entrypoint
+    WORKERS_PER_BUNDLE=2
+    SEED_WAIT_SECONDS=60
+
+    local engine_dir="${DOLPHIN_HOME}/runtimes/text-v/bin"
+    local engine_script="${engine_dir}/vllm"
+    # Worker mock: writes the launcher a moment after start, the way the real worker moves its
+    # finished runtime into place, then keeps running until TERMed.
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "start" ]]; then
+    echo "\${HOME}" >>"${SANDBOX}/prime_homes.log"
+    ( sleep 1; mkdir -p "${engine_dir}"; printf 'vendor\n' >"${engine_script}" ) &
+    exec sleep 300
+fi
+exit 0
+EOF
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+
+    local prime_home="${SANDBOX}/home/dolphin-workers/prime"
+    prime_engine_runtime all "${prime_home}" "${SANDBOX}/home/.cache" >/dev/null 2>&1
+    assert_eq "priming leaves the engine launcher on disk" "yes" \
+        "$([[ -f "${engine_script}" ]] && echo yes || echo no)"
+    assert_eq "priming reaps its own worker" "" "${PRIME_WORKER_PID}"
+    # Its config has to be a real worker config: an unreadable or malformed one makes the worker
+    # refuse to start, and phase 1 would then look like a missing runtime.
+    assert_eq "the priming worker gets its own config" "600" \
+        "$(stat -c %a "${prime_home}/.config/dolphinpod/worker.json" 2>/dev/null \
+            || stat -f %Lp "${prime_home}/.config/dolphinpod/worker.json")"
+    assert_eq "the priming worker shares the one cache copy" "${SANDBOX}/home/.cache" \
+        "$(readlink "${prime_home}/.cache")"
+
+    # A launcher that never appears must refuse, so the caller falls back to one worker instead
+    # of crash-looping engines that each claim the whole card.
+    rm -rf "${DOLPHIN_HOME}/runtimes"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "start" ]] && exec sleep 300
+exit 0
+EOF
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+    SEED_WAIT_SECONDS=0
+    assert_fails "no launcher means no split" \
+        prime_engine_runtime all "${prime_home}" "${SANDBOX}/home/.cache"
+    assert_eq "the worker is stopped even when priming fails" "" "${PRIME_WORKER_PID}"
+
+    # The launcher is on disk but the card is still held: phase 2's engines would size their
+    # divided claim against memory that is not free, so refuse rather than OOM at init.
+    mkdir -p "${engine_dir}"
+    printf 'vendor\n' >"${engine_script}"
+    mock_gpu_memory_used "0:120000"
+    DOLPHIN_PRIME_RELEASE_SECONDS=0
+    assert_fails "memory still held means no split" \
+        wait_for_gpu_memory_release all
+    mock_gpu_memory_used "0:31"
+    assert_eq "an idle card releases the split" "0" \
+        "$(wait_for_gpu_memory_release all; echo $?)"
+    unset DOLPHIN_HOME DOLPHIN_PRIME_RELEASE_SECONDS
+}
+
+# End to end on the case prod could not reach: one H200, empty DOLPHIN_HOME, split requested.
+# Before phase 1 this produced exactly one worker.
+test_cold_intra_card_split_smoke() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}"
+    mock_nvidia_smi "0:143771"
+    cat >"${SANDBOX}/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/curl"
+
+    local engine_dir="${DOLPHIN_HOME}/runtimes/text-v/bin"
+    # The mock stands in for the worker's two observable effects: it writes the engine launcher
+    # shortly after `start`, and opens an engine socket once the cache is seeded.
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "start" ]]; then
+    echo "\${HOME}" >>"${SANDBOX}/starts.log"
+    ( sleep 1; mkdir -p "${engine_dir}"; printf 'import sys\n' >"${engine_dir}/vllm" ) &
+    mkdir -p "${SANDBOX}/dp-\$\$" && touch "${SANDBOX}/dp-\$\$/v.sock"
+    exec sleep 300
+fi
+exit 0
+EOF
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+
+    DOLPHIN_API_KEY="dp-test" DOLPHIN_WORKERS_PER_BUNDLE=auto DOLPHIN_SPLIT_STAGGER_SECONDS=0 \
+        METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock" bash "${ENTRYPOINT}" &
+    local entry_pid=$!
+    local waited=0
+    while [[ ! -s "${SANDBOX}/starts.log" || "$(wc -l <"${SANDBOX}/starts.log")" -lt 3 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+        if [[ ${waited} -ge 40 ]]; then break; fi
+    done
+    kill -TERM "${entry_pid}" 2>/dev/null
+    wait "${entry_pid}" 2>/dev/null
+
+    # One priming start, then the two real instances — each with its own home, since both claim
+    # the same card and the card set alone can no longer name them apart.
+    assert_eq "a cold container primes once, then splits in two" \
+        "${SANDBOX}/home/dolphin-workers/prime
+${SANDBOX}/home/dolphin-workers/w0-gpuall
+${SANDBOX}/home/dolphin-workers/w1-gpuall" \
+        "$(sort "${SANDBOX}/starts.log" 2>/dev/null)"
+    assert_eq "the engine launcher ends up wrapped" "yes" \
+        "$(grep -q 'dolphin-intra-card-vram-wrapper' "${engine_dir}/vllm" && echo yes || echo no)"
+    assert_eq "the vendor launcher is kept for the off-switch" "yes" \
+        "$([[ -f "${engine_dir}/vllm.real" ]] && echo yes || echo no)"
+    unset DOLPHIN_HOME
+}
+
 test_plan
 test_intra_card_plan
 test_engine_memory_wrapper
+test_prime_engine_runtime
+test_cold_intra_card_split_smoke
 test_render
 test_prepare_instance_home
 test_wait_for_cache_seed
