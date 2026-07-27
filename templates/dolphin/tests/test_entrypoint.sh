@@ -36,6 +36,9 @@ make_sandbox() {
     export PATH="${SANDBOX}/bin:${PATH}"
     export HOME="${SANDBOX}/home"
     export DOLPHIN_WATCHDOG_STATE_DIR="${SANDBOX}/state"
+    # Container-local in production (/tmp), sandbox-local here: a test must never publish a
+    # divisor to the machine it runs on.
+    export DOLPHIN_ENGINE_SHARE_FILE="${SANDBOX}/engine-share"
     mkdir -p "${HOME}" "${DOLPHIN_WATCHDOG_STATE_DIR}"
 }
 
@@ -467,8 +470,10 @@ test_engine_memory_wrapper() {
     make_sandbox
     export DOLPHIN_HOME="${SANDBOX}/dolphin"
     load_entrypoint
-    # main resolves this per bundle; the wrapper is what turns it into an actual VRAM fraction.
+    # main resolves this per bundle; publish_engine_share is what turns it into a VRAM fraction,
+    # and the wrapper reads that at every launch instead of carrying a number of its own.
     WORKERS_PER_BUNDLE=2
+    publish_engine_share
 
     assert_fails "a missing runtime refuses so the caller can fall back" \
         install_engine_memory_wrapper
@@ -526,17 +531,26 @@ EOF
         "VENDOR2 serve m --gpu-memory-utilization 0.4250" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
 
-    # Turning the split off must give the card back: DOLPHIN_HOME outlives the container, so a
-    # leftover wrapper would run the single worker on half a card without saying anything.
+    # Turning the split off must give the card back — and must do it WITHOUT touching the
+    # wrapper, which this node's other filler containers execute too: removing it would take
+    # their divisor with them and their next engine would claim a card it does not have.
     WORKERS_PER_BUNDLE=1
-    remove_engine_memory_wrapper 2>/dev/null
-    assert_eq "off: the vendor's claim is restored in full" \
+    publish_engine_share
+    assert_eq "off: the vendor's claim is restored in full, wrapper still in place" \
         "VENDOR2 serve m --gpu-memory-utilization 0.85" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
-    assert_eq "off: the staged copy is gone, so the next install restages the vendor script" "" \
-        "$([[ -f "${bin_dir}/vllm.real" ]] && echo yes)"
-    remove_engine_memory_wrapper 2>/dev/null
-    assert_eq "off: removing again leaves the vendor script alone" \
+    assert_eq "off: the shared launcher is left alone for the split siblings" "yes" \
+        "$(grep -q 'dolphin-intra-card-vram-wrapper' "${bin_dir}/vllm" && echo yes || echo no)"
+
+    # A container that never split writes no share file at all (and /tmp keeps one from an
+    # earlier split, which is why it is rewritten on every start). Either way the divisor must
+    # fail safe: a whole card, not a fraction of one.
+    rm -f "${DOLPHIN_ENGINE_SHARE_FILE}"
+    assert_eq "no share file at all is the vendor's own claim" \
+        "VENDOR2 serve m --gpu-memory-utilization 0.85" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+    printf 'half\n' >"${DOLPHIN_ENGINE_SHARE_FILE}"
+    assert_eq "a junk share is the vendor's own claim, not a crashed engine" \
         "VENDOR2 serve m --gpu-memory-utilization 0.85" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
     unset DOLPHIN_HOME
@@ -608,6 +622,42 @@ EOF
     mock_gpu_memory_used "0:31"
     assert_eq "an idle card releases the split" "0" \
         "$(wait_for_gpu_memory_release all; echo $?)"
+
+    # A card that is still held once the priming engine has been killed is not a fallback case:
+    # an unsplit worker started on it dies at init exactly like a split one, and only the
+    # container's end actually gives the card back.
+    mock_gpu_memory_used "0:120000"
+    local prime_status=0
+    # A subshell, because the refusal is an exit rather than a return: it has to end the
+    # container, not hand the caller one more thing to fall back from.
+    ( prime_engine_runtime all "${prime_home}" "${SANDBOX}/home/.cache" ) >/dev/null 2>&1 || prime_status=$?
+    assert_eq "a card still held after the kill ends the container" "1" "${prime_status}"
+
+    # The engine does not always die with the worker that spawned it — the reason the wait above
+    # exists at all. Needs /proc; the scan reaches only this container's processes in production,
+    # and only this test's on a dev box (same premise as the watchdog's kill tests).
+    if [[ -d /proc ]]; then
+        mock_gpu_memory_used "0:0"
+        rm -rf "${DOLPHIN_HOME}/runtimes"
+        cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "start" ]]; then
+    bash -c "exec -a 'python vllm serve --uds ${SANDBOX}/v.sock' sleep 300" &
+    echo \$! >"${SANDBOX}/leftover.pid"
+    ( sleep 1; mkdir -p "${engine_dir}"; printf 'vendor\n' >"${engine_script}" ) &
+    exec sleep 300
+fi
+exit 0
+EOF
+        chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+        SEED_WAIT_SECONDS=60
+        prime_engine_runtime all "${prime_home}" "${SANDBOX}/home/.cache" >/dev/null 2>&1 || true
+        local leftover_state
+        leftover_state="$(ps -o state= -p "$(cat "${SANDBOX}/leftover.pid")" 2>/dev/null | tr -d ' ')"
+        # A killed orphan lingers as a zombie until pid 1 reaps it, and a zombie holds no VRAM.
+        assert_eq "an engine the priming worker left behind is killed" "gone" \
+            "$([[ -z "${leftover_state}" || "${leftover_state}" == Z* ]] && echo gone || echo "${leftover_state}")"
+    fi
     unset DOLPHIN_HOME DOLPHIN_PRIME_RELEASE_SECONDS
 }
 
@@ -660,8 +710,11 @@ ${SANDBOX}/home/dolphin-workers/w1-gpuall" \
         "$(sort "${SANDBOX}/starts.log" 2>/dev/null)"
     assert_eq "the engine launcher ends up wrapped" "yes" \
         "$(grep -q 'dolphin-intra-card-vram-wrapper' "${engine_dir}/vllm" && echo yes || echo no)"
-    assert_eq "the vendor launcher is kept for the off-switch" "yes" \
+    assert_eq "the vendor launcher is kept, so an update can be re-wrapped" "yes" \
         "$([[ -f "${engine_dir}/vllm.real" ]] && echo yes || echo no)"
+    # The divisor the wrapper reads is this container's own file, never the shared launcher.
+    assert_eq "the container publishes its own divisor" "2" \
+        "$(cat "${DOLPHIN_ENGINE_SHARE_FILE}" 2>/dev/null)"
     unset DOLPHIN_HOME
 }
 

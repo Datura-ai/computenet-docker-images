@@ -46,8 +46,9 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                        | VRAM floor one worker's bundle must clear (the full model needs ~70 GB). Each worker gets the smallest card group above it. |
 | `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                      | Delay between initial worker spawns, once the shared cache is seeded. |
 | `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. Also bounds how long a split waits for the priming worker to write the engine launcher. `0` = no wait, plain stagger. |
-| `DOLPHIN_PRIME_RELEASE_MB` | no | `2048`                          | Split only: how much VRAM may still be in use on the bundle after the priming worker is stopped. Above it the start runs unsplit rather than launching engines into memory that is still held. |
+| `DOLPHIN_PRIME_RELEASE_MB` | no | `2048`                          | Split only: how much VRAM may still be in use on the bundle after the priming worker is stopped and its engine killed. Above it the container ends rather than launching any worker into memory that is still held. |
 | `DOLPHIN_PRIME_RELEASE_SECONDS` | no | `300`                      | Split only: how long to wait for that memory to come back. |
+| `DOLPHIN_ENGINE_SHARE_FILE` | no | `/tmp/dolphin-engine-share`     | Where this container publishes how many workers share one card; the VRAM wrapper reads it at every engine launch. Keep it OFF `DOLPHIN_HOME` for the same reason as the watchdog state: that volume is shared by every filler container on the node, and one divisor per node is exactly the bug this file exists to avoid. Missing or unreadable = 1, the vendor's full claim. |
 | `METRICS_TOKEN`       | no       | —                                | Bearer token for the metrics sidecar on `:9101`. Unset → the sidecar answers 503 to everything (fail closed). |
 | `DOLPHIN_ENGINES_EXPECTED` | no  | (set by the entrypoint)          | How many engines this container runs. The sidecar publishes it next to `dolphin_engines_up`, and above 1 it tags every engine's series with `dolphin_engine`. |
 | `DOLPHIN_WATCHDOG_ENABLED` | no  | `1`                              | `0` stops the entrypoint from starting any engine watchdog. |
@@ -121,9 +122,18 @@ B200 2, B300 4, H100 80 GB 1, RTX PRO 6000 96 GB 1, and any multi-card bundle 1.
 
 vLLM sizes `--gpu-memory-utilization 0.85` against the **whole** card, so worker 2 would die at
 init. The engine is an ordinary pip console script inside `DOLPHIN_HOME`, so the entrypoint
-copies it to `vllm.real` and writes a wrapper that divides that one flag by the worker count.
-Turning the split back off restores the vendor script — `DOLPHIN_HOME` outlives the container,
-and a leftover wrapper would leave a lone worker silently claiming 1/N of the card.
+copies it to `vllm.real` and writes a wrapper that divides that one flag.
+
+**The divisor is not in the wrapper.** `DOLPHIN_HOME` is shared by every filler container on the
+node, so a number written into the wrapper would be one number for all of them: an unsplit
+container could only get its whole card back by removing the wrapper, and that removal takes the
+divisor away from a still-split sibling, whose next engine then claims a card it does not have.
+Instead every container writes its own count to `DOLPHIN_ENGINE_SHARE_FILE` (default
+`/tmp/dolphin-engine-share`, container-local like the watchdog state), and the wrapper reads it at
+each launch. Once installed the wrapper stays. A missing or unreadable share means 1 — the
+vendor's full claim, passed through byte for byte — which is what a container running unsplit,
+running an older image, or starting after the split was turned off needs. The file is rewritten on
+every start, including the unsplit one, because `/tmp` survives a container restart.
 
 **A cold container primes the runtime first.** The wrapper can only replace a launcher the worker
 writes itself, and the worker writes it only after `start` — so the install would always precede
@@ -132,7 +142,12 @@ spawns one throwaway worker, waits for `runtimes/<type>/bin/vllm` to appear (bou
 `DOLPHIN_SEED_WAIT_SECONDS`), stops it, and waits for its VRAM to come back
 (`DOLPHIN_PRIME_RELEASE_MB` / `DOLPHIN_PRIME_RELEASE_SECONDS`) before the real instances start.
 That worker has to go: it came up unwrapped holding the vendor's 0.85, and its share plus N
-divided shares exceeds the card. If either step fails the start runs unsplit. Without this the
+divided shares exceeds the card. Stopping it is not enough — the engine does not always die with
+the worker that spawned it — so every `vllm serve`/`VLLM::EngineCore` process left in the
+container is SIGKILLed before the VRAM is checked. If the launcher never appeared the start runs
+unsplit; if the card is still held even after the kill the container **ends** instead, since an
+unsplit worker started on memory that is already gone dies at init exactly like a split one, and
+only the container's end gives the card back. Without this the
 split was unreachable in prod — the refill scheduler creates a new container every tick and never
 restarts one, so "installs on the next start" never arrived (measured 2026-07-24: `auto` fired on
 zero nodes).
