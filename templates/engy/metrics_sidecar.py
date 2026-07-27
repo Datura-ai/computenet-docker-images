@@ -1,216 +1,94 @@
-"""Metrics sidecar for the Dolphin filler: proxies vLLM's /metrics from its
-unix socket onto TCP :9101 so the platform's published-port machinery can
-expose it to the lium-stats scraper.
+"""Expose the engy container's token counters on :9101 for the platform scraper.
 
-Design constraints (DAH-2468):
-- stdlib only, must never interfere with the worker; a crash is fine — the
-  entrypoint restart loop brings it back (with backoff).
-- Verbatim pass-through of the vLLM Prometheus text (no parsing at the edge),
-  plus appended dolphin_sidecar_* series. vLLM down still answers 200 with
-  the sidecar series only, so the scraper can tell "worker dead" from
-  "sidecar dead" from "machine dead".
-- Fail closed: without METRICS_TOKEN every request gets 503 — this port is
-  published to the internet, never serve it unauthenticated.
-- Total upstream budget per request stays under the scraper's client timeout
-  even when falling through several stale sockets.
-- Read-only: the sidecar observes and republishes, it never acts on the worker.
-  Acting is watchdog.py's job; this file only exposes the state file it writes
-  as dolphin_watchdog_* series, so the restarts reach the scraper.
+Same contract as the Dolphin sidecar (bearer token, fail-closed, port 9101), different plumbing:
+sglang serves Prometheus metrics over HTTP rather than a unix socket, and an engy container runs ONE
+ENGINE PER GPU. So this fans out to every engine and stamps each series with the engine's port — the
+node total is a sum in the query, and a single wedged card stays visible on its own.
+
+  ENGY_METRICS_TARGETS=http://127.0.0.1:8000,http://127.0.0.1:8001 METRICS_TOKEN=… python3 metrics_sidecar.py
+
+Without METRICS_TOKEN it refuses to start: an unauthenticated metrics port on a miner's host would
+publish our token throughput to whoever scans it.
 """
 
-import glob
-import hmac
-import http.client
 import http.server
-import json
 import os
-import socket
+import re
 import sys
-import time
+import urllib.error
+import urllib.request
 
-from dataclasses import dataclass
+PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
+TOKEN: str = os.environ.get("METRICS_TOKEN", "")
+TARGETS: list[str] = [t.strip() for t in os.environ.get("ENGY_METRICS_TARGETS", "").split(",") if t.strip()]
+FETCH_TIMEOUT_SECONDS: float = 5.0
 
-PORT = int(os.environ.get("METRICS_PORT", "9101"))
-TOKEN = os.environ.get("METRICS_TOKEN", "")
-SOCKET_GLOB = os.environ.get("METRICS_SOCKET_GLOB", "/tmp/dp-*/v.sock")
-# Written every tick by watchdog.py; absent when the watchdog is disabled or not shipped.
-# NOT under DOLPHIN_HOME: since lium-io#1161 that directory is a cache volume the platform
-# mounts into EVERY filler container on the node, so a state file there is one file shared by
-# every watchdog on the host — each overwriting the others' counters, and each inheriting a
-# neighbour's last_restart_timestamp on startup, which suppresses its own kill for a grace
-# period. /tmp is the container's own filesystem (the engine's unix socket lives there for the
-# same reason), so one state file belongs to exactly one watchdog and dies with its container.
-WATCHDOG_STATE_PATH = os.environ.get(
-    "DOLPHIN_WATCHDOG_STATE", "/tmp/dolphin_watchdog_state.json"
-)
-SIDECAR_VERSION = 1
-TOTAL_BUDGET_S = 4.0
-CONNECT_TIMEOUT_S = 1.0
-MAX_BODY_BYTES = 5 * 1024 * 1024
-LOG_INTERVAL_S = 10.0
-# Prometheus text exposition format version — NOT the image version, which it once
-# coincided with. Do not bump this when bumping the image tag.
-PROM_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
-
-_last_ok_ts: float = 0.0
-_last_socket: str = ""
-_last_error: str | None = None
-_last_log_ts: float = 0.0
+# A Prometheus sample line: name, optional {labels}, then the value. HELP/TYPE lines and blanks pass
+# through untouched — rewriting them would break the exposition format.
+SAMPLE_LINE = re.compile(r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?P<labels>\{.*\})?(?P<rest>\s+.+)$")
 
 
-def _optional_float(value: object) -> float | None:
-    return None if value is None else float(value)
+def _log(message: str) -> None:
+    print(f"[engy-metrics] {message}", file=sys.stderr, flush=True)
 
 
-@dataclass(frozen=True)
-class WatchdogState:
-    """What watchdog.py writes every tick. Declared here because three parties read these
-    names — the sidecar below, the watchdog itself after its own restart, and the tests —
-    and a key renamed on one side only makes the whole dolphin_watchdog_* group disappear,
-    which on a dashboard is indistinguishable from a watchdog that was never installed."""
-
-    updated: float
-    # Widest gap a healthy watchdog may leave between writes; the watchdog owns the number
-    # because only it knows how long its slowest tick (the one that kills an engine) takes.
-    max_write_gap_s: float
-    restarts_total: int
-    last_restart_timestamp: float
-    stall_seconds: float
-    # None when the engine did not answer this tick. requests_running is what tells an idle
-    # queue apart from a wedge, so a high stall_seconds cannot be read without it.
-    requests_running: float | None
-    generated_tokens: float | None
-
-    @classmethod
-    def read(cls, path: str) -> "WatchdogState | None":
-        # None for every shape we cannot use: absent, unparsable, or written by something
-        # else. Callers turn that into silence, never into invented zeros.
-        try:
-            with open(path) as fh:
-                raw = json.load(fh)
-            return cls(
-                updated=float(raw["updated"]),
-                max_write_gap_s=float(raw["max_write_gap_s"]),
-                restarts_total=int(raw["restarts_total"]),
-                last_restart_timestamp=float(raw["last_restart_timestamp"]),
-                stall_seconds=float(raw["stall_seconds"]),
-                requests_running=_optional_float(raw["requests_running"]),
-                generated_tokens=_optional_float(raw["generated_tokens"]),
-            )
-        except (OSError, ValueError, TypeError, KeyError):
-            return None
-
-
-def _log(msg: str) -> None:
-    # rate-limited: a crash-looping upstream must not flood container logs
-    global _last_log_ts
-    now = time.monotonic()
-    if now - _last_log_ts >= LOG_INTERVAL_S:
-        _last_log_ts = now
-        print(f"[sidecar] {msg}", file=sys.stderr, flush=True)
-
-
-class UdsHTTPConnection(http.client.HTTPConnection):
-    """HTTPConnection over an AF_UNIX socket path."""
-
-    def __init__(self, path: str, timeout: float) -> None:
-        super().__init__("localhost", timeout=timeout)
-        self._path = path
-
-    def connect(self) -> None:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        sock.connect(self._path)
-        self.sock = sock
-
-
-def discover_sockets() -> list[str]:
-    # newest mtime first: stale /tmp/dp-*/v.sock files survive worker restarts
-    paths = glob.glob(SOCKET_GLOB)
-    def mtime(p: str) -> float:
-        try:
-            return os.stat(p).st_mtime
-        except OSError:
-            return 0.0
-    return sorted(paths, key=mtime, reverse=True)
-
-
-def fetch_vllm_metrics(sockets: list[str]) -> bytes | None:
-    # try each socket within one shared deadline; first good response wins
-    global _last_ok_ts, _last_socket, _last_error
-    deadline = time.monotonic() + TOTAL_BUDGET_S
-    for path in sockets:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _last_error = "budget exhausted"
-            return None
-        conn = UdsHTTPConnection(path, timeout=min(CONNECT_TIMEOUT_S, remaining))
-        try:
-            conn.connect()
-            conn.sock.settimeout(max(0.1, deadline - time.monotonic()))
-            conn.request("GET", "/metrics")
-            resp = conn.getresponse()
-            if resp.status != 200:
-                _last_error = f"{path}: HTTP {resp.status}"
-                continue
-            body = resp.read(MAX_BODY_BYTES + 1)
-            if len(body) > MAX_BODY_BYTES:
-                _last_error = f"{path}: body over {MAX_BODY_BYTES} bytes"
-                continue
-            _last_ok_ts = time.time()
-            _last_socket = path
-            _last_error = None
-            return body
-        except (OSError, http.client.HTTPException) as e:
-            # a stale socket may host a non-HTTP listener, or vllm can die
-            # mid-response (IncompleteRead) — fall through to the next socket;
-            # a crash here would defeat the 200 fail-open the scraper relies on
-            _last_error = f"{path}: {e}"
+def label_with_engine(body: str, engine_port: str) -> str:
+    """Add engine="<port>" to every sample line so N engines can share one exposition."""
+    labelled: list[str] = []
+    for line in body.splitlines():
+        match = SAMPLE_LINE.match(line) if line and not line.startswith("#") else None
+        if match is None:
+            labelled.append(line)
             continue
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    return None
+        existing_labels: str = match.group("labels") or ""
+        merged_labels: str = (
+            existing_labels[:-1] + f',engine="{engine_port}"}}' if existing_labels else f'{{engine="{engine_port}"}}'
+        )
+        labelled.append(f"{match.group('name')}{merged_labels}{match.group('rest')}")
+    return "\n".join(labelled)
 
 
-def sidecar_series(sockets_found: int, proxy_ok: bool) -> bytes:
-    # proxy_ok is THE engine-liveness discriminator for the scraper: stale
-    # socket files can exist while the engine is dead, so sockets_found alone
-    # cannot distinguish "vllm down" from "vllm schema changed".
-    return (
-        f"dolphin_sidecar_up 1\n"
-        f"dolphin_sidecar_proxy_ok {int(proxy_ok)}\n"
-        f"dolphin_sidecar_sockets_found {sockets_found}\n"
-        f"dolphin_sidecar_last_proxy_ok_timestamp {int(_last_ok_ts)}\n"
-        f"dolphin_sidecar_version {SIDECAR_VERSION}\n"
-    ).encode()
+def fetch_engine_metrics(target: str) -> str | None:
+    engine_port: str = target.rsplit(":", 1)[-1]
+    try:
+        with urllib.request.urlopen(f"{target}/metrics", timeout=FETCH_TIMEOUT_SECONDS) as response:
+            body: str = response.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        _log(f"engine {target} unreachable: {error!r}")
+        return None
+    return label_with_engine(body, engine_port)
 
 
-def watchdog_series() -> bytes:
-    # Empty when there is no readable state at all — better than zeros, which would claim a
-    # healthy watchdog that does not exist. A watchdog that ran and died is a different
-    # story and must be visible, so a stale state file reports up 0 with its last numbers.
-    state = WatchdogState.read(WATCHDOG_STATE_PATH)
-    if state is None:
-        return b""
-    # Three missed writes mean it is gone. The bound comes from the file rather than from
-    # the poll interval, because the tick that kills an engine blocks far longer than a poll.
-    age_s = time.time() - state.updated
-    return (
-        f"dolphin_watchdog_up {int(age_s <= 3 * state.max_write_gap_s)}\n"
-        f"dolphin_watchdog_restarts_total {state.restarts_total}\n"
-        f"dolphin_watchdog_last_restart_timestamp {int(state.last_restart_timestamp)}\n"
-        f"dolphin_watchdog_stall_seconds {state.stall_seconds:.0f}\n"
-    ).encode()
+def collect() -> tuple[bytes, int]:
+    """Every reachable engine's metrics, plus how many answered.
+
+    A dead engine is skipped rather than failing the whole scrape: on a multi-card node the surviving
+    engines are still earning, and the reachable-count series is what says a card went quiet.
+    """
+    chunks: list[str] = []
+    reachable: int = 0
+    for target in TARGETS:
+        body: str | None = fetch_engine_metrics(target)
+        if body is None:
+            continue
+        reachable += 1
+        chunks.append(body)
+    chunks.append(
+        "# HELP engy_sidecar_engines_reachable Engines that answered the last scrape.\n"
+        "# TYPE engy_sidecar_engines_reachable gauge\n"
+        f"engy_sidecar_engines_reachable {reachable}\n"
+        "# HELP engy_sidecar_engines_configured Engines this container was told to scrape.\n"
+        "# TYPE engy_sidecar_engines_configured gauge\n"
+        f"engy_sidecar_engines_configured {len(TARGETS)}\n"
+    )
+    return ("\n".join(chunks) + "\n").encode("utf-8"), reachable
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "dolphin-sidecar"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
-        pass  # per-request access logging is pure noise on a 60s scrape
+        return  # otherwise one access-log line per scrape, forever
 
     def _reply(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
@@ -220,59 +98,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self) -> bool:
-        got = self.headers.get("Authorization", "")
-        return hmac.compare_digest(got, f"Bearer {TOKEN}")
+        return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
 
     def do_GET(self) -> None:  # noqa: N802
-        if not TOKEN:
-            # fail closed: an unset token must never mean an open port
-            self._reply(503, b"METRICS_TOKEN not configured\n", "text/plain")
-            _log("refusing request: METRICS_TOKEN is not set")
+        if self.path.split("?")[0] != "/metrics":
+            self._reply(404, b"not found\n", "text/plain")
             return
         if not self._authorized():
             self._reply(401, b"unauthorized\n", "text/plain")
             return
-        if self.path == "/metrics":
-            self._get_metrics()
-        elif self.path == "/health":
-            self._get_health()
-        else:
-            self._reply(404, b"not found\n", "text/plain")
-
-    def do_POST(self) -> None:  # noqa: N802
-        self._reply(405, b"method not allowed\n", "text/plain")
-
-    def _get_metrics(self) -> None:
-        # verbatim vllm body (if any engine answers) + appended sidecar series
-        sockets = discover_sockets()
-        body = fetch_vllm_metrics(sockets)
-        if body is None:
-            out = sidecar_series(len(sockets), proxy_ok=False)
-            if sockets:
-                _log(f"no responsive vllm socket ({len(sockets)} candidates): {_last_error}")
-        else:
-            if not body.endswith(b"\n"):
-                body += b"\n"
-            out = body + sidecar_series(len(sockets), proxy_ok=True)
-        self._reply(200, out + watchdog_series(), PROM_CONTENT_TYPE)
-
-    def _get_health(self) -> None:
-        sockets = discover_sockets()
-        payload = {
-            "socket": _last_socket or None,
-            "sockets_found": len(sockets),
-            "last_ok": int(_last_ok_ts),
-            "error": _last_error,
-            "sidecar_version": SIDECAR_VERSION,
-        }
-        self._reply(200, json.dumps(payload).encode() + b"\n", "application/json")
+        body, reachable = collect()
+        # 503 when nothing answered: an empty 200 reads as "this node earns zero", which is a very
+        # different alert from "the scrape could not reach the engines".
+        self._reply(200 if reachable else 503, body, "text/plain; version=0.0.4")
 
 
 def main() -> None:
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    server.daemon_threads = True
-    print(f"[sidecar] serving on :{PORT} (version {SIDECAR_VERSION})", file=sys.stderr, flush=True)
-    server.serve_forever()
+    if not TOKEN:
+        _log("METRICS_TOKEN is required — refusing to expose an unauthenticated metrics port.")
+        raise SystemExit(1)
+    if not TARGETS:
+        _log("ENGY_METRICS_TARGETS is empty — nothing to scrape.")
+        raise SystemExit(1)
+    _log(f"serving :{PORT}/metrics for {len(TARGETS)} engine(s)")
+    http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

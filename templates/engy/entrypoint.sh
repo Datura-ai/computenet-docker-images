@@ -105,14 +105,20 @@ for gpu_index in $(seq 0 $((gpu_count - 1))); do
     echo "[engy] engine on port ${port} ready"
 done
 
-if [[ -f "${ENGY_HOME}/metrics_sidecar.py" ]] && [[ -n "${METRICS_TOKEN:-}" ]]; then
-    METRICS_UPSTREAM="http://127.0.0.1:${FIRST_PORT}/metrics" python3 "${ENGY_HOME}/metrics_sidecar.py" &
+# Token counters for the platform scraper. Every engine is scraped, not just the first — on a
+# multi-card node the per-engine series is what shows one card gone quiet.
+if [[ -n "${METRICS_TOKEN:-}" ]]; then
+    ENGY_METRICS_TARGETS="$(IFS=,; echo "${serve_urls[*]}")" \
+        python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" &
 fi
 
-# The miner is supervised, the engines are not restarted: a new engy_miner run keeps the same
-# MINER_KEY, but a re-created CONTAINER mints a new worker_id and re-enters probe qualification,
-# which cost a full day on the pilot. So a dead engine ends the container (the platform relaunches
-# it), while a miner that merely dropped its websocket is restarted in place.
+# The miner is supervised, the engines are not restarted — but a miner restart is NOT free:
+# WORKER_ID is uuid4() PER PROCESS (engy_miner.py:278), so every relaunch of the miner is a brand-new
+# worker to the gateway and goes to the BACK of the qualification queue (hours to a day, measured).
+# The miner has its own reconnect loop for dropped websockets, so it exiting at all means something
+# is genuinely wrong; the 60s backoff keeps a crash-loop from spamming the gateway with fresh
+# worker_ids. A dead engine still ends the container — that decision belongs to the platform.
+MINER_RESTART_BACKOFF_SECONDS=60
 while true; do
     for url in "${serve_urls[@]}"; do
         if ! curl -sf "${url}/health_generate" >/dev/null 2>&1; then
@@ -129,6 +135,6 @@ while true; do
         --serve-url "$(IFS=,; echo "${serve_urls[*]}")" &
     miner_pid=$!
     wait "${miner_pid}" || true
-    echo "[engy] miner exited, restarting in 10s" >&2
-    sleep 10
+    echo "[engy] miner exited — restarting as a NEW worker (back of the qualification queue) in ${MINER_RESTART_BACKOFF_SECONDS}s" >&2
+    sleep "${MINER_RESTART_BACKOFF_SECONDS}"
 done

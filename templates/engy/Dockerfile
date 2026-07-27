@@ -17,6 +17,10 @@ FROM ${BASE_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
 
 # libnuma1: without it sgl_kernel fails to load behind a misleading "kernel not found".
+# python3-dev: Triton JIT-compiles kernels against Python.h at first forward pass. Without the
+# headers it does not fail loudly — it prints "Triton is not supported on current platform, roll
+# back to CPU" and the engine limps along on the CPU path. Caught by running the container, not by
+# building it.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -24,6 +28,7 @@ RUN apt-get update && \
     jq \
     libnuma1 \
     python3 \
+    python3-dev \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
@@ -49,6 +54,12 @@ ENV PATH=/usr/local/cuda/bin:${PATH}
 ENV ENGY_HOME=/opt/engy
 ENV ENGY_MINER_DIR=/opt/engy-miner
 
+# DeepGEMM JIT-compiles ~16k FP8 kernels on a cold engine — measured 10-20 min before the engine
+# serves its first token. Park that cache on the SHARED volume so only the first container on a node
+# ever pays it: a re-created container (which already costs engy a new worker_id and re-qualification)
+# must not also wait 20 minutes to come back.
+ENV DG_JIT_CACHE_DIR=${ENGY_HOME}/deepgemm-cache
+
 WORKDIR ${ENGY_HOME}
 
 # Vendored from github.com/hanlinai/engy @ v0.4.4 (miner/). Upstream publishes no package, and the
@@ -56,7 +67,10 @@ WORKDIR ${ENGY_HOME}
 # PYTHONPATH points at this dir so sitecustomize.py can trim the hidden states sglang returns.
 COPY vendor/engy_miner.py vendor/sitecustomize.py ${ENGY_MINER_DIR}/
 
-COPY metrics_sidecar.py ${ENGY_HOME}/metrics_sidecar.py
+# Code lives OUTSIDE ENGY_HOME on purpose: ENGY_HOME is the cache-volume root, and anything the
+# image puts there is shadowed the moment a volume is mounted over it (found by running it — the
+# sidecar silently vanished). ENGY_HOME holds data only.
+COPY metrics_sidecar.py ${ENGY_MINER_DIR}/metrics_sidecar.py
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
