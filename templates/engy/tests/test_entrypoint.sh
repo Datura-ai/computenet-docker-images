@@ -77,6 +77,9 @@ for port in 8000 8001 8002 8003; do
     grep -q -- "--port ${port}" "${SANDBOX}/calls.log" || fail "no engine on port ${port}"
 done
 grep -q -- "--tp-size 1" "${SANDBOX}/calls.log" && pass "engines are tp=1" || fail "engines are not tp=1"
+# Without this flag sglang answers /health_generate but 404s on /metrics, so the sidecar reports
+# every engine unreachable and the node looks like it earns nothing.
+grep -q -- "--enable-metrics" "${SANDBOX}/calls.log" && pass "engines expose /metrics" || fail "engines do not expose /metrics"
 # Each engine must be pinned to its own card, or they all pile onto GPU 0.
 for gpu in 0 1 2 3; do
     grep -q "CUDA_VISIBLE_DEVICES=${gpu}$" "${SANDBOX}/calls.log" || fail "no engine pinned to GPU ${gpu}"

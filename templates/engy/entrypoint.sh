@@ -72,6 +72,7 @@ start_engine() {
         --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 \
         --chunked-prefill-size 8192 --max-running-requests "${PER_ENGINE_REQUESTS}" \
         --context-length "${CONTEXT_LENGTH}" --enable-return-hidden-states --enable-cache-report \
+        --enable-metrics \
         --host 127.0.0.1 --port "${port}" &
     serve_pids+=("$!")
 }
