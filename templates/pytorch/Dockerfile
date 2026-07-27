@@ -66,9 +66,13 @@ RUN apt-get update --yes && \
 
 # gocryptfs powers lium encrypted local volumes
 ARG GOCRYPTFS_VERSION=2.6.1
+# sha256 of gocryptfs_v2.6.1_linux-static_amd64.tar.gz
+# https://github.com/rfjakob/gocryptfs/releases/tag/v2.6.1
+ARG GOCRYPTFS_SHA256=49b8c0eb0f6373b6ac99c394a52909d8478e74c08d0961527c1162967cc28c44
 RUN curl -fsSL \
         "https://github.com/rfjakob/gocryptfs/releases/download/v${GOCRYPTFS_VERSION}/gocryptfs_v${GOCRYPTFS_VERSION}_linux-static_amd64.tar.gz" \
         -o /tmp/gocryptfs.tgz && \
+    echo "${GOCRYPTFS_SHA256}  /tmp/gocryptfs.tgz" | sha256sum -c - && \
     tar -xzf /tmp/gocryptfs.tgz -C /usr/local/bin gocryptfs && \
     chmod 0755 /usr/local/bin/gocryptfs && \
     rm -f /tmp/gocryptfs.tgz && \
