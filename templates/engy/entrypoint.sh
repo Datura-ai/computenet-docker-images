@@ -127,7 +127,8 @@ done
 # multi-card node the per-engine series is what shows one card gone quiet.
 # Restarted with backoff, the same shape templates/dolphin uses: since it also serves /logs it is now
 # the only way to read this container from outside, and a dead sidecar would cost us exactly that
-# during the incident we wanted it for.
+# during the incident we wanted it for. TERM kills the subshell and leaves its python orphaned; that
+# is fine here because this script is PID 1 and container teardown reaps it.
 if [[ -n "${METRICS_TOKEN:-}" ]]; then
     (
         while true; do
