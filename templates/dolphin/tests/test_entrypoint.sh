@@ -752,7 +752,10 @@ EOF
 #!/usr/bin/env bash
 if [[ "\$1" == "start" ]]; then
     echo "\${HOME}" >>"${SANDBOX}/starts.log"
-    ( sleep 1; mkdir -p "${engine_dir}"; printf 'import sys\n' >"${engine_dir}/vllm" ) &
+    # Only when it is missing, like the real worker: it writes its runtime once and rewrites
+    # bin/vllm on update, not on every start. Writing it every time raced the wrapper install
+    # and made this test flaky.
+    [[ -f "${engine_dir}/vllm" ]] || ( sleep 1; mkdir -p "${engine_dir}"; printf 'import sys\n' >"${engine_dir}/vllm" ) &
     mkdir -p "${SANDBOX}/dp-\$\$" && touch "${SANDBOX}/dp-\$\$/v.sock"
     exec sleep 300
 fi

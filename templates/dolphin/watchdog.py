@@ -140,6 +140,40 @@ class EnginePoll:
 
 
 @dataclass(frozen=True)
+class StallClock:
+    """How long the engine has gone without emitting a token, and the counter proving it.
+
+    `generated_tokens` None means there is nothing to compare against yet: a cold start, or the
+    reset after a kill."""
+
+    generated_tokens: float | None
+    tokens_last_moved_at: float
+
+    @classmethod
+    def started_now(cls) -> "StallClock":
+        return cls(generated_tokens=None, tokens_last_moved_at=time.monotonic())
+
+    def seconds_since_tokens_moved(self, now: float) -> float:
+        return now - self.tokens_last_moved_at
+
+    def advanced(self, poll: EnginePoll, now: float) -> "StallClock":
+        counters = poll.counters
+        if counters is not None and counters.generated_tokens != self.generated_tokens:
+            return StallClock(counters.generated_tokens, now)
+        if counters is not None and counters.requests_running == 0:
+            # An idle queue holds the clock at zero rather than merely masking the kill: stall
+            # banked while nothing was asked of the engine would otherwise fire the moment the
+            # first request lands, when a poll can catch it mid-prefill — requests running, no
+            # tokens generated yet — and SIGKILL a healthy engine together with that request.
+            return StallClock(self.generated_tokens, now)
+        if not poll.socket_found:
+            return StallClock(generated_tokens=None, tokens_last_moved_at=now)
+        # A socket that exists but says nothing keeps the clock running: the engine went quiet,
+        # which is the wedge itself. Only a container with no socket at all is a cold start.
+        return self
+
+
+@dataclass(frozen=True)
 class EngineProcesses:
     """One engine's processes and the socket that identifies it.
 
@@ -425,8 +459,7 @@ def main() -> None:
         f"watching {SCOPE}: poll {POLL_INTERVAL_S:.0f}s, stall limit {STALL_LIMIT_S:.0f}s, "
         f"state {STATE_PATH}, {restarts_total} restart(s) so far this container"
     )
-    last_generated_tokens: float | None = None
-    tokens_last_moved_at = time.monotonic()
+    stall_clock = StallClock.started_now()
     # The previous process's kill still protects the engine: without carrying the grace over,
     # a supervisor restart would hand an engine that is still reloading weights to a watchdog
     # with no memory of the kill, which would read the reload as a fresh wedge.
@@ -448,24 +481,10 @@ def main() -> None:
         counters = poll.counters
         now = time.monotonic()
 
-        # A socket that exists but says nothing keeps the clock running: the engine went
-        # quiet, which is the wedge itself. Only a container with no socket at all is a
-        # cold start, and a cold start legitimately produces nothing for 30-60 minutes.
-        if counters is not None and counters.generated_tokens != last_generated_tokens:
-            last_generated_tokens = counters.generated_tokens
-            tokens_last_moved_at = now
-        elif counters is not None and counters.requests_running == 0:
-            # An idle queue holds the clock at zero rather than merely masking the kill:
-            # stall banked while nothing was asked of the engine would otherwise fire the
-            # moment the first request lands, when a poll can catch it mid-prefill —
-            # requests running, no tokens generated yet — and SIGKILL a healthy engine
-            # together with the request it was serving.
-            tokens_last_moved_at = now
-        elif not poll.socket_found:
-            last_generated_tokens = None
-            tokens_last_moved_at = now
-
-        stall_seconds = now - tokens_last_moved_at
+        # A cold start legitimately produces nothing for 30-60 minutes, so only the absence of a
+        # socket resets the clock; see StallClock.advanced for the other two cases.
+        stall_clock = stall_clock.advanced(poll, now)
+        stall_seconds = stall_clock.seconds_since_tokens_moved(now)
         # An idle queue is a demand problem, not a wedge — the engine is fine and waiting.
         wedged = (
             counters is not None
@@ -486,8 +505,7 @@ def main() -> None:
                 last_restart_timestamp = time.time()
                 # Only a real kill restarts the stall clock. When the kill was refused or
                 # failed, the counter keeps climbing — that is what makes it visible.
-                last_generated_tokens = None
-                tokens_last_moved_at = time.monotonic()
+                stall_clock = StallClock.started_now()
                 stall_seconds = 0.0
                 wedged = False
 

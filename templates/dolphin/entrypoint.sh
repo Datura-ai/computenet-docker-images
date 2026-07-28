@@ -349,6 +349,38 @@ instance_tag() {
     fi
 }
 
+# Spread ALL cards evenly over <worker_count> bundles (sizes differ by at most 1) and print one
+# bundle per line. Cards come in as "<index>:<vram_mb>" in plan order. Fails without printing
+# anything when a bundle would miss the VRAM floor, which is the caller's cue to keep the node on
+# its single all-GPUs worker rather than launch it broken.
+print_even_gpu_bundles() {
+    local worker_count="$1" split_min_vram_mb="$2"
+    shift 2
+    local cards=("$@") gpu_count=$#
+    local base_bundle_size=$(( gpu_count / worker_count ))
+    local bundles_with_extra_card=$(( gpu_count % worker_count ))
+    local bundles=() cursor=0 w bundle_size i bundle bundle_vram card
+    for (( w = 0; w < worker_count; w++ )); do
+        bundle_size=${base_bundle_size}
+        if (( w < bundles_with_extra_card )); then
+            bundle_size=$(( base_bundle_size + 1 ))
+        fi
+        bundle=""
+        bundle_vram=0
+        for (( i = cursor; i < cursor + bundle_size; i++ )); do
+            card="${cards[$i]}"
+            bundle="${bundle:+${bundle},}${card%%:*}"
+            bundle_vram=$(( bundle_vram + ${card##*:} ))
+        done
+        if (( bundle_vram < split_min_vram_mb )); then
+            return 1
+        fi
+        bundles+=("${bundle}")
+        cursor=$(( cursor + bundle_size ))
+    done
+    printf '%s\n' "${bundles[@]}"
+}
+
 # Emit one line per worker to spawn: a comma-separated gpu_ids list, or the literal "all"
 # (worker.json gpu_ids: null -> the worker auto-scales to every GPU on the node).
 #
@@ -369,25 +401,24 @@ plan_worker_gpu_sets() {
         echo "all"
         return
     fi
-    local indices=() vram_values=() index vram
+    local cards=() index vram
     while IFS=',' read -r index vram; do
         index="${index//[[:space:]]/}"
         vram="${vram//[[:space:]]/}"
         [[ -n "${index}" && -n "${vram}" ]] || continue
-        indices+=("${index}")
-        vram_values+=("${vram}")
+        cards+=("${index}:${vram}")
     done < <(detect_gpus)
-    local gpu_count=${#indices[@]}
+    local gpu_count=${#cards[@]}
     if (( gpu_count < 2 )); then
         echo "all"
         return
     fi
     # The smallest card decides how many cards one worker needs (Lium nodes are homogeneous;
     # min is the conservative choice for a mixed node).
-    local min_vram=${vram_values[0]}
-    for vram in "${vram_values[@]}"; do
-        if (( vram < min_vram )); then
-            min_vram=${vram}
+    local min_vram=${cards[0]##*:} card
+    for card in "${cards[@]}"; do
+        if (( ${card##*:} < min_vram )); then
+            min_vram=${card##*:}
         fi
     done
     if (( min_vram <= 0 )); then
@@ -400,30 +431,7 @@ plan_worker_gpu_sets() {
         echo "all"
         return
     fi
-    # Spread ALL cards evenly over the workers (bundle sizes differ by at most 1), then verify
-    # every bundle really clears the floor — a mixed node that can't is left on the single
-    # all-GPUs worker rather than launched broken.
-    local bundles=() base_bundle_size=$(( gpu_count / worker_count )) bundles_with_extra_card=$(( gpu_count % worker_count ))
-    local cursor=0 w bundle_size i bundle bundle_vram
-    for (( w = 0; w < worker_count; w++ )); do
-        bundle_size=${base_bundle_size}
-        if (( w < bundles_with_extra_card )); then
-            bundle_size=$(( base_bundle_size + 1 ))
-        fi
-        bundle=""
-        bundle_vram=0
-        for (( i = cursor; i < cursor + bundle_size; i++ )); do
-            bundle="${bundle:+${bundle},}${indices[$i]}"
-            bundle_vram=$(( bundle_vram + vram_values[i] ))
-        done
-        if (( bundle_vram < split_min_vram_mb )); then
-            echo "all"
-            return
-        fi
-        bundles+=("${bundle}")
-        cursor=$(( cursor + bundle_size ))
-    done
-    printf '%s\n' "${bundles[@]}"
+    print_even_gpu_bundles "${worker_count}" "${split_min_vram_mb}" "${cards[@]}" || echo "all"
 }
 
 # Render one worker.json into <config_dir>. gpu_set "all" -> gpu_ids null. 0600 up front:
@@ -728,210 +736,232 @@ resolve_and_apply_intra_card_split() {
     fi
 }
 
+# The plan's outputs are read by the supervisor loop, by its traps and by the watchdogs alike, so
+# they live at script scope instead of being threaded through six signatures.
+GPU_SETS=()
+INSTANCE_HOMES=()
+WORKER_PIDS=()
+WATCHDOG_PIDS=()
+SIDECAR_PID=""
+BASE_HOME="${HOME:-/root}"
+SHARED_CACHE="${BASE_HOME}/.cache"
+
+# Decide which cards each worker instance gets, then give every instance its own HOME and its own
+# worker.json. Fills GPU_SETS (one entry per worker) and INSTANCE_HOMES parallel to it.
+plan_worker_instances() {
+    local gpu_set_line
+    GPU_SETS=()
+    while IFS= read -r gpu_set_line; do
+        [[ -n "${gpu_set_line}" ]] && GPU_SETS+=("${gpu_set_line}")
+    done < <(plan_worker_gpu_sets)
+
+    # Lium nodes are homogeneous, so the first bundle decides the layout for all of them.
+    # emit_worker_plan is the identity at one worker per bundle, so the unsplit fleet needs no
+    # branch here — N=1 is just a case of N.
+    resolve_and_apply_intra_card_split "${GPU_SETS[0]}" "${BASE_HOME}" "${SHARED_CACHE}"
+    local expanded=()
+    while IFS= read -r gpu_set_line; do
+        [[ -n "${gpu_set_line}" ]] && expanded+=("${gpu_set_line}")
+    done < <(emit_worker_plan "${GPU_SETS[@]}")
+    GPU_SETS=("${expanded[@]}")
+
+    local i
+    INSTANCE_HOMES=()
+    if (( ${#GPU_SETS[@]} == 1 )); then
+        # Single-worker path: same config location as always (prod-proven behavior).
+        INSTANCE_HOMES=("${BASE_HOME}")
+    else
+        for i in "${!GPU_SETS[@]}"; do
+            # With WORKERS_PER_BUNDLE > 1 the same cards appear more than once, so the card set
+            # alone no longer names a home; the instance index is what keeps them apart.
+            INSTANCE_HOMES+=("${BASE_HOME}/dolphin-workers/$(instance_tag "${i}" "${GPU_SETS[$i]}")")
+            prepare_instance_home "${INSTANCE_HOMES[$i]}" "${SHARED_CACHE}"
+        done
+    fi
+    for i in "${!GPU_SETS[@]}"; do
+        render_worker_config "${INSTANCE_HOMES[$i]}/.config/dolphinpod" "${GPU_SETS[$i]}"
+    done
+    echo "[dolphin] spawning ${#GPU_SETS[@]} worker(s): $(printf '[%s] ' "${GPU_SETS[@]}")" >&2
+}
+
+# Metrics sidecar (DAH-2468): proxies every engine's uds /metrics onto :9101. Own restart loop with
+# backoff so a broken sidecar can neither kill a worker nor spin hot. Orphaned python (if the
+# subshell dies first on TERM) is reaped by container teardown when PID 1 exits. ENGINES_EXPECTED
+# lets it publish up-vs-expected, so one dead engine among N reads as a gap rather than as a
+# quieter machine.
+start_metrics_sidecar() {
+    export DOLPHIN_ENGINES_EXPECTED="${#GPU_SETS[@]}"
+    SIDECAR_PID=""
+    [[ -f "${DOLPHIN_HOME}/metrics_sidecar.py" ]] || return 0
+    (
+        while true; do
+            python3 "${DOLPHIN_HOME}/metrics_sidecar.py" || true
+            sleep 5
+        done
+    ) &
+    SIDECAR_PID=$!
+}
+
+# Engine watchdog: restarts a vLLM engine that wedged inside a CUDA kernel (requests in flight,
+# token counter frozen, GPU pinned at 100% on a third of normal power — observed live on this
+# image 2026-07-23).
+#
+# One watchdog per instance, each told its own HOME. It reads only its own engine's socket and
+# kills only its own processes, so a wedge on one instance no longer takes the others down: every
+# worker is spawned with a HOME of its own, which /proc reports for the engine it exec'd and for
+# the children below it, giving a home <-> pid <-> socket mapping. The cards cannot serve as that
+# key — N workers on one card share them (DAH-2473) — so they ride along as a label only. When the
+# mapping is ambiguous the watchdog kills nothing and publishes engine_found 0.
+#
+# A single instance gets the unscoped watchdog and the original state path, so the single-worker
+# fleet keeps exactly the behavior it runs today.
+#
+# State lives in the container's own /tmp, never on DOLPHIN_HOME: that volume is shared by every
+# filler container on the node, so state there would mix the counters of every watchdog on the
+# host (lium-io#1161). A restarted container keeps its /tmp, so a previous run's split is still
+# cleared before starting — stale files would otherwise publish forever as dead watchdogs for
+# instances that no longer exist.
+start_engine_watchdogs() {
+    WATCHDOG_PIDS=()
+    [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]] || return 0
+    rm -f "${WATCHDOG_STATE_DIR}"/dolphin_watchdog_state*.json
+    local i watchdog_gpu_set watchdog_instance_home watchdog_state
+    for i in "${!GPU_SETS[@]}"; do
+        watchdog_gpu_set=""
+        watchdog_instance_home=""
+        watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state.json"
+        if (( ${#GPU_SETS[@]} > 1 )); then
+            watchdog_gpu_set="${GPU_SETS[$i]}"
+            watchdog_instance_home="${INSTANCE_HOMES[$i]}"
+            # Named from the home rather than from instance_tag again: watchdog.py derives its own
+            # instance label the same way, so one construction feeds both sides.
+            watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state_$(basename "${INSTANCE_HOMES[$i]}").json"
+        fi
+        (
+            while true; do
+                DOLPHIN_WATCHDOG_GPU_SET="${watchdog_gpu_set}" \
+                DOLPHIN_WATCHDOG_INSTANCE_HOME="${watchdog_instance_home}" \
+                DOLPHIN_WATCHDOG_STATE="${watchdog_state}" \
+                    python3 "${DOLPHIN_HOME}/watchdog.py" || true
+                sleep 5
+            done
+        ) &
+        WATCHDOG_PIDS+=($!)
+    done
+    if (( ${#GPU_SETS[@]} > 1 )); then
+        echo "[dolphin] ${#WATCHDOG_PIDS[@]} per-engine watchdog(s) started" >&2
+    fi
+}
+
+spawn_instance() {
+    local idx="$1"
+    ensure_engine_memory_wrapper
+    (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) &
+    WORKER_PIDS[idx]=$!
+}
+
+terminate_workers() {
+    local pid
+    for pid in ${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}; do
+        [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
+    done
+    for pid in ${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}; do
+        [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
+    done
+}
+
+on_term() {
+    if [[ -n "${SIDECAR_PID}" ]]; then
+        kill -TERM "${SIDECAR_PID}" 2>/dev/null || true
+    fi
+    local watchdog_pid
+    for watchdog_pid in ${WATCHDOG_PIDS[@]+"${WATCHDOG_PIDS[@]}"}; do
+        kill -TERM "${watchdog_pid}" 2>/dev/null || true
+    done
+    terminate_workers
+    exit 0
+}
+
+# First start of every instance. Spaced out because instance 0 is what seeds the shared cache.
+spawn_all_instances() {
+    local i
+    WORKER_PIDS=()
+    for i in "${!GPU_SETS[@]}"; do
+        if (( i == 1 )); then
+            # Only before the SECOND instance: once instance 0 serves, the runtime and the weights
+            # are on disk, so 2..N all start warm and need no further wait.
+            wait_for_cache_seed
+        fi
+        if (( i > 0 && SPLIT_STAGGER_SECONDS > 0 )); then
+            interruptible_sleep "${SPLIT_STAGGER_SECONDS}"
+        fi
+        spawn_instance "${i}"
+    done
+}
+
+# Keep the running workers alive until a NEW worker binary is published, respawning any that exit
+# on their own meanwhile. Returns only when the whole set has to be restarted for an update.
+supervise_running_workers_until_new_binary_published() {
+    local running_etag="$1"
+    local elapsed=0 i latest_etag
+    while true; do
+        interruptible_sleep "${LIVENESS_INTERVAL}"
+        for i in "${!WORKER_PIDS[@]}"; do
+            if ! kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
+                wait "${WORKER_PIDS[$i]}" 2>/dev/null || true
+                echo "[dolphin] worker [${GPU_SETS[$i]}] exited; restarting" >&2
+                refresh_binary
+                spawn_instance "${i}"
+                # A worker exits to self-update onto a freshly published binary; refresh_binary
+                # just pulled it, so re-baseline the etag — otherwise the poll below still sees the
+                # old baseline and forces a redundant full restart of every worker.
+                running_etag="$(published_etag || true)"
+            fi
+        done
+        elapsed=$((elapsed + LIVENESS_INTERVAL))
+        if (( elapsed < CHECK_INTERVAL )); then
+            continue
+        fi
+        elapsed=0
+        latest_etag="$(published_etag || true)"
+        if [[ -n "${latest_etag}" && -n "${running_etag}" && "${latest_etag}" != "${running_etag}" ]]; then
+            echo "[dolphin] new worker binary published; restarting workers to update" >&2
+            return 0
+        fi
+    done
+}
+
+# The worker's own self-update downloads a new binary and then exits expecting an external
+# supervisor to restart it (systemd in Dolphin's reference install) — so every (re)spawn goes
+# through `update` (DAH-2457). The etag poll is the fallback for when no instance's self-update
+# fires: a changed etag on WORKER_URL restarts them all.
+run_worker_supervisor_loop() {
+    local running_etag
+    while true; do
+        refresh_binary
+        running_etag="$(published_etag || true)"
+        spawn_all_instances
+        supervise_running_workers_until_new_binary_published "${running_etag}"
+        terminate_workers
+        echo "[dolphin] workers stopped for update; restarting in 5s" >&2
+        interruptible_sleep 5
+    done
+}
+
 main() {
     if [[ -z "${API_KEY}" ]]; then
         echo "[dolphin] DOLPHIN_API_KEY is required (dp-... key from v2.dphn.ai)." >&2
         exit 1
     fi
-
-    ensure_worker_binary
-
-    local gpu_sets=() gpu_set_line
-    while IFS= read -r gpu_set_line; do
-        [[ -n "${gpu_set_line}" ]] && gpu_sets+=("${gpu_set_line}")
-    done < <(plan_worker_gpu_sets)
-    local instance_count=${#gpu_sets[@]}
-
-    local base_home="${HOME:-/root}"
-    local shared_cache="${base_home}/.cache"
-    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${shared_cache}}"
+    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${SHARED_CACHE}}"
     export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
 
-    # Lium nodes are homogeneous, so the first bundle decides the layout for all of them.
-    # emit_worker_plan is the identity at one worker per bundle, so the unsplit fleet needs no
-    # branch here — N=1 is just a case of N.
-    resolve_and_apply_intra_card_split "${gpu_sets[0]}" "${base_home}" "${shared_cache}"
-    local expanded=()
-    while IFS= read -r gpu_set_line; do
-        [[ -n "${gpu_set_line}" ]] && expanded+=("${gpu_set_line}")
-    done < <(emit_worker_plan "${gpu_sets[@]}")
-    gpu_sets=("${expanded[@]}")
-    instance_count=${#gpu_sets[@]}
-
-    local instance_homes=() i
-    if (( instance_count == 1 )); then
-        # Single-worker path: same config location as always (prod-proven behavior).
-        instance_homes=("${base_home}")
-    else
-        for i in "${!gpu_sets[@]}"; do
-            # With WORKERS_PER_BUNDLE > 1 the same cards appear more than once, so the card set
-            # alone no longer names a home; the instance index is what keeps them apart.
-            instance_homes+=("${base_home}/dolphin-workers/$(instance_tag "${i}" "${gpu_sets[$i]}")")
-            prepare_instance_home "${instance_homes[$i]}" "${shared_cache}"
-        done
-    fi
-    for i in "${!gpu_sets[@]}"; do
-        render_worker_config "${instance_homes[$i]}/.config/dolphinpod" "${gpu_sets[$i]}"
-    done
-    echo "[dolphin] spawning ${instance_count} worker(s): $(printf '[%s] ' "${gpu_sets[@]}")" >&2
-
-    # Metrics sidecar (DAH-2468): proxies every engine's uds /metrics onto :9101. Own restart
-    # loop with backoff so a broken sidecar can neither kill a worker nor spin hot. Orphaned
-    # python (if the subshell dies first on TERM) is reaped by container teardown when PID 1
-    # exits. ENGINES_EXPECTED lets it publish up-vs-expected, so one dead engine among N reads
-    # as a gap rather than as a quieter machine.
-    export DOLPHIN_ENGINES_EXPECTED="${instance_count}"
-    local sidecar_pid=""
-    if [[ -f "${DOLPHIN_HOME}/metrics_sidecar.py" ]]; then
-        (
-            while true; do
-                python3 "${DOLPHIN_HOME}/metrics_sidecar.py" || true
-                sleep 5
-            done
-        ) &
-        sidecar_pid=$!
-    fi
-
-    # Engine watchdog: restarts a vLLM engine that wedged inside a CUDA kernel (requests in
-    # flight, token counter frozen, GPU pinned at 100% on a third of normal power — observed
-    # live on this image 2026-07-23).
-    #
-    # One watchdog per instance, each told its own HOME. It reads only its own engine's socket
-    # and kills only its own processes, so a wedge on one instance no longer takes the others
-    # down: every worker is spawned with a HOME of its own, which /proc reports for the engine
-    # it exec'd and for the children below it, giving a home <-> pid <-> socket mapping. The
-    # cards cannot serve as that key — N workers on one card share them (DAH-2473) — so they
-    # ride along as a label only. When the mapping is ambiguous the watchdog kills nothing and
-    # publishes engine_found 0.
-    #
-    # A single instance gets the unscoped watchdog and the original state path, so the
-    # single-worker fleet keeps exactly the behavior it runs today.
-    #
-    # State lives in the container's own /tmp, never on DOLPHIN_HOME: that volume is shared by
-    # every filler container on the node, so state there would mix the counters of every
-    # watchdog on the host (lium-io#1161). A restarted container keeps its /tmp, so a previous
-    # run's split is still cleared before starting — stale files would otherwise publish
-    # forever as dead watchdogs for instances that no longer exist.
-    local watchdog_pids=()
-    if [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]]; then
-        rm -f "${WATCHDOG_STATE_DIR}"/dolphin_watchdog_state*.json
-        local watchdog_gpu_set watchdog_instance_home watchdog_state
-        for i in "${!gpu_sets[@]}"; do
-            watchdog_gpu_set=""
-            watchdog_instance_home=""
-            watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state.json"
-            if (( instance_count > 1 )); then
-                watchdog_gpu_set="${gpu_sets[$i]}"
-                watchdog_instance_home="${instance_homes[$i]}"
-                # Named from the home rather than from instance_tag again: watchdog.py derives
-                # its own instance label the same way, so one construction feeds both sides.
-                watchdog_state="${WATCHDOG_STATE_DIR}/dolphin_watchdog_state_$(basename "${instance_homes[$i]}").json"
-            fi
-            (
-                while true; do
-                    DOLPHIN_WATCHDOG_GPU_SET="${watchdog_gpu_set}" \
-                    DOLPHIN_WATCHDOG_INSTANCE_HOME="${watchdog_instance_home}" \
-                    DOLPHIN_WATCHDOG_STATE="${watchdog_state}" \
-                        python3 "${DOLPHIN_HOME}/watchdog.py" || true
-                    sleep 5
-                done
-            ) &
-            watchdog_pids+=($!)
-        done
-        if (( instance_count > 1 )); then
-            echo "[dolphin] ${#watchdog_pids[@]} per-engine watchdog(s) started" >&2
-        fi
-    fi
-
-    local worker_pids=()
-    terminate_workers() {
-        local pid
-        for pid in "${worker_pids[@]}"; do
-            [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
-        done
-        for pid in "${worker_pids[@]}"; do
-            [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
-        done
-    }
-    on_term() {
-        if [[ -n "${sidecar_pid}" ]]; then
-            kill -TERM "${sidecar_pid}" 2>/dev/null || true
-        fi
-        local wpid
-        for wpid in ${watchdog_pids[@]+"${watchdog_pids[@]}"}; do
-            kill -TERM "${wpid}" 2>/dev/null || true
-        done
-        terminate_workers
-        exit 0
-    }
+    ensure_worker_binary
+    plan_worker_instances
+    start_metrics_sidecar
+    start_engine_watchdogs
     trap on_term TERM INT
-
-    spawn_instance() {
-        local idx="$1"
-        ensure_engine_memory_wrapper
-        (cd "${DOLPHIN_HOME}" && HOME="${instance_homes[$idx]}" exec "${WORKER_BIN}" start) &
-        worker_pids[idx]=$!
-    }
-
-    # Supervisor loop. The worker's own self-update downloads a new binary and then exits
-    # expecting an external supervisor to restart it (systemd in Dolphin's reference install) —
-    # so every (re)spawn goes through `update` (DAH-2457). The etag poll is the fallback for
-    # when no instance's self-update fires: a changed etag on WORKER_URL restarts them all.
-    while true; do
-        refresh_binary
-        local running_etag
-        running_etag="$(published_etag || true)"
-        worker_pids=()
-        for i in "${!gpu_sets[@]}"; do
-            if (( i == 1 )); then
-                # Only before the SECOND instance: once instance 0 serves, the runtime and the
-                # weights are on disk, so 2..N all start warm and need no further wait.
-                wait_for_cache_seed
-            fi
-            if (( i > 0 && SPLIT_STAGGER_SECONDS > 0 )); then
-                # sleep in background + wait, so the TERM trap fires immediately
-                sleep "${SPLIT_STAGGER_SECONDS}" &
-                wait $! || true
-            fi
-            spawn_instance "${i}"
-        done
-
-        local elapsed=0 restart_all=0
-        while true; do
-            sleep "${LIVENESS_INTERVAL}" &
-            wait $! || true
-            for i in "${!worker_pids[@]}"; do
-                if ! kill -0 "${worker_pids[$i]}" 2>/dev/null; then
-                    wait "${worker_pids[$i]}" 2>/dev/null || true
-                    echo "[dolphin] worker [${gpu_sets[$i]}] exited; restarting" >&2
-                    refresh_binary
-                    spawn_instance "${i}"
-                    # A worker exits to self-update onto a freshly published binary; refresh_binary
-                    # just pulled it, so re-baseline the etag — otherwise the poll below still sees
-                    # the old baseline and forces a redundant full restart of every worker.
-                    running_etag="$(published_etag || true)"
-                fi
-            done
-            elapsed=$((elapsed + LIVENESS_INTERVAL))
-            if (( elapsed < CHECK_INTERVAL )); then
-                continue
-            fi
-            elapsed=0
-            local latest_etag
-            latest_etag="$(published_etag || true)"
-            if [[ -n "${latest_etag}" && -n "${running_etag}" && "${latest_etag}" != "${running_etag}" ]]; then
-                echo "[dolphin] new worker binary published; restarting workers to update" >&2
-                restart_all=1
-                break
-            fi
-        done
-
-        if (( restart_all )); then
-            terminate_workers
-            echo "[dolphin] workers stopped for update; restarting in 5s" >&2
-            sleep 5
-        fi
-    done
+    run_worker_supervisor_loop
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
