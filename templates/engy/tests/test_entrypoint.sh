@@ -31,7 +31,7 @@ new_sandbox() {
 #!/usr/bin/env bash
 echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
 case "$*" in
-    *engy_miner.py*) sleep 30 ;;
+    *engy_miner.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
     *) sleep 30 ;;
 esac
 STUB
@@ -107,6 +107,46 @@ new_sandbox 8
 run_entrypoint env MINER_KEY=mk-test
 miners="$(grep -c "engy_miner.py" "${SANDBOX}/calls.log")"
 [[ "${miners}" -eq 1 ]] && pass "8 GPUs -> 1 miner (one hotkey, one blast radius)" || fail "8 GPUs -> ${miners} miners"
+rm -rf "${SANDBOX}"
+
+echo "== the miner's stdout is kept on disk =="
+# On a miner's host the container's stdout goes to a docker pipe we have no access to, so this file
+# is the only record of why a routed request failed.
+new_sandbox 1
+run_entrypoint env MINER_KEY=mk-test
+miner_log="${SANDBOX}/home/logs/miner.log"
+if [[ -f "${miner_log}" ]] && grep -q "stub speaking on stdout" "${miner_log}"; then
+    pass "miner output is tee'd to ${miner_log##*/}"
+else
+    fail "miner output not captured: $(ls "${SANDBOX}/home/logs" 2>&1)"
+fi
+rm -rf "${SANDBOX}"
+
+echo "== SIGTERM stops the container promptly =="
+# A filler stop gets FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s) before the platform gives up. The log
+# trimmer loops forever, so if shutdown() does not kill it first, the bare `wait` never returns.
+new_sandbox 1
+CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" \
+ENGY_HOME="${SANDBOX}/home" ENGY_MINER_DIR="${SANDBOX}/miner" \
+    env MINER_KEY=mk-test bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
+entrypoint_pid=$!
+for _ in $(seq 1 50); do
+    grep -q "engy_miner.py" "${SANDBOX}/calls.log" 2>/dev/null && break
+    sleep 0.2
+done
+kill -TERM "${entrypoint_pid}" 2>/dev/null
+stopped=""
+for _ in $(seq 1 50); do            # 10s ceiling, well inside the platform's 30s
+    kill -0 "${entrypoint_pid}" 2>/dev/null || { stopped=yes; break; }
+    sleep 0.2
+done
+if [[ -n "${stopped}" ]]; then
+    pass "exited on SIGTERM without waiting on the log trimmer"
+else
+    fail "still running 10s after SIGTERM"
+    kill -KILL "${entrypoint_pid}" 2>/dev/null
+fi
+wait "${entrypoint_pid}" 2>/dev/null
 rm -rf "${SANDBOX}"
 
 echo

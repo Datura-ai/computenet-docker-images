@@ -1,4 +1,4 @@
-"""Expose the engy container's token counters on :9101 for the platform scraper.
+"""Expose the engy container's token counters and miner log on :9101 for the platform.
 
 Same contract as the Dolphin sidecar (bearer token, fail-closed, port 9101), different plumbing:
 sglang serves Prometheus metrics over HTTP rather than a unix socket, and an engy container runs ONE
@@ -7,8 +7,14 @@ node total is a sum in the query, and a single wedged card stays visible on its 
 
   ENGY_METRICS_TARGETS=http://127.0.0.1:8000,http://127.0.0.1:8001 METRICS_TOKEN=… python3 metrics_sidecar.py
 
-Without METRICS_TOKEN it refuses to start: an unauthenticated metrics port on a miner's host would
-publish our token throughput to whoever scans it.
+Two routes, both behind the same bearer token:
+  /metrics        every engine's Prometheus exposition, stamped with the engine port
+  /logs?tail=N    the tail of the miner's log, because on a miner's host the container's stdout goes
+                  to a docker pipe we cannot reach, and that log is the only record of WHY a routed
+                  request failed
+
+Without METRICS_TOKEN it refuses to start: an unauthenticated port on a miner's host would publish
+our token throughput, and now our logs, to whoever scans it.
 """
 
 import http.server
@@ -22,6 +28,11 @@ PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN: str = os.environ.get("METRICS_TOKEN", "")
 TARGETS: list[str] = [t.strip() for t in os.environ.get("ENGY_METRICS_TARGETS", "").split(",") if t.strip()]
 FETCH_TIMEOUT_SECONDS: float = 5.0
+# The miner's log, tee'd to disk by the entrypoint. Served on /logs so a failure can be read without
+# SSH into the container and without host access to `docker logs`, which we never have on a miner box.
+LOG_FILE: str = os.environ.get("ENGY_LOG_FILE", "/opt/engy/logs/miner.log")
+LOG_TAIL_DEFAULT_BYTES: int = 262144
+LOG_TAIL_MAX_BYTES: int = 8388608
 
 # A Prometheus sample line: name, optional {labels}, then the value. HELP/TYPE lines and blanks pass
 # through untouched — rewriting them would break the exposition format.
@@ -84,6 +95,28 @@ def collect() -> tuple[bytes, int]:
     return ("\n".join(chunks) + "\n").encode("utf-8"), reachable
 
 
+def read_log_tail(max_bytes: int) -> bytes:
+    """The last `max_bytes` of the miner log, starting at the first whole line."""
+    try:
+        size: int = os.path.getsize(LOG_FILE)
+        with open(LOG_FILE, "rb") as handle:
+            handle.seek(max(0, size - max_bytes))
+            tail: bytes = handle.read()
+    except OSError as error:
+        return f"log unavailable: {error!r}\n".encode()
+    newline: int = tail.find(b"\n")
+    return tail[newline + 1:] if size > max_bytes and newline != -1 else tail
+
+
+def requested_tail_bytes(path: str) -> int:
+    query: str = path.split("?", 1)[1] if "?" in path else ""
+    for pair in query.split("&"):
+        key, _, value = pair.partition("=")
+        if key == "tail" and value.isdigit():
+            return min(int(value), LOG_TAIL_MAX_BYTES)
+    return LOG_TAIL_DEFAULT_BYTES
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -101,11 +134,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.split("?")[0] != "/metrics":
+        route: str = self.path.split("?")[0]
+        if route not in ("/metrics", "/logs"):
             self._reply(404, b"not found\n", "text/plain")
             return
         if not self._authorized():
             self._reply(401, b"unauthorized\n", "text/plain")
+            return
+        if route == "/logs":
+            self._reply(200, read_log_tail(requested_tail_bytes(self.path)), "text/plain")
             return
         body, reachable = collect()
         # 503 when nothing answered: an empty 200 reads as "this node earns zero", which is a very

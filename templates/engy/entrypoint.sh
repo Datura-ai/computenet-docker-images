@@ -26,6 +26,12 @@ PER_ENGINE_REQUESTS="${ENGY_MAX_RUNNING_REQUESTS:-8}"
 FIRST_PORT="${ENGY_FIRST_PORT:-8000}"
 # The gateway's own model spec forces this; sglang refuses a shorter context for it.
 CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
+# The miner's own stdout is the ONLY place that says why a routed request failed, and on a miner's
+# host it goes to a docker pipe we cannot reach. Keep a copy on disk so the log survives to be read
+# over SSH or pulled from the sidecar's /logs.
+LOG_DIR="${ENGY_LOG_DIR:-${ENGY_HOME}/logs}"
+LOG_FILE="${LOG_DIR}/miner.log"
+LOG_MAX_BYTES="${ENGY_LOG_MAX_BYTES:-268435456}"   # 256MB, head-trimmed in place
 
 if [[ -z "${MINER_KEY}" ]]; then
     echo "[engy] MINER_KEY is required (gateway key from provider.engy.ai)." >&2
@@ -42,7 +48,7 @@ echo "[engy] ${gpu_count} GPU(s) -> ${gpu_count} engine(s), ${PER_ENGINE_REQUEST
 export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
 export HF_HOME="${ENGY_HOME}/hf"
 
-mkdir -p "${CKPT_DIR}" "${HF_HOME}"
+mkdir -p "${CKPT_DIR}" "${HF_HOME}" "${LOG_DIR}"
 if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
     echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
     HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
@@ -50,6 +56,7 @@ fi
 
 serve_pids=()
 miner_pid=""
+trim_log_pid=""
 
 # SIGTERM is a DROP, not a drain. A customer rental stops the filler and must not wait: the platform
 # only allows FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s) and a real drain of 262k-context requests can
@@ -57,6 +64,9 @@ miner_pid=""
 # only the in-flight requests are lost — bounded by MAX_INFLIGHT, and the error budget is 1% of the
 # day's requests. Losing the epoch to a slow stop would cost far more.
 shutdown() {
+    # The log trimmer loops forever, so it has to die BEFORE the bare wait below — otherwise the
+    # container never finishes stopping and blows the platform's 30s filler-stop budget.
+    [[ -n "${trim_log_pid}" ]] && kill -TERM "${trim_log_pid}" 2>/dev/null || true
     [[ -n "${miner_pid}" ]] && kill -TERM "${miner_pid}" 2>/dev/null || true
     for pid in "${serve_pids[@]:-}"; do kill -TERM "${pid}" 2>/dev/null || true; done
     wait 2>/dev/null || true
@@ -110,8 +120,25 @@ done
 # multi-card node the per-engine series is what shows one card gone quiet.
 if [[ -n "${METRICS_TOKEN:-}" ]]; then
     ENGY_METRICS_TARGETS="$(IFS=,; echo "${serve_urls[*]}")" \
+    ENGY_LOG_FILE="${LOG_FILE}" \
         python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" &
 fi
+
+# Head-trim the log in place rather than rotating it: `cat >` keeps the inode, so the tee holding the
+# file open keeps writing to the same one. A rename would leave tee appending to an unlinked file.
+trim_log() {
+    while true; do
+        sleep 300
+        local size
+        size="$(stat -c %s "${LOG_FILE}" 2>/dev/null || echo 0)"
+        if [[ "${size}" -gt "${LOG_MAX_BYTES}" ]]; then
+            tail -c "$((LOG_MAX_BYTES / 2))" "${LOG_FILE}" > "${LOG_FILE}.trim" &&
+                cat "${LOG_FILE}.trim" > "${LOG_FILE}" && rm -f "${LOG_FILE}.trim"
+        fi
+    done
+}
+trim_log &
+trim_log_pid=$!
 
 # The miner is supervised, the engines are not restarted — but a miner restart is NOT free:
 # WORKER_ID is uuid4() PER PROCESS (engy_miner.py:278), so every relaunch of the miner is a brand-new
@@ -133,7 +160,10 @@ while true; do
     ENGY_WORKER_NAME="${ENGY_WORKER_NAME:-$(hostname)}" \
         python3 "${ENGY_MINER_DIR}/engy_miner.py" \
         --checkpoint "${CKPT_DIR}" \
-        --serve-url "$(IFS=,; echo "${serve_urls[*]}")" &
+        --serve-url "$(IFS=,; echo "${serve_urls[*]}")" \
+        > >(tee -a "${LOG_FILE}") 2>&1 &
+    # Process substitution rather than a `| tee` pipeline: in a pipeline $! is the tee, and shutdown
+    # would then TERM the tee while the miner stayed connected to the gateway.
     miner_pid=$!
     wait "${miner_pid}" || true
     echo "[engy] miner exited — restarting as a NEW worker (back of the qualification queue) in ${MINER_RESTART_BACKOFF_SECONDS}s" >&2
