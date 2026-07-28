@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
@@ -96,24 +97,26 @@ def collect() -> tuple[bytes, int]:
 
 
 def read_log_tail(max_bytes: int) -> bytes:
-    """The last `max_bytes` of the miner log, starting at the first whole line."""
+    """The last `max_bytes` of the miner log, starting at the first whole line.
+
+    Reads once, into one buffer: this can be several MB and the server threads one connection per
+    client, so a slice-off-the-partial-line would double the peak for every concurrent reader.
+    """
     try:
-        size: int = os.path.getsize(LOG_FILE)
         with open(LOG_FILE, "rb") as handle:
-            handle.seek(max(0, size - max_bytes))
-            tail: bytes = handle.read()
+            size: int = os.fstat(handle.fileno()).st_size
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+                handle.readline()
+            return handle.read()
     except OSError as error:
         return f"log unavailable: {error!r}\n".encode()
-    newline: int = tail.find(b"\n")
-    return tail[newline + 1:] if size > max_bytes and newline != -1 else tail
 
 
-def requested_tail_bytes(path: str) -> int:
-    query: str = path.split("?", 1)[1] if "?" in path else ""
-    for pair in query.split("&"):
-        key, _, value = pair.partition("=")
-        if key == "tail" and value.isdigit():
-            return min(int(value), LOG_TAIL_MAX_BYTES)
+def requested_tail_bytes(query: str) -> int:
+    values: list[str] = urllib.parse.parse_qs(query).get("tail", [])
+    if values and values[0].isdigit():
+        return min(int(values[0]), LOG_TAIL_MAX_BYTES)
     return LOG_TAIL_DEFAULT_BYTES
 
 
@@ -134,7 +137,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
 
     def do_GET(self) -> None:  # noqa: N802
-        route: str = self.path.split("?")[0]
+        route, _, query = self.path.partition("?")
         if route not in ("/metrics", "/logs"):
             self._reply(404, b"not found\n", "text/plain")
             return
@@ -142,7 +145,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reply(401, b"unauthorized\n", "text/plain")
             return
         if route == "/logs":
-            self._reply(200, read_log_tail(requested_tail_bytes(self.path)), "text/plain")
+            self._reply(200, read_log_tail(requested_tail_bytes(query)), "text/plain")
             return
         body, reachable = collect()
         # 503 when nothing answered: an empty 200 reads as "this node earns zero", which is a very

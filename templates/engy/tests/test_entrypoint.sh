@@ -38,21 +38,26 @@ STUB
     chmod +x "${SANDBOX}/bin/"*
 }
 
-run_entrypoint() {
-    # Returns once the miner has been launched (or the timeout expires); the entrypoint never exits
-    # on its own, so it is killed and its recorded calls are what the assertions read.
+start_entrypoint() {
+    # Launches the entrypoint in the sandbox and returns once the miner is up (or the wait expires),
+    # leaving it running as ENTRYPOINT_PID. The entrypoint never exits on its own, so every caller
+    # has to stop it; its recorded calls are what the assertions read.
     CALLS_LOG="${SANDBOX}/calls.log" \
     PATH="${SANDBOX}/bin:${PATH}" \
     ENGY_HOME="${SANDBOX}/home" \
     ENGY_MINER_DIR="${SANDBOX}/miner" \
     "$@" bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
-    local pid=$!
+    ENTRYPOINT_PID=$!
     for _ in $(seq 1 50); do
         grep -q "engy_miner.py" "${SANDBOX}/calls.log" 2>/dev/null && break
         sleep 0.2
     done
-    kill -TERM "${pid}" 2>/dev/null
-    wait "${pid}" 2>/dev/null
+}
+
+run_entrypoint() {
+    start_entrypoint "$@"
+    kill -TERM "${ENTRYPOINT_PID}" 2>/dev/null
+    wait "${ENTRYPOINT_PID}" 2>/dev/null
 }
 
 echo "== a missing MINER_KEY is refused before anything starts =="
@@ -123,31 +128,33 @@ fi
 rm -rf "${SANDBOX}"
 
 echo "== SIGTERM stops the container promptly =="
-# A filler stop gets FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s) before the platform gives up. The log
-# trimmer loops forever, so if shutdown() does not kill it first, the bare `wait` never returns.
-new_sandbox 1
-CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" \
-ENGY_HOME="${SANDBOX}/home" ENGY_MINER_DIR="${SANDBOX}/miner" \
-    env MINER_KEY=mk-test bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
-entrypoint_pid=$!
-for _ in $(seq 1 50); do
-    grep -q "engy_miner.py" "${SANDBOX}/calls.log" 2>/dev/null && break
-    sleep 0.2
-done
-kill -TERM "${entrypoint_pid}" 2>/dev/null
-stopped=""
-for _ in $(seq 1 50); do            # 10s ceiling, well inside the platform's 30s
-    kill -0 "${entrypoint_pid}" 2>/dev/null || { stopped=yes; break; }
-    sleep 0.2
-done
-if [[ -n "${stopped}" ]]; then
-    pass "exited on SIGTERM without waiting on the log trimmer"
-else
-    fail "still running 10s after SIGTERM"
-    kill -KILL "${entrypoint_pid}" 2>/dev/null
-fi
-wait "${entrypoint_pid}" 2>/dev/null
-rm -rf "${SANDBOX}"
+# A filler stop gets FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s) before the platform gives up, and
+# shutdown() ends in a bare `wait`. Every long-lived child must be killed before it: the log trimmer
+# loops forever, and the sidecar serves forever. Run it with and without METRICS_TOKEN, because only
+# the token case starts the sidecar and that is the case production actually runs.
+assert_stops_on_sigterm() {
+    local case_name="$1"
+    shift
+    new_sandbox 1
+    start_entrypoint env MINER_KEY=mk-test "$@"
+    kill -TERM "${ENTRYPOINT_PID}" 2>/dev/null
+    local stopped=""
+    for _ in $(seq 1 50); do            # 10s ceiling, well inside the platform's 30s
+        kill -0 "${ENTRYPOINT_PID}" 2>/dev/null || { stopped=yes; break; }
+        sleep 0.2
+    done
+    if [[ -n "${stopped}" ]]; then
+        pass "${case_name}: exited on SIGTERM"
+    else
+        fail "${case_name}: still running 10s after SIGTERM"
+        kill -KILL "${ENTRYPOINT_PID}" 2>/dev/null
+    fi
+    wait "${ENTRYPOINT_PID}" 2>/dev/null
+    rm -rf "${SANDBOX}"
+}
+
+assert_stops_on_sigterm "no sidecar"
+assert_stops_on_sigterm "with sidecar" METRICS_TOKEN=tok-test
 
 echo
 if [[ "${failures}" -eq 0 ]]; then

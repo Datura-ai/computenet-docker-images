@@ -29,8 +29,7 @@ CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
 # The miner's own stdout is the ONLY place that says why a routed request failed, and on a miner's
 # host it goes to a docker pipe we cannot reach. Keep a copy on disk so the log survives to be read
 # over SSH or pulled from the sidecar's /logs.
-LOG_DIR="${ENGY_LOG_DIR:-${ENGY_HOME}/logs}"
-LOG_FILE="${LOG_DIR}/miner.log"
+LOG_FILE="${ENGY_HOME}/logs/miner.log"
 LOG_MAX_BYTES="${ENGY_LOG_MAX_BYTES:-268435456}"   # 256MB, head-trimmed in place
 
 if [[ -z "${MINER_KEY}" ]]; then
@@ -48,7 +47,7 @@ echo "[engy] ${gpu_count} GPU(s) -> ${gpu_count} engine(s), ${PER_ENGINE_REQUEST
 export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
 export HF_HOME="${ENGY_HOME}/hf"
 
-mkdir -p "${CKPT_DIR}" "${HF_HOME}" "${LOG_DIR}"
+mkdir -p "${CKPT_DIR}" "${HF_HOME}" "${LOG_FILE%/*}"
 if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
     echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
     HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
@@ -57,6 +56,7 @@ fi
 serve_pids=()
 miner_pid=""
 trim_log_pid=""
+sidecar_pid=""
 
 # SIGTERM is a DROP, not a drain. A customer rental stops the filler and must not wait: the platform
 # only allows FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s) and a real drain of 262k-context requests can
@@ -64,11 +64,12 @@ trim_log_pid=""
 # only the in-flight requests are lost — bounded by MAX_INFLIGHT, and the error budget is 1% of the
 # day's requests. Losing the epoch to a slow stop would cost far more.
 shutdown() {
-    # The log trimmer loops forever, so it has to die BEFORE the bare wait below — otherwise the
-    # container never finishes stopping and blows the platform's 30s filler-stop budget.
-    [[ -n "${trim_log_pid}" ]] && kill -TERM "${trim_log_pid}" 2>/dev/null || true
-    [[ -n "${miner_pid}" ]] && kill -TERM "${miner_pid}" 2>/dev/null || true
-    for pid in "${serve_pids[@]:-}"; do kill -TERM "${pid}" 2>/dev/null || true; done
+    # EVERY long-lived child has to die before the bare wait below, or the container never finishes
+    # stopping and blows the platform's 30s filler-stop budget. The trimmer and the sidecar both loop
+    # forever, so neither ends on its own. Miner first: closing the gateway websocket stops routing.
+    for pid in "${miner_pid}" "${trim_log_pid}" "${sidecar_pid}" "${serve_pids[@]:-}"; do
+        [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
+    done
     wait 2>/dev/null || true
     exit 0
 }
@@ -122,6 +123,7 @@ if [[ -n "${METRICS_TOKEN:-}" ]]; then
     ENGY_METRICS_TARGETS="$(IFS=,; echo "${serve_urls[*]}")" \
     ENGY_LOG_FILE="${LOG_FILE}" \
         python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" &
+    sidecar_pid=$!
 fi
 
 # Head-trim the log in place rather than rotating it: `cat >` keeps the inode, so the tee holding the
@@ -130,10 +132,14 @@ trim_log() {
     while true; do
         sleep 300
         local size
-        size="$(stat -c %s "${LOG_FILE}" 2>/dev/null || echo 0)"
+        # wc -c, not stat -c: stat's flags differ between GNU and BSD, and a silent failure here
+        # would mean the trim never runs.
+        size="$(wc -c < "${LOG_FILE}" 2>/dev/null || echo 0)"
         if [[ "${size}" -gt "${LOG_MAX_BYTES}" ]]; then
-            tail -c "$((LOG_MAX_BYTES / 2))" "${LOG_FILE}" > "${LOG_FILE}.trim" &&
-                cat "${LOG_FILE}.trim" > "${LOG_FILE}" && rm -f "${LOG_FILE}.trim"
+            # `|| true` because set -e would otherwise end this background loop for good on a single
+            # failed trim, and the log would then grow unbounded with nothing saying why.
+            { tail -c "$((LOG_MAX_BYTES / 2))" "${LOG_FILE}" > "${LOG_FILE}.trim" &&
+                cat "${LOG_FILE}.trim" > "${LOG_FILE}" && rm -f "${LOG_FILE}.trim"; } || true
         fi
     done
 }
