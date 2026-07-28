@@ -68,13 +68,15 @@ sidecar_pid=""
 # only the in-flight requests are lost — bounded by MAX_INFLIGHT, and the error budget is 1% of the
 # day's requests. Losing the epoch to a slow stop would cost far more.
 shutdown() {
-    # EVERY long-lived child has to die before the bare wait below, or the container never finishes
-    # stopping and blows the platform's 30s filler-stop budget. The trimmer and the sidecar both loop
-    # forever, so neither ends on its own. Miner first: closing the gateway websocket stops routing.
+    # Miner first: closing the gateway websocket is what stops routing.
     for pid in "${miner_pid}" "${trim_log_pid}" "${sidecar_pid}" "${serve_pids[@]:-}"; do
         [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
     done
-    wait 2>/dev/null || true
+    # Wait for the MINER only, never a bare `wait`. The tee behind the exec redirect above is a child
+    # too, and it cannot see EOF while this script still holds the pipe open, so a bare wait never
+    # returns under bash 5 and the stop blows the platform's 30s filler budget. Verified on the image's
+    # own bash (5.2, Ubuntu 24.04); bash 3.2 on a laptop does not reproduce it.
+    [[ -n "${miner_pid}" ]] && wait "${miner_pid}" 2>/dev/null || true
     exit 0
 }
 trap shutdown TERM INT
