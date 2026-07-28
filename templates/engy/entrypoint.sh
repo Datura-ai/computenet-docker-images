@@ -48,6 +48,10 @@ export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims re
 export HF_HOME="${ENGY_HOME}/hf"
 
 mkdir -p "${CKPT_DIR}" "${HF_HOME}" "${LOG_FILE%/*}"
+# Capture the WHOLE container's output, not just the miner's: the engines are where
+# "Triton is not supported on current platform" and a failed NVCC build show up, and the entrypoint's
+# own "engine never became ready" is the entire answer in that case.
+exec > >(tee -a "${LOG_FILE}") 2>&1
 if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
     echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
     HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
@@ -119,18 +123,29 @@ done
 
 # Token counters for the platform scraper. Every engine is scraped, not just the first — on a
 # multi-card node the per-engine series is what shows one card gone quiet.
+# Restarted with backoff, the same shape templates/dolphin uses: since it also serves /logs it is now
+# the only way to read this container from outside, and a dead sidecar would cost us exactly that
+# during the incident we wanted it for.
 if [[ -n "${METRICS_TOKEN:-}" ]]; then
-    ENGY_METRICS_TARGETS="$(IFS=,; echo "${serve_urls[*]}")" \
-    ENGY_LOG_FILE="${LOG_FILE}" \
-        python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" &
+    (
+        while true; do
+            ENGY_METRICS_TARGETS="$(IFS=,; echo "${serve_urls[*]}")" \
+            ENGY_LOG_FILE="${LOG_FILE}" \
+                python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" || true
+            sleep 5
+        done
+    ) &
     sidecar_pid=$!
 fi
 
 # Head-trim the log in place rather than rotating it: `cat >` keeps the inode, so the tee holding the
 # file open keeps writing to the same one. A rename would leave tee appending to an unlinked file.
-trim_log() {
+trim_log_forever() {
     while true; do
-        sleep 300
+        # Backgrounded sleep + wait, the same idiom templates/dolphin uses: a foreground sleep would
+        # hold a TERM until the nap ended, leaving an orphaned sleep behind on every stop.
+        sleep 300 &
+        wait $! || true
         local size
         # wc -c, not stat -c: stat's flags differ between GNU and BSD, and a silent failure here
         # would mean the trim never runs.
@@ -143,7 +158,7 @@ trim_log() {
         fi
     done
 }
-trim_log &
+trim_log_forever &
 trim_log_pid=$!
 
 # The miner is supervised, the engines are not restarted — but a miner restart is NOT free:
@@ -166,10 +181,7 @@ while true; do
     ENGY_WORKER_NAME="${ENGY_WORKER_NAME:-$(hostname)}" \
         python3 "${ENGY_MINER_DIR}/engy_miner.py" \
         --checkpoint "${CKPT_DIR}" \
-        --serve-url "$(IFS=,; echo "${serve_urls[*]}")" \
-        > >(tee -a "${LOG_FILE}") 2>&1 &
-    # Process substitution rather than a `| tee` pipeline: in a pipeline $! is the tee, and shutdown
-    # would then TERM the tee while the miner stayed connected to the gateway.
+        --serve-url "$(IFS=,; echo "${serve_urls[*]}")" &
     miner_pid=$!
     wait "${miner_pid}" || true
     echo "[engy] miner exited — restarting as a NEW worker (back of the qualification queue) in ${MINER_RESTART_BACKOFF_SECONDS}s" >&2

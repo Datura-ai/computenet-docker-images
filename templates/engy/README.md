@@ -35,10 +35,24 @@ worker zeroes the whole key for that day.
 | `MODEL` | no | `qwen3.6-35b-a3b` | the gateway's model id |
 | `ENGY_MAX_RUNNING_REQUESTS` | no | `8` | per engine; the sum is declared to the gateway as `MAX_INFLIGHT` |
 | `ENGY_WORKER_NAME` | no | hostname | must be unique per machine when several share one key |
-| `METRICS_TOKEN` | no | — | when set, the metrics sidecar is started on `:9101` |
+| `METRICS_TOKEN` | no | — | when set, the sidecar is started on `:9101` |
+| `ENGY_LOG_MAX_BYTES` | no | `268435456` | the on-disk log is head-trimmed back to half this size |
 
 `ENGY_HOME` (default `/opt/engy`) is the shared cache volume: the ~35GB FP8 checkpoint is pulled
 there once so a re-created container starts warm.
+
+## Reading a container's log
+
+The container's stdout goes to a docker pipe on the miner's host, and we never have host access, so
+everything the entrypoint, the engines and the miner print is also written to
+`$ENGY_HOME/logs/miner.log`. With `METRICS_TOKEN` set the sidecar serves it:
+
+```
+GET :9101/logs?tail=<bytes>    Authorization: Bearer $METRICS_TOKEN
+```
+
+`tail` defaults to 256KB and is capped at 8MB; the response always starts at a whole line. Same
+token and port as `/metrics`.
 
 ## Why this base image
 

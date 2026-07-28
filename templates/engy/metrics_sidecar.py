@@ -114,9 +114,9 @@ def read_log_tail(max_bytes: int) -> bytes:
 
 
 def requested_tail_bytes(query: str) -> int:
-    values: list[str] = urllib.parse.parse_qs(query).get("tail", [])
-    if values and values[0].isdigit():
-        return min(int(values[0]), LOG_TAIL_MAX_BYTES)
+    tail_values: list[str] = urllib.parse.parse_qs(query).get("tail", [])
+    if tail_values and tail_values[0].isdigit():
+        return min(int(tail_values[0]), LOG_TAIL_MAX_BYTES)
     return LOG_TAIL_DEFAULT_BYTES
 
 
