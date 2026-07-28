@@ -42,6 +42,12 @@ WATCHDOG_STATE_DIR="${DOLPHIN_WATCHDOG_STATE_DIR:-/tmp}"
 API_KEY="${DOLPHIN_API_KEY:-}"
 MODEL="${DOLPHIN_MODEL:-nvidia/Qwen3.6-35B-A3B-NVFP4}"
 WORKER_TYPE="${DOLPHIN_WORKER_TYPE:-text-v}"
+# The worker writes its python runtime here on first start; bin/vllm inside it is the engine
+# launcher the intra-card split wraps (DAH-2473), and bin/python the interpreter that runs it.
+RUNTIME_BIN_DIR="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
+ENGINE_LAUNCHER="${RUNTIME_BIN_DIR}/vllm"
+# Where the vendor's own launcher is kept once the wrapper takes its place.
+VENDOR_ENGINE_LAUNCHER="${RUNTIME_BIN_DIR}/vllm.real"
 # Public, stable worker-binary URL (linux/amd64 only — the worker ships no arm64 build). `update`
 # refreshes it after first launch. Override only if Dolphin moves the download.
 WORKER_URL="${DOLPHIN_WORKER_URL:-https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64}"
@@ -190,60 +196,35 @@ emit_worker_plan() {
 # Marker that tells our wrapper apart from the vendor's console script.
 ENGINE_WRAPPER_MARKER="dolphin-intra-card-vram-wrapper"
 
-# "Installed" has to mean runnable, not merely marked: the wrapper's whole body is a runpy of
-# vllm.real, so a marked wrapper whose vllm.real is gone launches nothing at all — and every
-# repair path here is gated on this answer, so calling that state installed is what makes it
-# permanent. It is the shared launcher, so the node's unsplit containers die on it too.
+# "Installed" has to mean runnable AND ours, not merely marked:
+#   - the wrapper's whole body is a runpy of vllm.real, so a marked wrapper whose vllm.real is
+#     gone launches nothing at all — and every repair path here is gated on this answer, so
+#     calling that state installed is what makes it permanent. It is the shared launcher, so the
+#     node's unsplit containers die on it too.
+#   - the share file's PATH is baked in at install time, and it is the one per-container value
+#     inside a node-shared script. A wrapper installed by a container that reads its divisor
+#     somewhere else would leave this container's count unread, i.e. every engine claiming a
+#     whole card, so a foreign path is reinstalled rather than trusted.
 engine_memory_wrapper_installed() {
-    local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
-    [[ -f "${bin_dir}/vllm" ]] && [[ -f "${bin_dir}/vllm.real" ]] \
-        && grep -q "${ENGINE_WRAPPER_MARKER}" "${bin_dir}/vllm"
+    [[ -f "${ENGINE_LAUNCHER}" ]] && [[ -f "${VENDOR_ENGINE_LAUNCHER}" ]] \
+        && grep -q "${ENGINE_WRAPPER_MARKER}" "${ENGINE_LAUNCHER}" \
+        && grep -qF "SHARE_FILE = \"${ENGINES_PER_CARD_FILE}\"" "${ENGINE_LAUNCHER}"
 }
 
-# The worker execs `<runtime>/bin/vllm serve ... --gpu-memory-utilization 0.85`, and vLLM sizes
-# that fraction against the card's TOTAL memory. So the second worker on a card asks for memory
-# the first one already holds and dies at init — the reproducible blocker DAH-2473 hit. The
-# fraction is hardcoded in the closed worker binary and worker.json exposes no knob for it, but
-# the runtime lives inside DOLPHIN_HOME, which is our volume, so the file the worker execs can be
-# wrapped. The wrapper only divides that one flag and then defers to the untouched vendor script
-# via runpy, so a vendor change to its contents cannot break us.
-install_engine_memory_wrapper() {
-    local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
-    local wrapper="${bin_dir}/vllm" real="${bin_dir}/vllm.real"
-    if [[ ! -f "${wrapper}" ]]; then
-        # The worker writes its runtime only once it starts, which is what prime_engine_runtime is
-        # for. There is nothing to wrap, so the caller runs unsplit rather than crash-looping N-1
-        # engines that each claim the whole card.
-        echo "[dolphin] engine runtime not present; nothing to wrap" >&2
-        return 1
-    fi
-    if ! engine_memory_wrapper_installed; then
-        if grep -q "${ENGINE_WRAPPER_MARKER}" "${wrapper}"; then
-            # Our own marker with no vllm.real beside it: the vendor script this wrapper defers to
-            # is gone and only the worker can write it back. Staging what is here would copy the
-            # wrapper onto vllm.real and make it runpy itself forever, so refuse and say so — a
-            # crash-looping engine at least names the file it could not open.
-            echo "[dolphin] engine wrapper has no vendor script to defer to; leaving it alone" >&2
-            return 1
-        fi
-        # Vendor script in place: either the first install, or a self-update overwrote us. If it
-        # cannot be staged, refuse — a wrapper whose vllm.real is missing launches nothing at all.
-        if ! cp -p "${wrapper}" "${real}"; then
-            echo "[dolphin] cannot stage ${real}; leaving the vendor engine script alone" >&2
-            return 1
-        fi
-    fi
-    local staged heredoc_status
-    staged="$(mktemp "${bin_dir}/.vllm.XXXXXX")" || return 1
-    cat >"${staged}" <<EOF
-#!${bin_dir}/python
+# The wrapper's source, kept in its own function so install_engine_memory_wrapper reads as the
+# steps it performs rather than as one long string literal. The heredoc's own exit status is
+# this function's, which is what lets the caller tell a truncated write from a good one.
+write_engine_memory_wrapper_script() {
+    local destination="$1"
+    cat >"${destination}" <<EOF
+#!${RUNTIME_BIN_DIR}/python
 # ${ENGINE_WRAPPER_MARKER} (DAH-2473)
 """Claim only this worker's share of the card, then run the vendor's launcher unchanged."""
 import runpy
 import sys
 
 SHARE_FILE = "${ENGINES_PER_CARD_FILE}"
-REAL = "${real}"
+REAL = "${VENDOR_ENGINE_LAUNCHER}"
 
 # How many workers this CONTAINER puts on one card, read at launch rather than baked in: this
 # script lives on the volume every filler container of the node shares, so one number written
@@ -288,7 +269,44 @@ except Exception:
 
 runpy.run_path(REAL, run_name="__main__")
 EOF
-    heredoc_status=$?
+}
+
+# The worker execs `<runtime>/bin/vllm serve ... --gpu-memory-utilization 0.85`, and vLLM sizes
+# that fraction against the card's TOTAL memory. So the second worker on a card asks for memory
+# the first one already holds and dies at init — the reproducible blocker DAH-2473 hit. The
+# fraction is hardcoded in the closed worker binary and worker.json exposes no knob for it, but
+# the runtime lives inside DOLPHIN_HOME, which is our volume, so the file the worker execs can be
+# wrapped. The wrapper only divides that one flag and then defers to the untouched vendor script
+# via runpy, so a vendor change to its contents cannot break us.
+install_engine_memory_wrapper() {
+    if [[ ! -f "${ENGINE_LAUNCHER}" ]]; then
+        # The worker writes its runtime only once it starts, which is what prime_engine_runtime is
+        # for. There is nothing to wrap, so the caller runs unsplit rather than crash-looping N-1
+        # engines that each claim the whole card.
+        echo "[dolphin] engine runtime not present; nothing to wrap" >&2
+        return 1
+    fi
+    # Whether the vendor's script still has to be staged is answered by the MARKER alone, never by
+    # engine_memory_wrapper_installed: that one also refuses a wrapper whose baked share path is
+    # not ours, and such a wrapper is re-written from the vllm.real already beside it, not staged
+    # over again.
+    if ! grep -q "${ENGINE_WRAPPER_MARKER}" "${ENGINE_LAUNCHER}"; then
+        # Vendor script in place: either the first install, or a self-update overwrote us. If it
+        # cannot be staged, refuse — a wrapper whose vllm.real is missing launches nothing at all.
+        if ! cp -p "${ENGINE_LAUNCHER}" "${VENDOR_ENGINE_LAUNCHER}"; then
+            echo "[dolphin] cannot stage ${VENDOR_ENGINE_LAUNCHER}; leaving the vendor engine script alone" >&2
+            return 1
+        fi
+    elif [[ ! -f "${VENDOR_ENGINE_LAUNCHER}" ]]; then
+        # Our own marker with no vllm.real beside it: the vendor script this wrapper defers to
+        # is gone and only the worker can write it back. Staging what is here would copy the
+        # wrapper onto vllm.real and make it runpy itself forever, so refuse and say so — a
+        # crash-looping engine at least names the file it could not open.
+        echo "[dolphin] engine wrapper has no vendor script to defer to; leaving it alone" >&2
+        return 1
+    fi
+    local staged
+    staged="$(mktemp "${RUNTIME_BIN_DIR}/.vllm.XXXXXX")" || return 1
     # Staged and renamed rather than written in place (DAH-2475): a worker in a sibling container
     # can exec this path at any moment, and a half-written script is not a launcher. mktemp opens
     # at 0600, so the mode is set to the vendor script's own 0755 rather than merely +x: this path
@@ -296,10 +314,12 @@ EOF
     # installed it.
     #
     # Every step is checked because the caller reads a non-zero return as "run unsplit". A full
-    # DOLPHIN_HOME truncates the heredoc, and publishing that would leave every filler container
+    # DOLPHIN_HOME truncates the script, and publishing that would leave every filler container
     # on the node without a launcher at all — vllm.real is already staged, so there is nothing
     # left to fall back to.
-    if (( heredoc_status != 0 )) || ! chmod 0755 "${staged}" || ! mv -f "${staged}" "${wrapper}"; then
+    if ! write_engine_memory_wrapper_script "${staged}" \
+        || ! chmod 0755 "${staged}" \
+        || ! mv -f "${staged}" "${ENGINE_LAUNCHER}"; then
         rm -f "${staged}"
         echo "[dolphin] cannot write the engine VRAM wrapper; leaving the vendor engine script alone" >&2
         return 1
@@ -561,7 +581,6 @@ kill_leftover_engines() {
 # prod nodes the launcher's mtime preceded the first tokens by 3-5 minutes.
 prime_engine_runtime() {
     local gpu_set="$1" prime_home="$2" shared_cache="$3"
-    local engine_script="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin/vllm"
 
     prepare_instance_home "${prime_home}" "${shared_cache}"
     render_worker_config "${prime_home}/.config/dolphinpod" "${gpu_set}"
@@ -572,7 +591,7 @@ prime_engine_runtime() {
     trap 'stop_prime_worker; exit 0' TERM INT
 
     local waited=0
-    while [[ ! -f "${engine_script}" ]]; do
+    while [[ ! -f "${ENGINE_LAUNCHER}" ]]; do
         if ! kill -0 "${PRIME_WORKER_PID}" 2>/dev/null; then
             echo "[dolphin] the priming worker exited before writing the engine launcher" >&2
             break
@@ -604,7 +623,7 @@ prime_engine_runtime() {
 
     # The card is free, so a missing launcher is only "no split this start" — one unsplit worker
     # on an empty card is a correct outcome, and the loop above already said why it is missing.
-    [[ -f "${engine_script}" ]] || return 1
+    [[ -f "${ENGINE_LAUNCHER}" ]] || return 1
     echo "[dolphin] engine launcher on disk after ${waited}s; priming worker stopped" >&2
 }
 
@@ -680,7 +699,7 @@ ensure_engine_memory_wrapper() {
 # just crash-loop N-1 of them, and a container with the card to itself is a correct outcome. The
 # one failure that does NOT fall back is a card still held after priming — prime_engine_runtime
 # ends the container there, because no layout works on memory that is already gone.
-resolve_intra_card_split() {
+resolve_and_apply_intra_card_split() {
     local gpu_set="$1" base_home="$2" shared_cache="$3"
     local bundle_cards bundle_vram
     read -r bundle_cards bundle_vram < <(gpu_cards_and_field_total "${gpu_set}" memory.total)
@@ -689,7 +708,7 @@ resolve_intra_card_split() {
     # Phase 1: on a cold container there is no engine launcher to wrap yet, so one throwaway
     # worker puts it on disk and is stopped again before the real instances start. A container
     # whose DOLPHIN_HOME already holds the runtime skips straight to the install below.
-    if (( WORKERS_PER_BUNDLE > 1 )) && [[ ! -f "${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin/vllm" ]]; then
+    if (( WORKERS_PER_BUNDLE > 1 )) && [[ ! -f "${ENGINE_LAUNCHER}" ]]; then
         if ! prime_engine_runtime "${gpu_set}" "${base_home}/dolphin-workers/prime" "${shared_cache}"; then
             WORKERS_PER_BUNDLE=1
         fi
@@ -731,7 +750,7 @@ main() {
     # Lium nodes are homogeneous, so the first bundle decides the layout for all of them.
     # emit_worker_plan is the identity at one worker per bundle, so the unsplit fleet needs no
     # branch here — N=1 is just a case of N.
-    resolve_intra_card_split "${gpu_sets[0]}" "${base_home}" "${shared_cache}"
+    resolve_and_apply_intra_card_split "${gpu_sets[0]}" "${base_home}" "${shared_cache}"
     local expanded=()
     while IFS= read -r gpu_set_line; do
         [[ -n "${gpu_set_line}" ]] && expanded+=("${gpu_set_line}")
