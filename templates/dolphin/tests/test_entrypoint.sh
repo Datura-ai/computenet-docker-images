@@ -38,7 +38,7 @@ make_sandbox() {
     export DOLPHIN_WATCHDOG_STATE_DIR="${SANDBOX}/state"
     # Container-local in production (/tmp), sandbox-local here: a test must never publish a
     # divisor to the machine it runs on.
-    export DOLPHIN_ENGINE_SHARE_FILE="${SANDBOX}/engine-share"
+    export DOLPHIN_ENGINES_PER_CARD_FILE="${SANDBOX}/engines-per-card"
     mkdir -p "${HOME}" "${DOLPHIN_WATCHDOG_STATE_DIR}"
 }
 
@@ -79,8 +79,14 @@ mock_gpu_memory_used() {
 # Source the entrypoint's function definitions only (main is guarded by BASH_SOURCE).
 load_entrypoint() {
     export DOLPHIN_API_KEY="dp-test"
+    # The entrypoint sets -euo pipefail for its own run, and sourcing leaks that into the harness:
+    # under -e the first non-zero probe kills the whole suite mid-run, which looks the same as a
+    # clean exit 1 whether or not anything actually failed. Put the harness's own options back.
+    local harness_opts
+    harness_opts="$(set +o)"
     # shellcheck disable=SC1090
     source "${ENTRYPOINT}"
+    eval "${harness_opts}"
 }
 
 plan_as_line() {
@@ -437,11 +443,33 @@ test_intra_card_plan() {
     assert_eq "a bundle of unknown size is not split" "1" "$(derive_workers_per_bundle 1 0)"
 
     mock_nvidia_smi "0:143771"
-    assert_eq "'all' on a one-card node measures that card" "1 143771" "$(bundle_cards_and_vram all)"
+    assert_eq "'all' on a one-card node measures that card" "1 143771" "$(gpu_cards_and_field_total all memory.total)"
     mock_nvidia_smi "0:143771" "1:143771" "2:143771" "3:143771"
-    assert_eq "'all' on a four-card node measures all of them" "4 575084" "$(bundle_cards_and_vram all)"
-    assert_eq "a pinned bundle measures only its own cards" "2 287542" "$(bundle_cards_and_vram 1,2)"
-    assert_eq "card 10 is not matched by card 1" "1 143771" "$(bundle_cards_and_vram 1)"
+    assert_eq "'all' on a four-card node measures all of them" "4 575084" "$(gpu_cards_and_field_total all memory.total)"
+    assert_eq "a pinned bundle measures only its own cards" "2 287542" "$(gpu_cards_and_field_total 1,2 memory.total)"
+    assert_eq "card 10 is not matched by card 1" "1 143771" "$(gpu_cards_and_field_total 1 memory.total)"
+
+    # A partially failed card prints [N/A] / [Unknown Error] for its field while the rest of the
+    # node still reports, and that string reaching $(( )) aborts the subshell this answers from.
+    mock_nvidia_smi "0:143771" "1:[N/A]" "2:143771" "3:[Unknown Error]"
+    assert_eq "a card that stopped reporting is left out of the total" "2 287542" \
+        "$(gpu_cards_and_field_total all memory.total 2>/dev/null)"
+    # Silence would understate the count and the total with nothing to explain either.
+    assert_eq "and every skipped card is named on stderr" "1 3" \
+        "$(gpu_cards_and_field_total all memory.total 2>&1 >/dev/null \
+            | sed -n 's/.*GPU \([0-9][0-9]*\) reports.*/\1/p' | paste -sd' ' -)"
+    mock_nvidia_smi "0:[N/A]"
+    assert_eq "a node where no card answers reads as nothing measured" "0 0" \
+        "$(gpu_cards_and_field_total all memory.total 2>/dev/null)"
+
+    # The failure this prevents is not a wrong number but a dead container: `read` gets EOF from
+    # the aborted subshell and set -e ends the run. The harness drops -e, so put it back for the
+    # one probe that needs it — wait_for_gpu_memory_release polls memory.used every 5s for up to
+    # 300s, so a single bad sample anywhere in that window used to be enough.
+    mock_nvidia_smi "0:143771" "1:143771"
+    mock_gpu_memory_used "0:12" "1:[N/A]"
+    assert_eq "a junk memory.used sample no longer ends the container under set -e" "0" \
+        "$(bash -c "set -euo pipefail; source '${ENTRYPOINT}'; wait_for_gpu_memory_release all" >/dev/null 2>&1; echo $?)"
 
     WORKERS_PER_BUNDLE=2
     assert_eq "each bundle is claimed by two workers" "0|0|1|1" \
@@ -470,10 +498,10 @@ test_engine_memory_wrapper() {
     make_sandbox
     export DOLPHIN_HOME="${SANDBOX}/dolphin"
     load_entrypoint
-    # main resolves this per bundle; publish_engine_share is what turns it into a VRAM fraction,
+    # main resolves this per bundle; publish_engines_per_card is what turns it into a VRAM fraction,
     # and the wrapper reads that at every launch instead of carrying a number of its own.
     WORKERS_PER_BUNDLE=2
-    publish_engine_share
+    publish_engines_per_card
 
     assert_fails "a missing runtime refuses so the caller can fall back" \
         install_engine_memory_wrapper
@@ -531,11 +559,26 @@ EOF
         "VENDOR2 serve m --gpu-memory-utilization 0.4250" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
 
+    # The wrapper is nothing but a runpy of vllm.real, so losing that file kills every engine on
+    # the node, unsplit siblings included. A marked wrapper is therefore not an installed one, and
+    # the re-stage must never reach for the wrapper as if it were the vendor's script.
+    rm -f "${bin_dir}/vllm.real"
+    assert_fails "a wrapper without its vendor script does not count as installed" \
+        engine_memory_wrapper_installed
+    assert_fails "and it is not repairable, so the caller falls back instead of looping" \
+        install_engine_memory_wrapper
+    assert_eq "the wrapper is never staged onto vllm.real, which would runpy itself forever" "no" \
+        "$([[ -f "${bin_dir}/vllm.real" ]] && echo yes || echo no)"
+    printf 'import sys\nprint("VENDOR2 " + " ".join(sys.argv[1:]))\n' >"${bin_dir}/vllm"
+    install_engine_memory_wrapper 2>/dev/null
+    assert_eq "a fresh vendor script is wrappable again" "yes" \
+        "$(engine_memory_wrapper_installed && echo yes || echo no)"
+
     # Turning the split off must give the card back — and must do it WITHOUT touching the
     # wrapper, which this node's other filler containers execute too: removing it would take
     # their divisor with them and their next engine would claim a card it does not have.
     WORKERS_PER_BUNDLE=1
-    publish_engine_share
+    publish_engines_per_card
     assert_eq "off: the vendor's claim is restored in full, wrapper still in place" \
         "VENDOR2 serve m --gpu-memory-utilization 0.85" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
@@ -545,14 +588,29 @@ EOF
     # A container that never split writes no share file at all (and /tmp keeps one from an
     # earlier split, which is why it is rewritten on every start). Either way the divisor must
     # fail safe: a whole card, not a fraction of one.
-    rm -f "${DOLPHIN_ENGINE_SHARE_FILE}"
+    rm -f "${DOLPHIN_ENGINES_PER_CARD_FILE}"
     assert_eq "no share file at all is the vendor's own claim" \
         "VENDOR2 serve m --gpu-memory-utilization 0.85" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
-    printf 'half\n' >"${DOLPHIN_ENGINE_SHARE_FILE}"
+    printf 'half\n' >"${DOLPHIN_ENGINES_PER_CARD_FILE}"
     assert_eq "a junk share is the vendor's own claim, not a crashed engine" \
         "VENDOR2 serve m --gpu-memory-utilization 0.85" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85)"
+
+    # A share that is missing, half-written, or a command line with no flag to divide all end the
+    # same way — every engine claiming a whole card — and vLLM reports that as plain OOM. The one
+    # line the wrapper writes per launch is what tells those three apart afterwards.
+    assert_eq "a junk share is reported as the whole card, not silence" \
+        "[dolphin] engine vram wrapper: divisor=1, no split, vendor claim kept" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 2>&1 >/dev/null)"
+    WORKERS_PER_BUNDLE=2
+    publish_engines_per_card
+    assert_eq "the wrapper names the divisor and the claim it rewrote" \
+        "[dolphin] engine vram wrapper: divisor=2, --gpu-memory-utilization 0.85 -> 0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 2>&1 >/dev/null)"
+    assert_eq "a split whose command line carries no flag says exactly that" \
+        "[dolphin] engine vram wrapper: divisor=2, --gpu-memory-utilization not on the command line" \
+        "$(python3 "${bin_dir}/vllm" serve m --kv-cache-dtype fp8 2>&1 >/dev/null)"
     unset DOLPHIN_HOME
 }
 
@@ -632,6 +690,19 @@ EOF
     # container, not hand the caller one more thing to fall back from.
     ( prime_engine_runtime all "${prime_home}" "${SANDBOX}/home/.cache" ) >/dev/null 2>&1 || prime_status=$?
     assert_eq "a card still held after the kill ends the container" "1" "${prime_status}"
+
+    # The other half of the same card. The launcher never appeared AND the priming engine still
+    # holds the card: the fallback is no more available here than above, because one unsplit
+    # worker asks the vendor's 0.85 of a card that is already 0.85 gone. Both refusals leave the
+    # subshell at 1, so what tells them apart is which line was logged — the "no launcher"
+    # fallback asserted earlier must NOT claim the card back, and this one must.
+    rm -rf "${DOLPHIN_HOME}/runtimes"
+    local held_log
+    held_log="$( ( prime_engine_runtime all "${prime_home}" "${SANDBOX}/home/.cache" ) 2>&1 >/dev/null )"
+    prime_status=$?
+    assert_eq "no launcher AND a held card refuses" "1" "${prime_status}"
+    assert_eq "and it refuses by ending the container, not by falling back to one worker" "yes" \
+        "$(grep -q 'ending this container' <<<"${held_log}" && echo yes || echo no)"
 
     # The engine does not always die with the worker that spawned it — the reason the wait above
     # exists at all. Needs /proc; the scan reaches only this container's processes in production,
@@ -714,7 +785,7 @@ ${SANDBOX}/home/dolphin-workers/w1-gpuall" \
         "$([[ -f "${engine_dir}/vllm.real" ]] && echo yes || echo no)"
     # The divisor the wrapper reads is this container's own file, never the shared launcher.
     assert_eq "the container publishes its own divisor" "2" \
-        "$(cat "${DOLPHIN_ENGINE_SHARE_FILE}" 2>/dev/null)"
+        "$(cat "${DOLPHIN_ENGINES_PER_CARD_FILE}" 2>/dev/null)"
     unset DOLPHIN_HOME
 }
 

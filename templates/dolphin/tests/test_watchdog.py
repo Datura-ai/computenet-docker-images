@@ -692,7 +692,7 @@ def test_bundle_series_stay_grouped_by_metric() -> None:
         for index in range(3):
             write_state_file(
                 pathlib.Path(tmp) / f"dolphin_watchdog_state_gpu{index}.json", updated=time.time(),
-                restarts=index, stall_s=0.0, gpus=str(index),
+                restarts=index, stall_s=0.0, gpus=str(index), instance=f"gpu{index}",
                 engine_socket=f"{tmp}/dp-{index}/v.sock",
             )
         with sidecar_with_state_glob(pathlib.Path(tmp), f"{tmp}/dp-*/v.sock") as base:

@@ -413,9 +413,11 @@ def watchdog_samples(state: WatchdogState) -> list[tuple[str, str]]:
         ("dolphin_watchdog_last_restart_timestamp", str(int(state.last_restart_timestamp))),
         ("dolphin_watchdog_stall_seconds", f"{state.stall_seconds:.0f}"),
     ]
-    if state.gpus:
-        # Split mode only. A watchdog that cannot identify its own engine is running and
-        # guarding nothing — indistinguishable from a healthy one without this series.
+    if state.instance:
+        # Split mode only, and keyed on the instance because that is what the watchdog itself
+        # identifies its engine by — gpus is a label, and siblings on one card share it. A
+        # watchdog that cannot find its engine is running and guarding nothing, which without
+        # this series is indistinguishable from a healthy one.
         values.append(("dolphin_watchdog_engine_found", str(int(bool(state.engine_socket)))))
     return values
 

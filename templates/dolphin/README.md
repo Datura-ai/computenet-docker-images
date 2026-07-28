@@ -48,7 +48,7 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. Also bounds how long a split waits for the priming worker to write the engine launcher. `0` = no wait, plain stagger. |
 | `DOLPHIN_PRIME_RELEASE_MB` | no | `2048`                          | Split only: how much VRAM may still be in use on the bundle after the priming worker is stopped and its engine killed. Above it the container ends rather than launching any worker into memory that is still held. |
 | `DOLPHIN_PRIME_RELEASE_SECONDS` | no | `300`                      | Split only: how long to wait for that memory to come back. |
-| `DOLPHIN_ENGINE_SHARE_FILE` | no | `/tmp/dolphin-engine-share`     | Where this container publishes how many workers share one card; the VRAM wrapper reads it at every engine launch. Keep it OFF `DOLPHIN_HOME` for the same reason as the watchdog state: that volume is shared by every filler container on the node, and one divisor per node is exactly the bug this file exists to avoid. Missing or unreadable = 1, the vendor's full claim. |
+| `DOLPHIN_ENGINES_PER_CARD_FILE` | no | `/tmp/dolphin-engines-per-card`     | Where this container publishes how many workers share one card; the VRAM wrapper reads it at every engine launch. Keep it OFF `DOLPHIN_HOME` for the same reason as the watchdog state: that volume is shared by every filler container on the node, and one divisor per node is exactly the bug this file exists to avoid. Missing or unreadable = 1, the vendor's full claim. |
 | `METRICS_TOKEN`       | no       | —                                | Bearer token for the metrics sidecar on `:9101`. Unset → the sidecar answers 503 to everything (fail closed). |
 | `DOLPHIN_ENGINES_EXPECTED` | no  | (set by the entrypoint)          | How many engines this container runs. The sidecar publishes it next to `dolphin_engines_up`, and above 1 it tags every engine's series with `dolphin_engine`. |
 | `DOLPHIN_WATCHDOG_ENABLED` | no  | `1`                              | `0` stops the entrypoint from starting any engine watchdog. |
@@ -128,9 +128,10 @@ copies it to `vllm.real` and writes a wrapper that divides that one flag.
 node, so a number written into the wrapper would be one number for all of them: an unsplit
 container could only get its whole card back by removing the wrapper, and that removal takes the
 divisor away from a still-split sibling, whose next engine then claims a card it does not have.
-Instead every container writes its own count to `DOLPHIN_ENGINE_SHARE_FILE` (default
-`/tmp/dolphin-engine-share`, container-local like the watchdog state), and the wrapper reads it at
-each launch. Once installed the wrapper stays. A missing or unreadable share means 1 — the
+Instead every container writes its own count to `DOLPHIN_ENGINES_PER_CARD_FILE` (default
+`/tmp/dolphin-engines-per-card`, container-local like the watchdog state), and the wrapper reads it at
+each launch. Once installed the wrapper stays, and it is reinstalled before every engine launch in
+case the vendor's own `update` restored its script over ours. A missing or unreadable count means 1 — the
 vendor's full claim, passed through byte for byte — which is what a container running unsplit,
 running an older image, or starting after the split was turned off needs. The file is rewritten on
 every start, including the unsplit one, because `/tmp` survives a container restart.
@@ -267,15 +268,15 @@ Tests (no GPU needed):
 ```bash
 python3 tests/test_sidecar.py            # host run against the repo copy
 python3 tests/test_watchdog.py           # same; the kill tests need /proc and SKIP on macOS
-tests/run_in_image.sh daturaai/dolphin:0.0.14  # both suites inside the image + docker-stop cleanliness
+tests/run_in_image.sh daturaai/dolphin:0.0.15  # both suites inside the image + docker-stop cleanliness
 ```
 
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.14
-VERSION=0.0.14 docker buildx bake      # override the tag
+docker buildx bake                     # daturaai/dolphin:0.0.15
+VERSION=0.0.15 docker buildx bake      # override the tag
 ```
 
 ## Run
