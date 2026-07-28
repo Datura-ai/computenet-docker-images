@@ -349,22 +349,21 @@ instance_tag() {
     fi
 }
 
-# Spread ALL cards evenly over <worker_count> bundles (sizes differ by at most 1) and print one
-# bundle per line. Cards come in as "<index>:<vram_mb>" in plan order. Fails without printing
-# anything when a bundle would miss the VRAM floor, which is the caller's cue to keep the node on
-# its single all-GPUs worker rather than launch it broken.
-print_even_gpu_bundles() {
-    local worker_count="$1" split_min_vram_mb="$2"
+# Cut the cards into bundles of EXACTLY <bundle_size> and print one bundle per line. Cards come in
+# as "<index>:<vram_mb>" in plan order. Fails without printing anything when a bundle would miss the
+# VRAM floor, which is the caller's cue to keep the node on its single all-GPUs worker rather than
+# launch it broken.
+#
+# Exactly, not evenly: the size IS vLLM's --tensor-parallel-size and only 1, 2, 4, 8, 16 are valid,
+# so spreading a remainder over the bundles (9 cards over 4 -> 3,2,2,2) would hand one engine an
+# invalid size and crash-loop it. Cards past the last whole bundle stay idle, which is what the
+# backend did while it planned these bundles itself.
+print_gpu_bundles_of_size() {
+    local bundle_size="$1" split_min_vram_mb="$2"
     shift 2
     local cards=("$@") gpu_count=$#
-    local base_bundle_size=$(( gpu_count / worker_count ))
-    local bundles_with_extra_card=$(( gpu_count % worker_count ))
-    local bundles=() cursor=0 w bundle_size i bundle bundle_vram card
-    for (( w = 0; w < worker_count; w++ )); do
-        bundle_size=${base_bundle_size}
-        if (( w < bundles_with_extra_card )); then
-            bundle_size=$(( base_bundle_size + 1 ))
-        fi
+    local bundles=() cursor=0 i bundle bundle_vram card
+    while (( cursor + bundle_size <= gpu_count )); do
         bundle=""
         bundle_vram=0
         for (( i = cursor; i < cursor + bundle_size; i++ )); do
@@ -378,6 +377,7 @@ print_even_gpu_bundles() {
         bundles+=("${bundle}")
         cursor=$(( cursor + bundle_size ))
     done
+    (( ${#bundles[@]} > 0 )) || return 1
     printf '%s\n' "${bundles[@]}"
 }
 
@@ -425,13 +425,39 @@ plan_worker_gpu_sets() {
         echo "all"
         return
     fi
+    # A bundle's card count becomes vLLM's --tensor-parallel-size, which must divide the model's 16
+    # attention heads: 1, 2, 4, 8, 16 and nothing else. Confirmed 2026-07-22 — an invalid size
+    # crash-loops the engine before it even downloads the weights. The backend used to guarantee
+    # this by planning bundles itself; it now hands the whole node to one container, so the rule
+    # lives here. Round the VRAM answer UP to a valid size (3 cards -> 4), and if the node cannot
+    # form even one such bundle, keep the single all-GPUs worker rather than crash-loop N of them.
     local cards_per_worker=$(( (split_min_vram_mb + min_vram - 1) / min_vram ))
-    local worker_count=$(( gpu_count / cards_per_worker ))
-    if (( worker_count < 2 )); then
+    local valid_size
+    for valid_size in 1 2 4 8 16; do
+        if (( valid_size >= cards_per_worker )); then
+            cards_per_worker=${valid_size}
+            break
+        fi
+    done
+    if (( cards_per_worker > 16 )); then
         echo "all"
         return
     fi
-    print_even_gpu_bundles "${worker_count}" "${split_min_vram_mb}" "${cards[@]}" || echo "all"
+    local bundles
+    if ! bundles="$(print_gpu_bundles_of_size "${cards_per_worker}" "${split_min_vram_mb}" "${cards[@]}")"; then
+        echo "all"
+        return
+    fi
+    # One bundle covering every card is the whole-node run, and "all" is how it has always been
+    # written (worker.json gpu_ids: null). A single bundle that does NOT cover every card is a
+    # different thing and must stay scoped: the leftover cards cannot join it without making the
+    # tensor-parallel size invalid, so a node with 6 cards and a 4-card bundle runs on 4 and leaves
+    # 2 idle — exactly what the backend used to plan before it handed the whole node over.
+    if (( $(wc -l <<<"${bundles}") == 1 )) && (( cards_per_worker == gpu_count )); then
+        echo "all"
+        return
+    fi
+    printf '%s\n' "${bundles}"
 }
 
 # Render one worker.json into <config_dir>. gpu_set "all" -> gpu_ids null. 0600 up front:

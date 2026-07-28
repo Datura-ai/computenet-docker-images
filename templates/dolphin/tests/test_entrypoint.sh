@@ -127,6 +127,21 @@ test_plan() {
     mock_nvidia_smi "0:97887" "1:32607"
     assert_eq "mixed VRAM below floor keeps all-GPUs worker" "all" "$(plan_as_line)"
 
+    # A bundle's card count IS vLLM's --tensor-parallel-size, and only 1/2/4/8/16 divide the model's
+    # 16 attention heads. The backend used to guarantee that by planning bundles itself; it now
+    # hands the whole node over, so a plan that emits any other size crash-loops that engine before
+    # it downloads a byte. Both ways of producing one are covered:
+    mock_nvidia_smi "0:32607" "1:32607" "2:32607" "3:32607" "4:32607" "5:32607"
+    assert_eq "6x32GB rounds the 3-card bundle up to 4 and leaves 2 cards idle" \
+        "0,1,2,3" "$(plan_as_line)"
+
+    mock_nvidia_smi "0:46068" "1:46068" "2:46068" "3:46068" "4:46068" "5:46068" "6:46068" "7:46068" "8:46068"
+    assert_eq "9x48GB cuts whole pairs and idles the odd card, never a bundle of 3" \
+        "0,1|2,3|4,5|6,7" "$(plan_as_line)"
+
+    mock_nvidia_smi "0:97887" "1:97887" "2:97887"
+    assert_eq "3x96GB gives each card its own worker" "0|1|2" "$(plan_as_line)"
+
     DOLPHIN_GPU_IDS="0,1"
     mock_nvidia_smi "0:97887" "1:97887" "2:97887"
     assert_eq "explicit DOLPHIN_GPU_IDS wins over split" "0,1" "$(plan_as_line)"
