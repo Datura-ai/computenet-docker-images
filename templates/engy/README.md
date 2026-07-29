@@ -54,6 +54,13 @@ GET :9101/logs?tail=<bytes>    Authorization: Bearer $METRICS_TOKEN
 `tail` defaults to 256KB and is capped at 8MB; the response always starts at a whole line. Same
 token and port as `/metrics`.
 
+Every line is stamped with the capture time (`ts` from moreutils), because the miner prints
+without one and the log is read against engy's per-second dashboard:
+
+```
+2026-07-29T05:13:13+0000 [engy] 8 GPU(s) -> 8 engine(s), 8 running requests each
+```
+
 ## Why this base image
 
 Both pins were paid for on a live box, not guessed:

@@ -135,6 +135,17 @@ fi
 grep -q "GPU(s) ->" "${miner_log}" 2>/dev/null \
     && pass "the entrypoint's own output is captured too" \
     || fail "entrypoint output missing from the log"
+# Every line carries a timestamp, or reading this against engy's per-second dashboard is guesswork.
+# Only when `ts` is installed; the entrypoint deliberately still works without it.
+if command -v ts >/dev/null 2>&1; then
+    if grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{4} ' "${miner_log}"; then
+        pass "log lines are timestamped"
+    else
+        fail "log lines have no timestamp: $(head -1 "${miner_log}")"
+    fi
+else
+    pass "ts not installed here; timestamp check skipped (the image ships moreutils)"
+fi
 rm -rf "${SANDBOX}"
 
 echo "== a refusal to start is logged, not just printed =="

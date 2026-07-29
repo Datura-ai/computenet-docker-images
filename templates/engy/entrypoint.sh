@@ -35,18 +35,41 @@ LOG_MAX_BYTES="${ENGY_LOG_MAX_BYTES:-268435456}"   # 256MB, head-trimmed in plac
 # Redirect BEFORE the first check: a container that refuses to start is exactly the one whose reason
 # we cannot otherwise see, and "MINER_KEY is required" printed to an unreachable pipe helps nobody.
 # Everything after this line — the engines, the miner, this script — lands in the log.
+#
+# Stamped by `ts`: the miner prints without a timestamp, and the point of this log is reading it
+# against engy's per-request dashboard, which is timestamped to the second.
+#
+# stdbuf -oL is load-bearing, not a nicety. ts block-buffers when its stdout is a pipe, and bash does
+# not wait for a process substitution on exit, so an early `exit` left the refusal below sitting in
+# that buffer and printed NOWHERE. Line-buffered, the line reaches the file before we can exit.
+#
+# Falling back to a bare tee when ts is absent is deliberate: the container's ENTIRE output goes
+# through here and must not hinge on one optional binary.
 mkdir -p "${LOG_FILE%/*}"
-exec > >(tee -a "${LOG_FILE}") 2>&1
+if command -v ts >/dev/null 2>&1; then
+    exec > >(stdbuf -oL ts "%Y-%m-%dT%H:%M:%S%z" | tee -a "${LOG_FILE}") 2>&1
+else
+    exec > >(tee -a "${LOG_FILE}") 2>&1
+fi
+log_pipe_pid=$!
+
+# Refuse to start, with the reason guaranteed to be ON DISK. Closing our end is what makes the pipe
+# drain, and waiting for it is only safe HERE, before any engine or miner exists: once they do, they
+# hold the same pipe open and this wait never returns.
+refuse_to_start() {
+    echo "[engy] $1" >&2
+    exec 1>&- 2>&-
+    wait "${log_pipe_pid}" 2>/dev/null || true
+    exit 1
+}
 
 if [[ -z "${MINER_KEY}" ]]; then
-    echo "[engy] MINER_KEY is required (gateway key from provider.engy.ai)." >&2
-    exit 1
+    refuse_to_start "MINER_KEY is required (gateway key from provider.engy.ai)."
 fi
 
 gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)"
 if [[ "${gpu_count}" -lt 1 ]]; then
-    echo "[engy] no GPUs visible to the container." >&2
-    exit 1
+    refuse_to_start "no GPUs visible to the container."
 fi
 echo "[engy] ${gpu_count} GPU(s) -> ${gpu_count} engine(s), ${PER_ENGINE_REQUESTS} running requests each"
 
