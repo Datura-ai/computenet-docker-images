@@ -107,6 +107,16 @@ def main() -> int:
             status, body = get("/logs?tail=notanumber")
             check(status == 200, "junk tail value falls back to the default")
 
+            print("== a tail window inside one huge line still returns something ==")
+            # Progress bars redraw with \r, so a real log carries single lines of many KB; one was
+            # measured at 11.9KB on a live node. Skipping the "partial first line" then ate the whole
+            # window and /logs answered 200 with an empty body.
+            with open(log_file, "a", encoding="utf-8") as handle:
+                handle.write("[engy] " + "x" * 40000)
+            status, body = get("/logs?tail=4000")
+            check(status == 200 and len(body) > 0,
+                  f"unterminated long line -> non-empty body (got {len(body)} bytes)")
+
             print("== a missing log degrades instead of failing the scrape ==")
             os.remove(log_file)
             status, body = get("/logs")

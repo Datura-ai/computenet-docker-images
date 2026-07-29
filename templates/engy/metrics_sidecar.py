@@ -106,9 +106,18 @@ def read_log_tail(max_bytes: int) -> bytes:
     try:
         with open(LOG_FILE, "rb") as handle:
             size: int = os.fstat(handle.fileno()).st_size
-            if size > max_bytes:
-                handle.seek(size - max_bytes)
+            start: int = max(0, size - max_bytes)
+            handle.seek(start)
+            if start:
                 handle.readline()
+            tail: bytes = handle.read()
+            if tail or not start:
+                return tail
+            # The whole window sat inside ONE unterminated line, so skipping the partial line ate
+            # everything. Real logs do this: sglang and huggingface progress bars redraw with \r, and
+            # a single such line was measured at 11.9KB on a live node. A mid-line fragment beats
+            # answering an empty body.
+            handle.seek(start)
             return handle.read()
     except OSError as error:
         return f"log unavailable: {error!r}\n".encode()

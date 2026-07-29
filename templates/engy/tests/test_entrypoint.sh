@@ -158,6 +158,35 @@ grep -q "MINER_KEY is required" "${SANDBOX}/home/logs/miner.log" 2>/dev/null \
     || fail "refusal never reached the log: $(ls "${SANDBOX}/home/logs" 2>&1)"
 rm -rf "${SANDBOX}"
 
+echo "== the sidecar is up before the engines are ready =="
+# A cold start is a 35GB download plus warmup, and a node that never becomes ready is the one you
+# most want to read. Verified on a real L40S box: with the sidecar started after the readiness wait,
+# /logs answered nothing for the entire startup window.
+new_sandbox 1
+# This curl stub never reports an engine healthy, so the readiness wait blocks forever.
+printf '#!/usr/bin/env bash\nexit 1\n' >"${SANDBOX}/bin/curl"
+chmod +x "${SANDBOX}/bin/curl"
+CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" \
+ENGY_HOME="${SANDBOX}/home" ENGY_MINER_DIR="${SANDBOX}/miner" \
+    env MINER_KEY=mk-test METRICS_TOKEN=tok-test bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
+never_ready_pid=$!
+sidecar_started=""
+for _ in $(seq 1 50); do
+    grep -q "metrics_sidecar.py" "${SANDBOX}/calls.log" 2>/dev/null && { sidecar_started=yes; break; }
+    sleep 0.2
+done
+if [[ -n "${sidecar_started}" ]]; then
+    pass "sidecar starts while the engines are still coming up"
+else
+    fail "sidecar never started while engines were unready"
+fi
+grep -q "engy_miner.py" "${SANDBOX}/calls.log" 2>/dev/null \
+    && fail "the miner started even though no engine was ready" \
+    || pass "the miner still waits for a ready engine"
+kill -TERM "${never_ready_pid}" 2>/dev/null
+wait "${never_ready_pid}" 2>/dev/null
+rm -rf "${SANDBOX}"
+
 echo "== SIGTERM stops the container promptly =="
 # A filler stop gets FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s) before the platform gives up, and
 # shutdown() ends in a bare `wait`. Every long-lived child must be killed before it: the log trimmer

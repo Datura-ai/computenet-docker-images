@@ -139,17 +139,11 @@ for gpu_index in $(seq 0 $((gpu_count - 1))); do
     serve_urls+=("http://127.0.0.1:${port}")
 done
 
-for gpu_index in $(seq 0 $((gpu_count - 1))); do
-    port=$((FIRST_PORT + gpu_index))
-    if ! wait_for_engine "${port}"; then
-        echo "[engy] engine on port ${port} never became ready" >&2
-        exit 1
-    fi
-    echo "[engy] engine on port ${port} ready"
-done
-
-# Token counters for the platform scraper. Every engine is scraped, not just the first — on a
-# multi-card node the per-engine series is what shows one card gone quiet.
+# Started BEFORE waiting on the engines, not after: a cold start is a 35GB download plus engine
+# warmup, and that whole window is exactly when someone wants to see why the node is quiet. With
+# the old order /logs answered nothing until the engines were up, and a node that never got there
+# served nothing at all. /metrics degrades to 503 while the engines are still coming up, which the
+# sidecar already handles.
 # Restarted with backoff, the same shape templates/dolphin uses: since it also serves /logs it is now
 # the only way to read this container from outside, and a dead sidecar would cost us exactly that
 # during the incident we wanted it for. TERM kills the subshell and leaves its python orphaned; that
@@ -165,6 +159,15 @@ if [[ -n "${METRICS_TOKEN:-}" ]]; then
     ) &
     sidecar_pid=$!
 fi
+
+for gpu_index in $(seq 0 $((gpu_count - 1))); do
+    port=$((FIRST_PORT + gpu_index))
+    if ! wait_for_engine "${port}"; then
+        echo "[engy] engine on port ${port} never became ready" >&2
+        exit 1
+    fi
+    echo "[engy] engine on port ${port} ready"
+done
 
 # Head-trim the log in place rather than rotating it: `cat >` keeps the inode, so the tee holding the
 # file open keeps writing to the same one. A rename would leave tee appending to an unlinked file.
