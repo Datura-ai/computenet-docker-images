@@ -125,6 +125,21 @@ if [[ -f "${miner_log}" ]] && grep -q "stub speaking on stdout" "${miner_log}"; 
 else
     fail "miner output not captured: $(ls "${SANDBOX}/home/logs" 2>&1)"
 fi
+# The entrypoint's own lines matter as much as the miner's: "engine never became ready" is the whole
+# answer when an engine dies, and it is printed by this script, not by the miner.
+grep -q "GPU(s) ->" "${miner_log}" 2>/dev/null \
+    && pass "the entrypoint's own output is captured too" \
+    || fail "entrypoint output missing from the log"
+rm -rf "${SANDBOX}"
+
+echo "== a refusal to start is logged, not just printed =="
+# The container that refuses to boot is exactly the one whose reason we cannot otherwise reach.
+new_sandbox 1
+PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" CALLS_LOG="${SANDBOX}/calls.log" \
+    bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
+grep -q "MINER_KEY is required" "${SANDBOX}/home/logs/miner.log" 2>/dev/null \
+    && pass "the missing-key refusal reaches the log file" \
+    || fail "refusal never reached the log: $(ls "${SANDBOX}/home/logs" 2>&1)"
 rm -rf "${SANDBOX}"
 
 echo "== SIGTERM stops the container promptly =="

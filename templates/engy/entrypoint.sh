@@ -32,6 +32,12 @@ CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
 LOG_FILE="${ENGY_HOME}/logs/miner.log"
 LOG_MAX_BYTES="${ENGY_LOG_MAX_BYTES:-268435456}"   # 256MB, head-trimmed in place
 
+# Redirect BEFORE the first check: a container that refuses to start is exactly the one whose reason
+# we cannot otherwise see, and "MINER_KEY is required" printed to an unreachable pipe helps nobody.
+# Everything after this line — the engines, the miner, this script — lands in the log.
+mkdir -p "${LOG_FILE%/*}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
 if [[ -z "${MINER_KEY}" ]]; then
     echo "[engy] MINER_KEY is required (gateway key from provider.engy.ai)." >&2
     exit 1
@@ -47,11 +53,7 @@ echo "[engy] ${gpu_count} GPU(s) -> ${gpu_count} engine(s), ${PER_ENGINE_REQUEST
 export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
 export HF_HOME="${ENGY_HOME}/hf"
 
-mkdir -p "${CKPT_DIR}" "${HF_HOME}" "${LOG_FILE%/*}"
-# Capture the WHOLE container's output, not just the miner's: the engines are where
-# "Triton is not supported on current platform" and a failed NVCC build show up, and the entrypoint's
-# own "engine never became ready" is the entire answer in that case.
-exec > >(tee -a "${LOG_FILE}") 2>&1
+mkdir -p "${CKPT_DIR}" "${HF_HOME}"
 if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
     echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
     HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
