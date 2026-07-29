@@ -40,37 +40,19 @@ make_sandbox() {
 }
 
 mock_nvidia_smi() {
-    # Args: one "index:vram_mb" pair per GPU; exit 1 when none given. memory.used answers from a
-    # separate file (idle cards by default) so a caller can pretend the priming worker still
-    # holds the card.
-    local spec_file="${SANDBOX}/bin/gpus.txt" used_file="${SANDBOX}/bin/gpus_used.txt"
+    # Args: one "index:vram_mb" pair per GPU; exit 1 when none given.
+    local spec_file="${SANDBOX}/bin/gpus.txt"
     : >"${spec_file}"
-    : >"${used_file}"
     local pair
     for pair in "$@"; do
         echo "${pair%%:*}, ${pair##*:}" >>"${spec_file}"
-        echo "${pair%%:*}, 0" >>"${used_file}"
     done
     cat >"${SANDBOX}/bin/nvidia-smi" <<EOF
 #!/usr/bin/env bash
 [[ -s "${spec_file}" ]] || exit 1
-if [[ "\$*" == *memory.used* ]]; then
-    cat "${used_file}"
-else
-    cat "${spec_file}"
-fi
+cat "${spec_file}"
 EOF
     chmod +x "${SANDBOX}/bin/nvidia-smi"
-}
-
-mock_gpu_memory_used() {
-    # Args: one "index:used_mb" pair per GPU; overrides the idle default above.
-    local used_file="${SANDBOX}/bin/gpus_used.txt"
-    : >"${used_file}"
-    local pair
-    for pair in "$@"; do
-        echo "${pair%%:*}, ${pair##*:}" >>"${used_file}"
-    done
 }
 
 # Source the entrypoint's function definitions only (main is guarded by BASH_SOURCE).
