@@ -11,8 +11,7 @@
 # ~13% VRAM/GPU while a 1x worker on the same card reports 72 slots at ~70%. Slots bound the
 # concurrent batch and Dolphin pays per processed token, so more workers recover the lost
 # concurrency. 96 GB cards get a worker per GPU, 48 GB cards one per pair, and so on; nodes that
-# cannot form 2+ bundles keep the single all-GPUs worker, unless the intra-card split below claims
-# that one bundle more than once.
+# cannot form 2+ bundles keep the single all-GPUs worker.
 #
 # What multi-instance costs, and how each cost is paid here:
 #   - config collision   -> per-instance HOME, so each worker reads its own worker.json
@@ -27,10 +26,6 @@
 #   - one wedge kills all -> one watchdog per instance, scoped by DOLPHIN_WATCHDOG_INSTANCE_HOME,
 #                           so a wedged engine is killed on its own and its siblings — including
 #                           siblings sharing its card — keep serving
-#   - N engines, one card -> vLLM sizes --gpu-memory-utilization against the WHOLE card, so the
-#                           shared bin/vllm is wrapped to divide that flag by the count in
-#                           DOLPHIN_ENGINES_PER_CARD_FILE, which is this container's own /tmp so
-#                           an unsplit filler on the same node keeps its full claim (DAH-2473)
 set -euo pipefail
 
 DOLPHIN_HOME="${DOLPHIN_HOME:-/opt/dolphinpod}"
@@ -42,12 +37,6 @@ WATCHDOG_STATE_DIR="${DOLPHIN_WATCHDOG_STATE_DIR:-/tmp}"
 API_KEY="${DOLPHIN_API_KEY:-}"
 MODEL="${DOLPHIN_MODEL:-nvidia/Qwen3.6-35B-A3B-NVFP4}"
 WORKER_TYPE="${DOLPHIN_WORKER_TYPE:-text-v}"
-# The worker writes its python runtime here on first start; bin/vllm inside it is the engine
-# launcher the intra-card split wraps (DAH-2473), and bin/python the interpreter that runs it.
-RUNTIME_BIN_DIR="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
-ENGINE_LAUNCHER="${RUNTIME_BIN_DIR}/vllm"
-# Where the vendor's own launcher is kept once the wrapper takes its place.
-VENDOR_ENGINE_LAUNCHER="${RUNTIME_BIN_DIR}/vllm.real"
 # Public, stable worker-binary URL (linux/amd64 only — the worker ships no arm64 build). `update`
 # refreshes it after first launch. Override only if Dolphin moves the download.
 WORKER_URL="${DOLPHIN_WORKER_URL:-https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64}"
@@ -59,38 +48,6 @@ LIVENESS_INTERVAL=30
 
 # Delay between initial worker spawns, AFTER the shared cache is seeded.
 SPLIT_STAGGER_SECONDS="${DOLPHIN_SPLIT_STAGGER_SECONDS:-30}"
-
-# How many workers share each VRAM bundle (DAH-2473). >1 puts several engines on the SAME card:
-# every extra worker pays a fresh ~31.5 GB for its own copy of the weights out of the KV cache,
-# so it only pays off where the pool, not the card, is the limit.
-#
-# "auto" derives it from the bundle — see derive_workers_per_bundle. A positive integer forces it,
-# which is the escape hatch for measuring a layout the rule would not pick; it is NOT checked
-# against the card's VRAM, so forcing 2 onto an 80 GB card gives two crippled engines. "1"
-# disables the split entirely.
-#
-# The default is 1: splitting is opt-in ("auto" or an explicit count), because what each layout
-# earns is still being measured. The watchdog is no longer the reason — it identifies its engine
-# by the instance HOME, so a wedge on a split card is cured like any other.
-WORKERS_PER_BUNDLE_SETTING="${DOLPHIN_WORKERS_PER_BUNDLE:-1}"
-if [[ "${WORKERS_PER_BUNDLE_SETTING}" != "auto" ]] && ! [[ "${WORKERS_PER_BUNDLE_SETTING}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "[dolphin] DOLPHIN_WORKERS_PER_BUNDLE='${WORKERS_PER_BUNDLE_SETTING}' is neither 'auto' nor a positive integer; not splitting" >&2
-    WORKERS_PER_BUNDLE_SETTING=1
-fi
-# Resolved per bundle at plan time; 1 until then so every helper has a sane value.
-WORKERS_PER_BUNDLE=1
-
-# What one worker needs on the card, in MB: its own copy of the weights plus a KV cache worth
-# having. Measured 2026-07-24 on a live H200 split in two — each engine reported 42 slots and ran
-# 16-21 concurrent requests at 17-19% KV usage, so ~35 slots (0.717 GB each) is a floor with room
-# above the load the pool actually sends, not a number that merely boots.
-#
-# Constants, not knobs: DOLPHIN_WORKERS_PER_BUNDLE=<n> already forces any layout the rule would
-# not pick, so a second way to bend the same decision would only add untested inputs to it.
-WORKER_WEIGHTS_MB=32256
-WORKER_MIN_KV_MB=25600
-# vLLM is launched with --gpu-memory-utilization 0.85, so this is what a bundle really offers.
-VRAM_USABLE_PERCENT=85
 
 # On a cold node the siblings wait for the FIRST instance to finish seeding the shared cache
 # instead of merely pausing a few seconds. Measured 2026-07-23: with a 30 s stagger both workers
@@ -112,241 +69,16 @@ DOLPHIN_LOCK="${DOLPHIN_HOME}/.dolphinpod.lock"
 # timeout we proceed anyway rather than fail the container.
 DOLPHIN_LOCK_TIMEOUT="${DOLPHIN_LOCK_TIMEOUT:-900}"
 
-# How many engines THIS container puts on one card — the divisor the VRAM wrapper reads at every
-# engine launch. The wrapper lives in the shared DOLPHIN_HOME and is therefore the SAME file for
-# every filler container on the node, so the NUMBER must not live in it: a container that does not split
-# would otherwise have to strip the wrapper to get its whole card back, and that strips the
-# divisor from a still-split sibling, whose next engine then claims a card it does not have.
-# /tmp is the container's own, like the watchdog state (lium-io#1161).
-ENGINES_PER_CARD_FILE="${DOLPHIN_ENGINES_PER_CARD_FILE:-/tmp/dolphin-engines-per-card}"
-
 # One line per GPU: "<index>, <value>" for one nvidia-smi field, total VRAM by default. Empty
 # output when nvidia-smi is absent/failing.
 detect_gpus() {
     nvidia-smi --query-gpu="index,${1:-memory.total}" --format=csv,noheader,nounits 2>/dev/null || true
 }
 
-# "<cards> <total>" for one nvidia-smi field over the cards behind one plan line; "all" covers
-# every GPU on the node. 0 cards means nothing was measured (no nvidia-smi), which callers read
-# as "nothing to verify" rather than as an empty card.
-gpu_cards_and_field_total() {
-    local gpu_set="$1" field="$2" index value cards=0 total=0
-    while IFS=',' read -r index value; do
-        index="${index//[[:space:]]/}"
-        value="${value//[[:space:]]/}"
-        [[ -n "${index}" && -n "${value}" ]] || continue
-        if [[ "${gpu_set}" == "all" || ",${gpu_set}," == *",${index},"* ]]; then
-            # A partially failed card prints [N/A] / [Not Supported] / [Unknown Error] in place of
-            # its number while every other card still reports, and detect_gpus keeps that output.
-            # Fed to $(( )) it aborts this subshell, so the caller's `read` sees EOF and set -e
-            # ends the CONTAINER over one bad sample — and memory.used is polled every 5s. Named
-            # on stderr, never on the stdout this function answers on: dropping the row quietly
-            # would understate both the count and the total, and a card that stopped reporting is
-            # the one thing worth waking an operator for here.
-            if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
-                echo "[dolphin] GPU ${index} reports '${value}' for ${field}; not counted" >&2
-                continue
-            fi
-            cards=$(( cards + 1 ))
-            total=$(( total + value ))
-        fi
-    done < <(detect_gpus "${field}")
-    echo "${cards} ${total}"
-}
-
-# How many workers this bundle can carry. Two conditions, and both must hold:
-#
-#   1. The bundle is ONE card. Bundles of several cards exist only because each card is too small
-#      to hold the model alone, i.e. the node is built from weak cards — and a weak card is
-#      limited by the card, not by the pool, so splitting it buys nothing. (Measured: an L40S
-#      worker's token rate stops dead at p99 1993 / max 2083, while an H200's median 1697 has a
-#      max of 5384 on the same hardware. Splitting the first is pointless, splitting the second
-#      is the whole point.) A 4x L40S bundle has the VRAM for a split and must still not get one,
-#      which is why VRAM alone is not the test.
-#   2. Every worker still gets its weights plus a real KV cache out of the usable VRAM.
-#
-# Everything the rule needs is already on hand from detect_gpus, so this costs no extra probing.
-derive_workers_per_bundle() {
-    local bundle_cards="$1" bundle_vram_mb="$2"
-    if [[ "${WORKERS_PER_BUNDLE_SETTING}" != "auto" ]]; then
-        echo "${WORKERS_PER_BUNDLE_SETTING}"
-        return
-    fi
-    if (( bundle_cards != 1 )) || (( bundle_vram_mb <= 0 )); then
-        echo 1
-        return
-    fi
-    local per_worker_mb=$(( WORKER_WEIGHTS_MB + WORKER_MIN_KV_MB ))
-    local workers=$(( bundle_vram_mb * VRAM_USABLE_PERCENT / 100 / per_worker_mb ))
-    (( workers < 1 )) && workers=1
-    echo "${workers}"
-}
-
-# Print each bundle WORKERS_PER_BUNDLE times: an intra-card split is just the same bundle
-# claimed by more than one worker, so it composes with every path in the planner below.
-emit_worker_plan() {
-    local bundle rep
-    for bundle in "$@"; do
-        for (( rep = 0; rep < WORKERS_PER_BUNDLE; rep++ )); do
-            echo "${bundle}"
-        done
-    done
-}
-
-# Marker that tells our wrapper apart from the vendor's console script.
-ENGINE_WRAPPER_MARKER="dolphin-intra-card-vram-wrapper"
-
-# "Installed" has to mean runnable AND ours, not merely marked:
-#   - the wrapper's whole body is a runpy of vllm.real, so a marked wrapper whose vllm.real is
-#     gone launches nothing at all — and every repair path here is gated on this answer, so
-#     calling that state installed is what makes it permanent. It is the shared launcher, so the
-#     node's unsplit containers die on it too.
-#   - the share file's PATH is baked in at install time, and it is the one per-container value
-#     inside a node-shared script. A wrapper installed by a container that reads its divisor
-#     somewhere else would leave this container's count unread, i.e. every engine claiming a
-#     whole card, so a foreign path is reinstalled rather than trusted.
-engine_memory_wrapper_installed() {
-    [[ -f "${ENGINE_LAUNCHER}" ]] && [[ -f "${VENDOR_ENGINE_LAUNCHER}" ]] \
-        && grep -q "${ENGINE_WRAPPER_MARKER}" "${ENGINE_LAUNCHER}" \
-        && grep -qF "SHARE_FILE = \"${ENGINES_PER_CARD_FILE}\"" "${ENGINE_LAUNCHER}"
-}
-
-# The wrapper's source, kept in its own function so install_engine_memory_wrapper reads as the
-# steps it performs rather than as one long string literal. The heredoc's own exit status is
-# this function's, which is what lets the caller tell a truncated write from a good one.
-write_engine_memory_wrapper_script() {
-    local destination="$1"
-    cat >"${destination}" <<EOF
-#!${RUNTIME_BIN_DIR}/python
-# ${ENGINE_WRAPPER_MARKER} (DAH-2473)
-"""Claim only this worker's share of the card, then run the vendor's launcher unchanged."""
-import runpy
-import sys
-
-SHARE_FILE = "${ENGINES_PER_CARD_FILE}"
-REAL = "${VENDOR_ENGINE_LAUNCHER}"
-
-# How many workers this CONTAINER puts on one card, read at launch rather than baked in: this
-# script lives on the volume every filler container of the node shares, so one number written
-# here would be one number for all of them. A missing or unreadable share — an unsplit
-# container, a container running an image that predates the split — leaves the command line
-# alone, which is what an engine that has the card to itself needs.
-try:
-    with open(SHARE_FILE) as fh:
-        divisor = int(fh.read().strip())
-except (OSError, ValueError):
-    divisor = 1
-
-argv = sys.argv
-before = after = None
-# One worker per card is the shipped fleet, and it gets the vendor's command line byte for
-# byte — rewriting 0.85 as 0.8500 changes nothing about the claim and everything about how
-# an unsplit container's engine reads in a log next to one that never had a wrapper.
-if divisor > 1:
-    for i, arg in enumerate(argv):
-        if arg == "--gpu-memory-utilization" and i + 1 < len(argv):
-            before, after = argv[i + 1], "%.4f" % (float(argv[i + 1]) / divisor)
-            argv[i + 1] = after
-        elif arg.startswith("--gpu-memory-utilization="):
-            before, after = arg.split("=", 1)[1], "%.4f" % (float(arg.split("=", 1)[1]) / divisor)
-            argv[i] = "--gpu-memory-utilization=" + after
-
-# All three ways this goes wrong — no share file, a half-written one, a vendor command line
-# without the flag — end as N engines claiming a whole card each, and vLLM reports that as
-# plain OOM. One line per launch is the only place the divisor actually used is written down.
-if divisor == 1:
-    note = "no split, vendor claim kept"
-elif after is None:
-    note = "--gpu-memory-utilization not on the command line"
-else:
-    note = "--gpu-memory-utilization %s -> %s" % (before, after)
-try:
-    print("[dolphin] engine vram wrapper: divisor=%d, %s" % (divisor, note), file=sys.stderr)
-except Exception:
-    # This wrapper stands in front of every engine launch on the node; a log line is never
-    # worth failing one, not even on a closed stderr.
-    pass
-
-runpy.run_path(REAL, run_name="__main__")
-EOF
-}
-
-# The worker execs `<runtime>/bin/vllm serve ... --gpu-memory-utilization 0.85`, and vLLM sizes
-# that fraction against the card's TOTAL memory. So the second worker on a card asks for memory
-# the first one already holds and dies at init — the reproducible blocker DAH-2473 hit. The
-# fraction is hardcoded in the closed worker binary and worker.json exposes no knob for it, but
-# the runtime lives inside DOLPHIN_HOME, which is our volume, so the file the worker execs can be
-# wrapped. The wrapper only divides that one flag and then defers to the untouched vendor script
-# via runpy, so a vendor change to its contents cannot break us.
-install_engine_memory_wrapper() {
-    if [[ ! -f "${ENGINE_LAUNCHER}" ]]; then
-        # The worker writes its runtime only once it starts, which is what prime_engine_runtime is
-        # for. There is nothing to wrap, so the caller runs unsplit rather than crash-looping N-1
-        # engines that each claim the whole card.
-        echo "[dolphin] engine runtime not present; nothing to wrap" >&2
-        return 1
-    fi
-    # Whether the vendor's script still has to be staged is answered by the MARKER alone, never by
-    # engine_memory_wrapper_installed: that one also refuses a wrapper whose baked share path is
-    # not ours, and such a wrapper is re-written from the vllm.real already beside it, not staged
-    # over again.
-    if ! grep -q "${ENGINE_WRAPPER_MARKER}" "${ENGINE_LAUNCHER}"; then
-        # Vendor script in place: either the first install, or a self-update overwrote us. If it
-        # cannot be staged, refuse — a wrapper whose vllm.real is missing launches nothing at all.
-        if ! cp -p "${ENGINE_LAUNCHER}" "${VENDOR_ENGINE_LAUNCHER}"; then
-            echo "[dolphin] cannot stage ${VENDOR_ENGINE_LAUNCHER}; leaving the vendor engine script alone" >&2
-            return 1
-        fi
-    elif [[ ! -f "${VENDOR_ENGINE_LAUNCHER}" ]]; then
-        # Our own marker with no vllm.real beside it: the vendor script this wrapper defers to
-        # is gone and only the worker can write it back. Staging what is here would copy the
-        # wrapper onto vllm.real and make it runpy itself forever, so refuse and say so — a
-        # crash-looping engine at least names the file it could not open.
-        echo "[dolphin] engine wrapper has no vendor script to defer to; leaving it alone" >&2
-        return 1
-    fi
-    local staged
-    staged="$(mktemp "${RUNTIME_BIN_DIR}/.vllm.XXXXXX")" || return 1
-    # Staged and renamed rather than written in place (DAH-2475): a worker in a sibling container
-    # can exec this path at any moment, and a half-written script is not a launcher. mktemp opens
-    # at 0600, so the mode is set to the vendor script's own 0755 rather than merely +x: this path
-    # is read by whatever uid a sibling container's worker runs as, not only by the one that
-    # installed it.
-    #
-    # Every step is checked because the caller reads a non-zero return as "run unsplit". A full
-    # DOLPHIN_HOME truncates the script, and publishing that would leave every filler container
-    # on the node without a launcher at all — vllm.real is already staged, so there is nothing
-    # left to fall back to.
-    if ! write_engine_memory_wrapper_script "${staged}" \
-        || ! chmod 0755 "${staged}" \
-        || ! mv -f "${staged}" "${ENGINE_LAUNCHER}"; then
-        rm -f "${staged}"
-        echo "[dolphin] cannot write the engine VRAM wrapper; leaving the vendor engine script alone" >&2
-        return 1
-    fi
-    echo "[dolphin] engine VRAM wrapper installed" >&2
-}
-
-# Written on every start, including the unsplit one: /tmp survives a container restart, so a stale
-# number from an earlier split is what would otherwise run a single worker on 1/N of its card.
-# This is the whole off-switch — the wrapper itself stays where it is, because it is shared with
-# every other filler container on the node and removing it takes their divisor with it.
-publish_engines_per_card() {
-    printf '%s\n' "${WORKERS_PER_BUNDLE}" >"${ENGINES_PER_CARD_FILE}"
-    # The wrapper runs as whatever uid the worker gave its engine, not necessarily this one.
-    chmod 0644 "${ENGINES_PER_CARD_FILE}"
-}
-
-# Name one instance's private files (HOME, watchdog state). The card set stays in the name for
-# readability; the index is only prepended when cards alone cannot separate instances, so the
-# single-worker-per-bundle layout keeps the exact paths it has always used.
+# Name one instance's private files (HOME, watchdog state) by the cards it owns.
 instance_tag() {
-    local index="$1" gpu_set="$2"
-    if (( WORKERS_PER_BUNDLE > 1 )); then
-        echo "w${index}-gpu${gpu_set//,/-}"
-    else
-        echo "gpu${gpu_set//,/-}"
-    fi
+    local gpu_set="$1"
+    echo "gpu${gpu_set//,/-}"
 }
 
 # Cut the cards into bundles of EXACTLY <bundle_size> and print one bundle per line. Cards come in
@@ -526,141 +258,6 @@ interruptible_sleep() {
     wait $! || true
 }
 
-# The priming worker below may already have started claiming the card, and phase 2's engines size
-# their divided claim against a card they expect to be free. Answering "no" here is not the
-# unsplit fallback but the end of the container (see prime_engine_runtime): once the priming
-# engine has been killed and the memory is still gone, no layout works on what is left.
-#
-# 0 cards means nvidia-smi is absent, so there is nothing to verify and nothing to refuse.
-wait_for_gpu_memory_release() {
-    local gpu_set="$1"
-    local limit_mb="${DOLPHIN_PRIME_RELEASE_MB:-2048}"
-    local timeout="${DOLPHIN_PRIME_RELEASE_SECONDS:-300}"
-    local waited=0 cards used
-    while true; do
-        read -r cards used < <(gpu_cards_and_field_total "${gpu_set}" memory.used)
-        (( cards > 0 )) || return 0
-        (( used <= limit_mb )) && return 0
-        if (( waited >= timeout )); then
-            echo "[dolphin] ${used} MB still held on [${gpu_set}] after ${waited}s; giving up on this start" >&2
-            return 1
-        fi
-        interruptible_sleep 5
-        waited=$((waited + 5))
-    done
-}
-
-# The priming worker is spawned before the container's own TERM trap exists, so it is reaped here:
-# a stop during phase 1 must not leave an unwrapped engine holding the whole card.
-#
-# The wait is bounded and ends in SIGKILL for the same reason kill_leftover_engines exists: the
-# worker stops by stopping its engine, and an engine wedged in a CUDA kernel is precisely what
-# does not answer TERM. An unbounded wait here hangs phase 1 forever with no worker up, and
-# nothing else times phase 1 out.
-PRIME_WORKER_PID=""
-PRIME_STOP_SECONDS=60
-stop_prime_worker() {
-    [[ -n "${PRIME_WORKER_PID}" ]] || return 0
-    kill -TERM "${PRIME_WORKER_PID}" 2>/dev/null || true
-    local waited=0
-    while (( waited < PRIME_STOP_SECONDS )) && kill -0 "${PRIME_WORKER_PID}" 2>/dev/null; do
-        interruptible_sleep 5
-        waited=$(( waited + 5 ))
-    done
-    kill -9 "${PRIME_WORKER_PID}" 2>/dev/null || true
-    wait "${PRIME_WORKER_PID}" 2>/dev/null || true
-    PRIME_WORKER_PID=""
-}
-
-# SIGKILL every vLLM process in this container. Called only while the priming worker is the one
-# thing running, so "every" is "the priming worker's": /proc inside a container shows nothing of
-# the other fillers on the node, and the real instances have not spawned yet.
-#
-# TERM to the worker does not reliably take its engine down with it, and an engine left holding
-# the card makes BOTH continuations wrong, not just the split one — the divided engines size
-# their claim against a card they expect free, and the unsplit fallback asks for the vendor's
-# 0.85 of a card that is already 0.85 gone. SIGKILL rather than TERM for the same reason the
-# watchdog uses it: a process stuck in a CUDA kernel does not answer TERM.
-#
-# The same two markers watchdog.py picks engines by (SERVE_CMDLINE_MARKER,
-# ENGINE_CORE_CMDLINE_MARKER); when vLLM renames a process title both files have to change.
-SERVE_CMDLINE_MARKER="vllm serve"
-ENGINE_CORE_CMDLINE_MARKER="VLLM::EngineCore"
-kill_leftover_engines() {
-    local proc_dir pid cmdline killed=0
-    for proc_dir in /proc/[0-9]*; do
-        pid="${proc_dir##*/}"
-        # stderr is silenced before the input redirect, not after: a process that exits between
-        # the glob and the open makes the SHELL print, and by then a trailing 2>/dev/null is
-        # too late to catch it.
-        cmdline="$(tr '\0' ' ' 2>/dev/null <"${proc_dir}/cmdline" || true)"
-        [[ "${cmdline}" == *"${SERVE_CMDLINE_MARKER}"* || "${cmdline}" == *"${ENGINE_CORE_CMDLINE_MARKER}"* ]] || continue
-        kill -9 "${pid}" 2>/dev/null && killed=$(( killed + 1 ))
-    done
-    (( killed > 0 )) && echo "[dolphin] SIGKILLed ${killed} engine process(es) left by the priming worker" >&2
-    return 0
-}
-
-# Phase 1 of the split (DAH-2473). install_engine_memory_wrapper can only wrap a file the worker
-# writes itself, and the worker writes it only after `start` — so on a cold container the check
-# always precedes the file and the split degrades to a single worker for the life of that
-# container. Measured in prod 2026-07-24: the refill scheduler CREATES a container every tick and
-# never restarts one, so the "installs on the next start" that comment promised never arrived, and
-# `auto` fired on exactly zero nodes.
-#
-# Breaking that ordering needs one throwaway worker whose only job is to put the launcher on disk.
-# It must die before the real instances start: it came up UNWRAPPED and claims the vendor's 0.85 of
-# the card, so its share plus N divided shares exceeds the card and the last engine would fail at
-# init. Waiting for the FILE rather than for the engine is both sufficient and much earlier — on
-# prod nodes the launcher's mtime preceded the first tokens by 3-5 minutes.
-prime_engine_runtime() {
-    local gpu_set="$1" prime_home="$2" shared_cache="$3"
-
-    prepare_instance_home "${prime_home}" "${shared_cache}"
-    render_worker_config "${prime_home}/.config/dolphinpod" "${gpu_set}"
-
-    echo "[dolphin] priming the engine runtime with one throwaway worker on [${gpu_set}]" >&2
-    (cd "${DOLPHIN_HOME}" && HOME="${prime_home}" exec "${WORKER_BIN}" start) &
-    PRIME_WORKER_PID=$!
-    trap 'stop_prime_worker; exit 0' TERM INT
-
-    local waited=0
-    while [[ ! -f "${ENGINE_LAUNCHER}" ]]; do
-        if ! kill -0 "${PRIME_WORKER_PID}" 2>/dev/null; then
-            echo "[dolphin] the priming worker exited before writing the engine launcher" >&2
-            break
-        fi
-        if (( waited >= SEED_WAIT_SECONDS )); then
-            echo "[dolphin] no engine launcher after ${waited}s; not splitting this start" >&2
-            break
-        fi
-        interruptible_sleep 10
-        waited=$((waited + 10))
-    done
-
-    stop_prime_worker
-    kill_leftover_engines
-    trap - TERM INT
-
-    # Before deciding anything, because the priming worker was started either way and came up
-    # UNWRAPPED: the fallback asks for the vendor's 0.85 of the same card the split would have
-    # divided, so it needs the memory back just as much. SIGKILL does not return VRAM
-    # synchronously, which is the whole reason this wait exists.
-    if ! wait_for_gpu_memory_release "${gpu_set}"; then
-        # Not a case for the unsplit fallback: the card is held by something that survived
-        # SIGKILL, and a single worker started here dies at init exactly like a split one would.
-        # Ending the container is what actually frees the card — its PID namespace goes with it,
-        # taking whatever is left — and the refill scheduler puts a fresh one on the node.
-        echo "[dolphin] the card is still held after killing the priming engine; ending this container" >&2
-        exit 1
-    fi
-
-    # The card is free, so a missing launcher is only "no split this start" — one unsplit worker
-    # on an empty card is a correct outcome, and the loop above already said why it is missing.
-    [[ -f "${ENGINE_LAUNCHER}" ]] || return 1
-    echo "[dolphin] engine launcher on disk after ${waited}s; priming worker stopped" >&2
-}
-
 published_etag() {
     curl -fsSI --max-time 30 "${WORKER_URL}" | awk 'tolower($1) == "etag:" {print $2}' | tr -d '\r'
 }
@@ -713,55 +310,6 @@ refresh_binary() {
         || echo "[dolphin] update failed; starting current version" >&2
 }
 
-# Put the wrapper back before every engine launch, because the vendor's own `update` rewrites the
-# runtime and can restore its bin/vllm over ours (the install path already says so). Since the
-# divisor moved out of the wrapper the two no longer disappear together: /tmp would keep saying N
-# while nothing divides, and every respawned engine would ask for the whole card. The install is
-# idempotent and the check that precedes it is a grep, so this costs nothing on the normal path.
-ensure_engine_memory_wrapper() {
-    (( WORKERS_PER_BUNDLE > 1 )) || return 0
-    engine_memory_wrapper_installed && return 0
-    with_dolphin_lock install_engine_memory_wrapper \
-        || echo "[dolphin] engine VRAM wrapper is gone and cannot be reinstalled; this engine will claim the whole card" >&2
-}
-
-# Decide how many workers share one bundle and make that decision real: prime the engine runtime
-# if there is nothing to wrap yet, install the wrapper, and publish this container's divisor for
-# it. Sets WORKERS_PER_BUNDLE, which the plan below expands into one line per worker.
-#
-# Every failure lands on 1 rather than on a broken split: N engines that each claim the whole card
-# just crash-loop N-1 of them, and a container with the card to itself is a correct outcome. The
-# one failure that does NOT fall back is a card still held after priming — prime_engine_runtime
-# ends the container there, because no layout works on memory that is already gone.
-resolve_and_apply_intra_card_split() {
-    local gpu_set="$1" base_home="$2" shared_cache="$3"
-    local bundle_cards bundle_vram
-    read -r bundle_cards bundle_vram < <(gpu_cards_and_field_total "${gpu_set}" memory.total)
-    WORKERS_PER_BUNDLE="$(derive_workers_per_bundle "${bundle_cards}" "${bundle_vram}")"
-
-    # Phase 1: on a cold container there is no engine launcher to wrap yet, so one throwaway
-    # worker puts it on disk and is stopped again before the real instances start. A container
-    # whose DOLPHIN_HOME already holds the runtime skips straight to the install below.
-    if (( WORKERS_PER_BUNDLE > 1 )) && [[ ! -f "${ENGINE_LAUNCHER}" ]]; then
-        if ! prime_engine_runtime "${gpu_set}" "${base_home}/dolphin-workers/prime" "${shared_cache}"; then
-            WORKERS_PER_BUNDLE=1
-        fi
-    fi
-
-    # The wrapper is written inside the shared DOLPHIN_HOME, so it takes the same lock as the
-    # binary download: two containers installing at once would otherwise race on vllm/vllm.real
-    # (DAH-2475). It is never removed again — the count published below is what an unsplit
-    # container changes, and it is this container's own. ensure_engine_memory_wrapper puts it
-    # back if a later vendor update overwrites it.
-    if (( WORKERS_PER_BUNDLE > 1 )) && ! with_dolphin_lock install_engine_memory_wrapper; then
-        WORKERS_PER_BUNDLE=1
-    fi
-    publish_engines_per_card
-    if (( WORKERS_PER_BUNDLE > 1 )); then
-        echo "[dolphin] bundle of ${bundle_cards} card(s), ${bundle_vram} MB -> ${WORKERS_PER_BUNDLE} workers per bundle" >&2
-    fi
-}
-
 # The plan's outputs are read by the supervisor loop, by its traps and by the watchdogs alike, so
 # they live at script scope instead of being threaded through six signatures.
 GPU_SETS=()
@@ -781,15 +329,6 @@ plan_worker_instances() {
         [[ -n "${gpu_set_line}" ]] && GPU_SETS+=("${gpu_set_line}")
     done < <(plan_worker_gpu_sets)
 
-    # Lium nodes are homogeneous, so the first bundle decides the layout for all of them.
-    # emit_worker_plan is the identity at one worker per bundle, so the unsplit fleet needs no
-    # branch here — N=1 is just a case of N.
-    resolve_and_apply_intra_card_split "${GPU_SETS[0]}" "${BASE_HOME}" "${SHARED_CACHE}"
-    local expanded=()
-    while IFS= read -r gpu_set_line; do
-        [[ -n "${gpu_set_line}" ]] && expanded+=("${gpu_set_line}")
-    done < <(emit_worker_plan "${GPU_SETS[@]}")
-    GPU_SETS=("${expanded[@]}")
 
     local i
     INSTANCE_HOMES=()
@@ -798,9 +337,7 @@ plan_worker_instances() {
         INSTANCE_HOMES=("${BASE_HOME}")
     else
         for i in "${!GPU_SETS[@]}"; do
-            # With WORKERS_PER_BUNDLE > 1 the same cards appear more than once, so the card set
-            # alone no longer names a home; the instance index is what keeps them apart.
-            INSTANCE_HOMES+=("${BASE_HOME}/dolphin-workers/$(instance_tag "${i}" "${GPU_SETS[$i]}")")
+            INSTANCE_HOMES+=("${BASE_HOME}/dolphin-workers/$(instance_tag "${GPU_SETS[$i]}")")
             prepare_instance_home "${INSTANCE_HOMES[$i]}" "${SHARED_CACHE}"
         done
     fi
@@ -836,7 +373,7 @@ start_metrics_sidecar() {
 # kills only its own processes, so a wedge on one instance no longer takes the others down: every
 # worker is spawned with a HOME of its own, which /proc reports for the engine it exec'd and for
 # the children below it, giving a home <-> pid <-> socket mapping. The cards cannot serve as that
-# key — N workers on one card share them (DAH-2473) — so they ride along as a label only. When the
+# key alone once a node is planned per bundle, so they ride along as a label only. When the
 # mapping is ambiguous the watchdog kills nothing and publishes engine_found 0.
 #
 # A single instance gets the unscoped watchdog and the original state path, so the single-worker
@@ -881,7 +418,6 @@ start_engine_watchdogs() {
 
 spawn_instance() {
     local idx="$1"
-    ensure_engine_memory_wrapper
     (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) &
     WORKER_PIDS[idx]=$!
 }
