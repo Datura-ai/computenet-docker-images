@@ -31,6 +31,8 @@ CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
 # over SSH or pulled from the sidecar's /logs.
 LOG_FILE="${ENGY_HOME}/logs/miner.log"
 LOG_MAX_BYTES="${ENGY_LOG_MAX_BYTES:-268435456}"   # 256MB, head-trimmed in place
+# The trim keeps half the cap, so anything under 2 bytes would round to `tail -c 0` and wipe the log.
+if (( LOG_MAX_BYTES < 8192 )); then LOG_MAX_BYTES=8192; fi
 
 # Redirect BEFORE the first check: a container that refuses to start is exactly the one whose reason
 # we cannot otherwise see, and "MINER_KEY is required" printed to an unreachable pipe helps nobody.
@@ -53,11 +55,19 @@ else
 fi
 log_pipe_pid=$!
 
-# Refuse to start, with the reason guaranteed to be ON DISK. Closing our end is what makes the pipe
-# drain, and waiting for it is only safe HERE, before any engine or miner exists: once they do, they
-# hold the same pipe open and this wait never returns.
+serve_pids=()
+miner_pid=""
+trim_log_pid=""
+sidecar_pid=""
+
+# Refuse to start, with the reason guaranteed to be ON DISK. Anything still holding the log pipe
+# keeps it from draining, so every child goes first; at the early call sites they are all empty and
+# that loop is a no-op. Then closing our end lets the pipe reach EOF and we wait for it to flush.
 refuse_to_start() {
     echo "[engy] $1" >&2
+    for pid in "${miner_pid}" "${trim_log_pid}" "${sidecar_pid}" "${serve_pids[@]:-}"; do
+        [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
+    done
     exec 1>&- 2>&-
     wait "${log_pipe_pid}" 2>/dev/null || true
     exit 1
@@ -81,11 +91,6 @@ if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
     echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
     HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
 fi
-
-serve_pids=()
-miner_pid=""
-trim_log_pid=""
-sidecar_pid=""
 
 # SIGTERM is a DROP, not a drain. A customer rental stops the filler and must not wait: the platform
 # only allows FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s) and a real drain of 262k-context requests can
@@ -139,15 +144,15 @@ for gpu_index in $(seq 0 $((gpu_count - 1))); do
     serve_urls+=("http://127.0.0.1:${port}")
 done
 
-# Started BEFORE waiting on the engines, not after: a cold start is a 35GB download plus engine
-# warmup, and that whole window is exactly when someone wants to see why the node is quiet. With
-# the old order /logs answered nothing until the engines were up, and a node that never got there
-# served nothing at all. /metrics degrades to 503 while the engines are still coming up, which the
-# sidecar already handles.
-# Restarted with backoff, the same shape templates/dolphin uses: since it also serves /logs it is now
-# the only way to read this container from outside, and a dead sidecar would cost us exactly that
-# during the incident we wanted it for. TERM kills the subshell and leaves its python orphaned; that
-# is fine here because this script is PID 1 and container teardown reaps it.
+# Token counters for the platform scraper, and the log. Every engine is scraped, not just the first
+# — on a multi-card node the per-engine series is what shows one card gone quiet.
+#
+# Started BEFORE the readiness wait: a cold start is a 35GB download plus warmup, and that whole
+# window is when someone wants to see why the node is quiet. In the old order /logs answered nothing
+# until the engines were up, and a node that never got there served nothing at all. /metrics degrades
+# to 503 meanwhile, which the sidecar already handles. Restarted with backoff like templates/dolphin,
+# since a dead sidecar now costs us the only remote read of this container. TERM kills the subshell
+# and orphans its python; container teardown reaps it, because this script is PID 1.
 if [[ -n "${METRICS_TOKEN:-}" ]]; then
     (
         while true; do
@@ -163,8 +168,7 @@ fi
 for gpu_index in $(seq 0 $((gpu_count - 1))); do
     port=$((FIRST_PORT + gpu_index))
     if ! wait_for_engine "${port}"; then
-        echo "[engy] engine on port ${port} never became ready" >&2
-        exit 1
+        refuse_to_start "engine on port ${port} never became ready"
     fi
     echo "[engy] engine on port ${port} ready"
 done
