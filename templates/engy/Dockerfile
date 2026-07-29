@@ -21,12 +21,15 @@ ARG DEBIAN_FRONTEND=noninteractive
 # headers it does not fail loudly — it prints "Triton is not supported on current platform, roll
 # back to CPU" and the engine limps along on the CPU path. Caught by running the container, not by
 # building it.
+# moreutils: for `ts`, which stamps every captured line. The miner prints without a timestamp, and
+# reading our log against engy's per-request dashboard is guesswork without one.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     jq \
     libnuma1 \
+    moreutils \
     python3 \
     python3-dev \
     python3-pip \

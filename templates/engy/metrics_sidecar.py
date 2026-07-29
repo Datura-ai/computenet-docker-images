@@ -1,4 +1,4 @@
-"""Expose the engy container's token counters on :9101 for the platform scraper.
+"""Expose the engy container's token counters and miner log on :9101 for the platform.
 
 Same contract as the Dolphin sidecar (bearer token, fail-closed, port 9101), different plumbing:
 sglang serves Prometheus metrics over HTTP rather than a unix socket, and an engy container runs ONE
@@ -7,21 +7,34 @@ node total is a sum in the query, and a single wedged card stays visible on its 
 
   ENGY_METRICS_TARGETS=http://127.0.0.1:8000,http://127.0.0.1:8001 METRICS_TOKEN=… python3 metrics_sidecar.py
 
-Without METRICS_TOKEN it refuses to start: an unauthenticated metrics port on a miner's host would
-publish our token throughput to whoever scans it.
+Two routes, both behind the same bearer token:
+  /metrics        every engine's Prometheus exposition, stamped with the engine port
+  /logs?tail=N    the tail of the miner's log, because on a miner's host the container's stdout goes
+                  to a docker pipe we cannot reach, and that log is the only record of WHY a routed
+                  request failed
+
+Without METRICS_TOKEN it refuses to start: an unauthenticated port on a miner's host would publish
+our token throughput, and now our logs, to whoever scans it.
 """
 
+import hmac
 import http.server
 import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN: str = os.environ.get("METRICS_TOKEN", "")
 TARGETS: list[str] = [t.strip() for t in os.environ.get("ENGY_METRICS_TARGETS", "").split(",") if t.strip()]
 FETCH_TIMEOUT_SECONDS: float = 5.0
+# The miner's log, tee'd to disk by the entrypoint. Served on /logs so a failure can be read without
+# SSH into the container and without host access to `docker logs`, which we never have on a miner box.
+LOG_FILE: str = os.environ.get("ENGY_LOG_FILE", "/opt/engy/logs/miner.log")
+LOG_TAIL_DEFAULT_BYTES: int = 262144
+LOG_TAIL_MAX_BYTES: int = 8388608
 
 # A Prometheus sample line: name, optional {labels}, then the value. HELP/TYPE lines and blanks pass
 # through untouched — rewriting them would break the exposition format.
@@ -84,6 +97,39 @@ def collect() -> tuple[bytes, int]:
     return ("\n".join(chunks) + "\n").encode("utf-8"), reachable
 
 
+def read_log_tail(max_bytes: int) -> bytes:
+    """The last `max_bytes` of the miner log, starting at the first whole line.
+
+    Reads once, into one buffer: this can be several MB and the server threads one connection per
+    client, so a slice-off-the-partial-line would double the peak for every concurrent reader.
+    """
+    try:
+        with open(LOG_FILE, "rb") as handle:
+            size: int = os.fstat(handle.fileno()).st_size
+            start: int = max(0, size - max_bytes)
+            handle.seek(start)
+            if start:
+                handle.readline()
+            tail: bytes = handle.read()
+            if tail or not start:
+                return tail
+            # The whole window sat inside ONE unterminated line, so skipping the partial line ate
+            # everything. Real logs do this: sglang and huggingface progress bars redraw with \r, and
+            # a single such line was measured at 11.9KB on a live node. A mid-line fragment beats
+            # answering an empty body.
+            handle.seek(start)
+            return handle.read()
+    except OSError as error:
+        return f"log unavailable: {error!r}\n".encode()
+
+
+def requested_tail_bytes(query: str) -> int:
+    tail_values: list[str] = urllib.parse.parse_qs(query).get("tail", [])
+    if tail_values and tail_values[0].isdigit():
+        return min(int(tail_values[0]), LOG_TAIL_MAX_BYTES)
+    return LOG_TAIL_DEFAULT_BYTES
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -98,14 +144,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self) -> bool:
-        return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
+        # Constant-time, like templates/dolphin: a plain == leaks the token one byte at a time to
+        # anyone who can time this port, and it now guards our logs rather than just counters.
+        return hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {TOKEN}")
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.split("?")[0] != "/metrics":
+        route, _, query = self.path.partition("?")
+        if route not in ("/metrics", "/logs"):
             self._reply(404, b"not found\n", "text/plain")
             return
         if not self._authorized():
             self._reply(401, b"unauthorized\n", "text/plain")
+            return
+        if route == "/logs":
+            self._reply(200, read_log_tail(requested_tail_bytes(query)), "text/plain")
             return
         body, reachable = collect()
         # 503 when nothing answered: an empty 200 reads as "this node earns zero", which is a very
