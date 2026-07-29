@@ -48,10 +48,15 @@ start_entrypoint() {
     ENGY_MINER_DIR="${SANDBOX}/miner" \
     "$@" bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
     ENTRYPOINT_PID=$!
-    for _ in $(seq 1 50); do
-        grep -q "engy_miner.py" "${SANDBOX}/calls.log" 2>/dev/null && break
+    # Loud on timeout, never silent: a readiness wait that expires and lets the assertions run anyway
+    # reports "0 engines" on a busy machine and reads like a real regression.
+    local waited=0
+    while (( waited < 150 )); do
+        grep -q "engy_miner.py" "${SANDBOX}/calls.log" 2>/dev/null && return 0
         sleep 0.2
+        waited=$((waited + 1))
     done
+    fail "the miner never started within 30s; entrypoint said: $(tail -2 "${SANDBOX}/out.log" 2>&1)"
 }
 
 run_entrypoint() {

@@ -17,6 +17,7 @@ Without METRICS_TOKEN it refuses to start: an unauthenticated port on a miner's 
 our token throughput, and now our logs, to whoever scans it.
 """
 
+import hmac
 import http.server
 import os
 import re
@@ -134,7 +135,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self) -> bool:
-        return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
+        # Constant-time, like templates/dolphin: a plain == leaks the token one byte at a time to
+        # anyone who can time this port, and it now guards our logs rather than just counters.
+        return hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {TOKEN}")
 
     def do_GET(self) -> None:  # noqa: N802
         route, _, query = self.path.partition("?")

@@ -68,6 +68,13 @@ def start_sidecar(log_file: str) -> subprocess.Popen:
     raise RuntimeError("sidecar never came up")
 
 
+def check_token_comparison_is_constant_time() -> None:
+    """Guarded by reading the source, not by behaviour: `==` and `hmac.compare_digest` return the
+    same answers and differ only in timing, so no HTTP-level assertion can tell them apart."""
+    source: str = pathlib.Path(SIDECAR_PATH).read_text(encoding="utf-8")
+    check("hmac.compare_digest" in source, "the bearer token is compared in constant time")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as workdir:
         log_file: str = os.path.join(workdir, "miner.log")
@@ -83,6 +90,9 @@ def main() -> int:
             check(status == 401, "no token -> 401")
             status, _ = get("/logs", token="wrong-token")
             check(status == 401, "wrong token -> 401")
+            status, _ = get("/logs", token=TOKEN[:-1])
+            check(status == 401, "a token that is a prefix of the real one -> 401")
+            check_token_comparison_is_constant_time()
 
             print("== the tail starts at a whole line and ends at the newest one ==")
             status, body = get("/logs?tail=2000")
