@@ -31,6 +31,12 @@
 #                           shared bin/vllm is wrapped to divide that flag by the count in
 #                           DOLPHIN_ENGINES_PER_CARD_FILE, which is this container's own /tmp so
 #                           an unsplit filler on the same node keeps its full claim (DAH-2473)
+#   - siblings sizing at  -> that measurement reads the card device-wide, so two engines sizing
+#     the same moment       at once each undercount by what the other just took. Workers are
+#                           spawned wave by wave and the second on a card waits for the first to
+#                           actually hold its share, and once one clean engine has printed the
+#                           byte count that reproduces its own KV cache the wrapper pins it with
+#                           --kv-cache-memory, which skips the measurement altogether
 set -euo pipefail
 
 DOLPHIN_HOME="${DOLPHIN_HOME:-/opt/dolphinpod}"
@@ -114,6 +120,15 @@ DOLPHIN_LOCK_TIMEOUT="${DOLPHIN_LOCK_TIMEOUT:-900}"
 # /tmp is the container's own, like the watchdog state (lium-io#1161).
 ENGINES_PER_CARD_FILE="${DOLPHIN_ENGINES_PER_CARD_FILE:-/tmp/dolphin-engines-per-card}"
 
+# The KV cache size, in bytes, that vLLM itself reports as the one reproducing a clean engine's
+# allocation, harvested from the engine log by the wrapper and handed to the next engine on the
+# same card so that engine never has to measure a card its sibling is still moving. Written only
+# by a splitting container, and container-local for the same reason the divisor above is.
+ENGINE_KV_BYTES_FILE="${DOLPHIN_ENGINE_KV_BYTES_FILE:-/tmp/dolphin-kv-cache-bytes}"
+# Where that harvest keeps its copy of the engine's stderr. The worker gives the engine's output
+# nowhere readable, so without this a split that goes wrong leaves nothing at all to read.
+ENGINE_LOG_DIR="${DOLPHIN_ENGINE_LOG_DIR:-/tmp/dolphin-engine-logs}"
+
 # One line per GPU: "<index>, <value>" for one nvidia-smi field, total VRAM by default. Empty
 # output when nvidia-smi is absent/failing.
 detect_gpus() {
@@ -178,10 +193,15 @@ derive_workers_per_bundle() {
 
 # Print each bundle WORKERS_PER_BUNDLE times: an intra-card split is just the same bundle
 # claimed by more than one worker, so it composes with every path in the planner below.
+#
+# Wave by wave — every bundle's first worker, then every bundle's second — rather than a
+# bundle's workers back to back. Two engines on one card must not size their VRAM claim at the
+# same moment (see wait_for_bundle_sized), and back to back is the smallest gap an order can
+# give them while a wave apart is the largest. At one worker per bundle this is unchanged.
 emit_worker_plan() {
     local bundle rep
-    for bundle in "$@"; do
-        for (( rep = 0; rep < WORKERS_PER_BUNDLE; rep++ )); do
+    for (( rep = 0; rep < WORKERS_PER_BUNDLE; rep++ )); do
+        for bundle in "$@"; do
             echo "${bundle}"
         done
     done
@@ -207,9 +227,21 @@ engine_memory_wrapper_installed() {
 # the runtime lives inside DOLPHIN_HOME, which is our volume, so the file the worker execs can be
 # wrapped. The wrapper only divides that one flag and then defers to the untouched vendor script
 # via runpy, so a vendor change to its contents cannot break us.
+# The flag that pins the KV cache to a byte count instead of a fraction of a live snapshot. vLLM
+# renamed it (`--kv-cache-memory-bytes` in 0.23, `--kv-cache-memory` after), so it is read out of
+# the installed package rather than guessed — and an empty answer, from a vLLM too old to have it
+# at all, is what leaves the wrapper pinning nothing rather than launching an engine that dies on
+# an unknown argument.
+engine_kv_cache_flag() {
+    local runtime="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}"
+    grep -rhom1 -- '--kv-cache-memory[a-z-]*' "${runtime}"/lib/python*/site-packages/vllm/engine/arg_utils.py 2>/dev/null | head -1
+}
+
 install_engine_memory_wrapper() {
     local bin_dir="${DOLPHIN_HOME}/runtimes/${WORKER_TYPE}/bin"
     local wrapper="${bin_dir}/vllm" real="${bin_dir}/vllm.real"
+    local kv_flag
+    kv_flag="$(engine_kv_cache_flag)"
     if [[ ! -f "${wrapper}" ]]; then
         # The worker writes its runtime only once it starts, which is what prime_engine_runtime is
         # for. There is nothing to wrap, so the caller runs unsplit rather than crash-looping N-1
@@ -239,11 +271,21 @@ install_engine_memory_wrapper() {
 #!${bin_dir}/python
 # ${ENGINE_WRAPPER_MARKER} (DAH-2473)
 """Claim only this worker's share of the card, then run the vendor's launcher unchanged."""
+import atexit
+import os
+import re
 import runpy
 import sys
+import threading
 
 SHARE_FILE = "${ENGINES_PER_CARD_FILE}"
+KV_BYTES_FILE = "${ENGINE_KV_BYTES_FILE}"
+KV_FLAG = "${kv_flag}"
+LOG_DIR = "${ENGINE_LOG_DIR}"
 REAL = "${real}"
+# A vLLM start writes a few hundred KB; the serving log after it grows for as long as the engine
+# lives, and this is the container's own /tmp. Enough to hold everything that explains a start.
+LOG_LIMIT = 4 << 20
 
 # How many workers this CONTAINER puts on one card, read at launch rather than baked in: this
 # script lives on the volume every filler container of the node shares, so one number written
@@ -270,6 +312,139 @@ if divisor > 1:
             before, after = arg.split("=", 1)[1], "%.4f" % (float(arg.split("=", 1)[1]) / divisor)
             argv[i] = "--gpu-memory-utilization=" + after
 
+# A fraction is a claim on whatever the card looks like at this instant, and on a split card that
+# is the wrong question to ask: vLLM measures free memory device-wide, so a sibling loading its
+# weights during the measurement is charged to THIS engine and shrinks its KV cache by that much
+# (measured 2026-07-28 — engines that started within a second of each other came out 30-40%
+# short). An absolute byte count is the same claim asked as a question about nothing but itself:
+# it skips the measurement entirely, so no sibling can move the answer.
+#
+# The number comes from the first clean engine's own log, so this pins nothing on the first start
+# and nothing at all where the installed vLLM has no such flag.
+kv_bytes = 0
+if divisor > 1 and KV_FLAG and not any(arg.split("=", 1)[0] == KV_FLAG for arg in argv):
+    try:
+        with open(KV_BYTES_FILE) as fh:
+            kv_bytes = int(fh.read().strip())
+    except (OSError, ValueError):
+        kv_bytes = 0
+    if kv_bytes > 0:
+        argv.extend([KV_FLAG, str(kv_bytes)])
+
+
+def publish_kv_bytes(value):
+    # The FIRST engine to size on a clean card is the only one worth copying: measured on a
+    # 4-way B300 on 2026-07-28, the engines that sized alongside it reported 2.35, -22.6 and
+    # -566 GiB of available KV cache and died. Every engine here is a separate process, so
+    # "first one wins" has to be the filesystem's answer, not a flag in this one — link() onto a
+    # name that already exists fails, and it fails without ever publishing a half-written file.
+    tmp = "%s.%d" % (KV_BYTES_FILE, os.getpid())
+    with open(tmp, "w") as fh:
+        fh.write("%d\n" % value)
+    # The wrapper runs as whatever uid the worker gave its engine, not necessarily the next one's.
+    os.chmod(tmp, 0o644)
+    try:
+        os.link(tmp, KV_BYTES_FILE)
+    except OSError:
+        pass
+    os.unlink(tmp)
+
+
+published = False
+# Two ways vLLM names the size that reproduces its own KV cache. Newer builds print the exact
+# byte count to pass back — two of them, and the first, the one that fits the memory we asked for
+# rather than the one that fills the whole card, is ours — with their own 150 MiB safety buffer
+# already taken off; 0.23, the one
+# the worker ships today, only prints the rounded GiB it settled on. That rounding can be half a
+# percent high, and half a percent high is an engine that will not boot, so the rounded form is
+# taken down a percent — a percent of the KV cache is nothing, an OOM at start is the engine.
+KV_EXACT = re.compile(rb"--kv-cache-memory[a-z-]*=([0-9]+)")
+KV_ROUNDED = re.compile(rb"Available KV cache memory: ([0-9]+(?:\.[0-9]+)?) GiB")
+
+
+def kv_bytes_in(line):
+    found = KV_EXACT.search(line)
+    if found:
+        return int(found.group(1))
+    found = KV_ROUNDED.search(line)
+    if found:
+        return int(float(found.group(1)) * (1 << 30) * 0.99)
+    return 0
+
+
+def tee(fd, log):
+    # The worker swallows its engine's output, so the line naming the --kv-cache-memory value
+    # that reproduces this engine's allocation is written nowhere at all — and neither is any
+    # traceback from a start that failed. The stream is duplicated, never taken: every byte read
+    # here is handed back to the worker's own end first, so what the vendor sees is unchanged.
+    passthrough = os.dup(fd)
+    read_fd, write_fd = os.pipe()
+    os.dup2(write_fd, fd)
+    os.close(write_fd)
+
+    def pump():
+        global published
+        written = 0
+        source = os.fdopen(read_fd, "rb")
+        try:
+            for line in source:
+                try:
+                    os.write(passthrough, line)
+                except OSError:
+                    pass
+                try:
+                    if written < LOG_LIMIT:
+                        written += log.write(line)
+                except OSError:
+                    pass
+                # A negative number is what a short-changed engine reports, and it is about to
+                # die anyway; passing that on as the fleet's KV size would kill the rest too.
+                value = 0 if published else kv_bytes_in(line)
+                if value > 0:
+                    try:
+                        publish_kv_bytes(value)
+                        published = True
+                    except OSError:
+                        pass
+        except Exception:
+            # A pump that stopped reading is a full pipe and an engine blocked writing to its own
+            # stdout, which is a worse failure than any this thread exists to prevent. Whatever
+            # went wrong above, keep draining until the engine is gone.
+            try:
+                while source.read(65536):
+                    pass
+            except Exception:
+                pass
+
+    pump_thread = threading.Thread(target=pump, daemon=True)
+    pump_thread.start()
+
+    def drain():
+        # A daemon thread is killed at interpreter exit, and the lines lost with it would be the
+        # ones explaining why this engine is exiting. Put the real stream back so the pipe can
+        # reach EOF, then give the pump a moment to hand on what is still in it. Bounded, because
+        # a child process still holding the pipe would otherwise keep this exit waiting forever.
+        try:
+            os.dup2(passthrough, fd)
+        except OSError:
+            pass
+        pump_thread.join(2)
+
+    atexit.register(drain)
+
+
+# Only a splitting container captures anything: the shipped fleet runs one engine per card, and
+# it has no sibling to be short-changed by and no reason to have its launcher grow a thread.
+if divisor > 1:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        engine_log = open(os.path.join(LOG_DIR, "engine-%d.log" % os.getpid()), "ab", buffering=0)
+        # vLLM logs to stdout and crashes to stderr, and a start that went wrong needs both.
+        tee(1, engine_log)
+        tee(2, engine_log)
+    except OSError as exc:
+        print("[dolphin] engine vram wrapper: no log capture (%s)" % exc, file=sys.stderr)
+
 # All three ways this goes wrong — no share file, a half-written one, a vendor command line
 # without the flag — end as N engines claiming a whole card each, and vLLM reports that as
 # plain OOM. One line per launch is the only place the divisor actually used is written down.
@@ -279,6 +454,9 @@ elif after is None:
     note = "--gpu-memory-utilization not on the command line"
 else:
     note = "--gpu-memory-utilization %s -> %s" % (before, after)
+if divisor > 1:
+    note += ", %s %s" % (KV_FLAG or "--kv-cache-memory(absent)",
+                         kv_bytes if kv_bytes else "not pinned yet")
 try:
     print("[dolphin] engine vram wrapper: divisor=%d, %s" % (divisor, note), file=sys.stderr)
 except Exception:
@@ -315,6 +493,10 @@ publish_engines_per_card() {
     printf '%s\n' "${WORKERS_PER_BUNDLE}" >"${ENGINES_PER_CARD_FILE}"
     # The wrapper runs as whatever uid the worker gave its engine, not necessarily this one.
     chmod 0644 "${ENGINES_PER_CARD_FILE}"
+    # The pinned KV size goes with it. It is only valid for the model, the vLLM build and the card
+    # that produced it, and /tmp outlives all three across a container restart, so it is dropped
+    # here and re-harvested from this start's own first clean engine.
+    rm -f "${ENGINE_KV_BYTES_FILE}"
 }
 
 # Name one instance's private files (HOME, watchdog state). The card set stays in the name for
@@ -470,6 +652,46 @@ wait_for_cache_seed() {
 interruptible_sleep() {
     sleep "$1" &
     wait $! || true
+}
+
+# Hold the next worker on a bundle until the worker already on it has finished claiming its
+# share. Two engines on one card must never size their claim at the same time: vLLM reads free
+# memory device-wide, so a sibling loading weights during that read is charged to the engine
+# doing the reading and shrinks its KV cache by that much. Measured 2026-07-28 on 4 split H200s:
+# the two cards whose engines started within a second of each other came out at 36-44 GB instead
+# of 61 GB and produced half the tokens; the two whose engines started minutes apart landed on
+# target. A fixed stagger cannot fix this because it counts from launch while the sizing happens
+# after the weights load, which takes anywhere from one to several minutes.
+#
+# Resident memory is the honest signal: the KV cache is the last thing an engine allocates, so a
+# card holding its share is a card whose engine is done. Nine tenths of the share, because the
+# engine's own overhead is not in the fraction and the fraction is not exact anyway.
+wait_for_bundle_sized() {
+    local gpu_set="$1" already_on_it="$2"
+    local timeout="${DOLPHIN_SIZING_WAIT_SECONDS:-1800}"
+    local cards total_mb used_mb target_mb waited=0
+    read -r cards total_mb < <(gpu_cards_and_field_total "${gpu_set}" memory.total)
+    # No nvidia-smi, no signal; the caller's stagger is all such a start gets.
+    (( cards > 0 )) || return 0
+    # What EVERY worker already on this bundle should be holding by now, not just the last one:
+    # a card split four ways passes one share as soon as its first engine is up, and releasing
+    # the third worker on that is releasing it into the race the second one is still running.
+    target_mb=$(( total_mb * VRAM_USABLE_PERCENT / 100 / WORKERS_PER_BUNDLE * already_on_it * 9 / 10 ))
+    while true; do
+        read -r cards used_mb < <(gpu_cards_and_field_total "${gpu_set}" memory.used)
+        if (( used_mb >= target_mb )); then
+            echo "[dolphin] [${gpu_set}] holds ${used_mb} MB after ${waited}s; releasing the next worker on it" >&2
+            return 0
+        fi
+        if (( waited >= timeout )); then
+            # Starting anyway rather than never: a worker that never sized is a card serving with
+            # one engine, and refusing the second one keeps it that way.
+            echo "[dolphin] [${gpu_set}] at ${used_mb}/${target_mb} MB after ${waited}s; starting the next worker on it anyway" >&2
+            return 0
+        fi
+        interruptible_sleep 10
+        waited=$((waited + 10))
+    done
 }
 
 # The priming worker below may already have started claiming the card, and phase 2's engines size
@@ -863,16 +1085,22 @@ main() {
         local running_etag
         running_etag="$(published_etag || true)"
         worker_pids=()
+        # The plan lists workers wave by wave, so the worker sharing instance i's cards is
+        # exactly bundle_count places back — and at one worker per bundle there is no such
+        # worker, which is what keeps the shipped fleet on the plain stagger it runs today.
+        local bundle_count=$(( instance_count / WORKERS_PER_BUNDLE ))
         for i in "${!gpu_sets[@]}"; do
             if (( i == 1 )); then
                 # Only before the SECOND instance: once instance 0 serves, the runtime and the
                 # weights are on disk, so 2..N all start warm and need no further wait.
                 wait_for_cache_seed
             fi
-            if (( i > 0 && SPLIT_STAGGER_SECONDS > 0 )); then
-                # sleep in background + wait, so the TERM trap fires immediately
-                sleep "${SPLIT_STAGGER_SECONDS}" &
-                wait $! || true
+            if (( i >= bundle_count )); then
+                # i / bundle_count is this worker's wave, which is also how many workers are
+                # already on its cards.
+                wait_for_bundle_sized "${gpu_sets[$i]}" $(( i / bundle_count ))
+            elif (( i > 0 && SPLIT_STAGGER_SECONDS > 0 )); then
+                interruptible_sleep "${SPLIT_STAGGER_SECONDS}"
             fi
             spawn_instance "${i}"
         done

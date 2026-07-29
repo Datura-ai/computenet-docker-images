@@ -268,15 +268,15 @@ Tests (no GPU needed):
 ```bash
 python3 tests/test_sidecar.py            # host run against the repo copy
 python3 tests/test_watchdog.py           # same; the kill tests need /proc and SKIP on macOS
-tests/run_in_image.sh daturaai/dolphin:0.0.15  # both suites inside the image + docker-stop cleanliness
+tests/run_in_image.sh daturaai/dolphin:0.0.16  # both suites inside the image + docker-stop cleanliness
 ```
 
 ## Build
 
 ```bash
 cd templates/dolphin
-docker buildx bake                     # daturaai/dolphin:0.0.15
-VERSION=0.0.15 docker buildx bake      # override the tag
+docker buildx bake                     # daturaai/dolphin:0.0.16
+VERSION=0.0.16 docker buildx bake      # override the tag
 ```
 
 ## Run

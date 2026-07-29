@@ -472,7 +472,9 @@ test_intra_card_plan() {
         "$(bash -c "set -euo pipefail; source '${ENTRYPOINT}'; wait_for_gpu_memory_release all" >/dev/null 2>&1; echo $?)"
 
     WORKERS_PER_BUNDLE=2
-    assert_eq "each bundle is claimed by two workers" "0|0|1|1" \
+    # Wave by wave, not back to back: siblings on one card must not size their VRAM claim at the
+    # same moment, and adjacent in this list is the smallest gap the order can give them.
+    assert_eq "each bundle is claimed by two workers, a wave apart" "0|1|0|1" \
         "$(emit_worker_plan 0 1 | paste -sd'|' -)"
     assert_eq "replicas of one card get distinct homes" "w0-gpu0 w1-gpu0" \
         "$(instance_tag 0 0) $(instance_tag 1 0)"
@@ -485,10 +487,64 @@ test_intra_card_plan() {
     load_entrypoint
     assert_eq "an explicit count overrides the rule, VRAM and all" "3" \
         "$(derive_workers_per_bundle 1 81559)"
+    WORKERS_PER_BUNDLE=3
+    assert_eq "three per bundle is three waves, one card each" "0|1|0|1|0|1" \
+        "$(emit_worker_plan 0 1 | paste -sd'|' -)"
+    WORKERS_PER_BUNDLE=1
     export DOLPHIN_WORKERS_PER_BUNDLE=oops
     load_entrypoint 2>/dev/null
     assert_eq "a junk value falls back to not splitting" "1" "$(derive_workers_per_bundle 1 143771)"
     unset DOLPHIN_WORKERS_PER_BUNDLE
+}
+
+# The ship blocker measured on 2026-07-28: two engines that sized their claim within a second of
+# each other each came out 30-40% short, because vLLM reads the card's free memory device-wide
+# and charges whatever the sibling took to the engine doing the reading. The gate is what turns
+# "started 30s apart" into "started after the other one is actually holding its share".
+test_wait_for_bundle_sized() {
+    make_sandbox
+    load_entrypoint
+    WORKERS_PER_BUNDLE=2
+    mock_nvidia_smi "0:143771" "1:143771"
+
+    # Half of 85% of an H200 is 61102 MB, and the gate releases at nine tenths of that.
+    mock_gpu_memory_used "0:61000" "1:0"
+    assert_eq "a card already holding its share releases the sibling at once" "0" \
+        "$(DOLPHIN_SIZING_WAIT_SECONDS=0 wait_for_bundle_sized 0 1 >/dev/null 2>&1; echo $?)"
+    assert_eq "and says how much it found" "yes" \
+        "$(wait_for_bundle_sized 0 1 2>&1 >/dev/null | grep -q 'holds 61000 MB' && echo yes || echo no)"
+
+    # An engine that only loaded its weights is not done: its KV cache is the last thing it
+    # allocates, so releasing here is releasing into exactly the race this exists to prevent.
+    mock_gpu_memory_used "0:33000" "1:0"
+    assert_eq "a card holding only the weights does not release the sibling yet" "yes" \
+        "$(DOLPHIN_SIZING_WAIT_SECONDS=0 wait_for_bundle_sized 0 1 2>&1 >/dev/null \
+            | grep -q 'at 33000/54991 MB' && echo yes || echo no)"
+    # Never refusing: a worker that failed to size leaves a card served by one engine, and
+    # holding the second one back forever keeps it that way.
+    assert_eq "but the bound starts it anyway rather than never" "0" \
+        "$(DOLPHIN_SIZING_WAIT_SECONDS=0 wait_for_bundle_sized 0 1 >/dev/null 2>&1; echo $?)"
+
+    # A card split four ways passes ONE share as soon as its first engine is up, so a fixed
+    # threshold would release the third and fourth workers straight into the race the second one
+    # is still running — measured on a B300 (275040 MB, 4 workers) on 2026-07-28.
+    WORKERS_PER_BUNDLE=4
+    mock_gpu_memory_used "0:30000" "1:0"
+    assert_eq "one engine up is enough to release the second worker" "yes" \
+        "$(wait_for_bundle_sized 0 1 2>&1 >/dev/null | grep -q 'holds 30000 MB' && echo yes || echo no)"
+    assert_eq "but not the third, which needs two shares on the card" "yes" \
+        "$(DOLPHIN_SIZING_WAIT_SECONDS=0 wait_for_bundle_sized 0 2 2>&1 >/dev/null \
+            | grep -q 'at 30000/54991 MB' && echo yes || echo no)"
+    mock_gpu_memory_used "0:61000" "1:0"
+    assert_eq "and released once two engines really are holding their shares" "yes" \
+        "$(wait_for_bundle_sized 0 2 2>&1 >/dev/null | grep -q 'holds 61000 MB' && echo yes || echo no)"
+
+    # No nvidia-smi is no signal at all, and a container that cannot see its cards must still
+    # start its workers.
+    rm -f "${SANDBOX}/bin/gpus.txt"
+    assert_eq "a node without nvidia-smi is not held up" "0" \
+        "$(DOLPHIN_SIZING_WAIT_SECONDS=0 wait_for_bundle_sized 0 1 >/dev/null 2>&1; echo $?)"
+    WORKERS_PER_BUNDLE=1
 }
 
 # The wrapper is the only lever we have over the closed worker's hardcoded VRAM claim, and
@@ -497,6 +553,9 @@ test_intra_card_plan() {
 test_engine_memory_wrapper() {
     make_sandbox
     export DOLPHIN_HOME="${SANDBOX}/dolphin"
+    # Baked into the wrapper at install time, so they belong to the sandbox, not to this laptop.
+    export DOLPHIN_ENGINE_KV_BYTES_FILE="${SANDBOX}/kv-cache-bytes"
+    export DOLPHIN_ENGINE_LOG_DIR="${SANDBOX}/engine-logs"
     load_entrypoint
     # main resolves this per bundle; publish_engines_per_card is what turns it into a VRAM fraction,
     # and the wrapper reads that at every launch instead of carrying a number of its own.
@@ -507,7 +566,11 @@ test_engine_memory_wrapper() {
         install_engine_memory_wrapper
 
     local bin_dir="${DOLPHIN_HOME}/runtimes/text-v/bin"
-    mkdir -p "${bin_dir}"
+    local vllm_pkg="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/vllm/engine"
+    mkdir -p "${bin_dir}" "${vllm_pkg}"
+    # vLLM renamed this flag between releases, so the wrapper reads the name out of the installed
+    # package. The fixture ships 0.23's spelling, which is what the worker runs today.
+    printf 'parser.add_argument("--kv-cache-memory-bytes", **kw)\n' >"${vllm_pkg}/arg_utils.py"
     printf 'import sys\nprint("VENDOR " + " ".join(sys.argv[1:]))\n' >"${bin_dir}/vllm"
     install_engine_memory_wrapper 2>/dev/null
 
@@ -606,12 +669,96 @@ EOF
     WORKERS_PER_BUNDLE=2
     publish_engines_per_card
     assert_eq "the wrapper names the divisor and the claim it rewrote" \
-        "[dolphin] engine vram wrapper: divisor=2, --gpu-memory-utilization 0.85 -> 0.4250" \
+        "[dolphin] engine vram wrapper: divisor=2, --gpu-memory-utilization 0.85 -> 0.4250, --kv-cache-memory-bytes not pinned yet" \
         "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 2>&1 >/dev/null)"
     assert_eq "a split whose command line carries no flag says exactly that" \
-        "[dolphin] engine vram wrapper: divisor=2, --gpu-memory-utilization not on the command line" \
+        "[dolphin] engine vram wrapper: divisor=2, --gpu-memory-utilization not on the command line, --kv-cache-memory-bytes not pinned yet" \
         "$(python3 "${bin_dir}/vllm" serve m --kv-cache-dtype fp8 2>&1 >/dev/null)"
-    unset DOLPHIN_HOME
+
+    # A fraction asks what the card looks like right now, and on a split card a sibling loading
+    # weights during that measurement is charged to this engine — measured 2026-07-28 as a 30-40%
+    # shortfall. vLLM prints the byte count that reproduces a clean engine's own KV cache; the
+    # wrapper is what carries it from that engine's log to the next engine's command line.
+    cat >"${bin_dir}/vllm.real" <<'EOF'
+import sys
+print("VENDOR " + " ".join(sys.argv[1:]))
+print("Free memory on device (140.00/140.00 GiB) on startup. Replace gpu_memory_utilization "
+      "config with `--kv-cache-memory=41943040000` (39.06 GiB) to fit into requested memory, "
+      "or `--kv-cache-memory=99999999999` (93.13 GiB) to fully utilize gpu memory.")
+EOF
+    rm -f "${DOLPHIN_ENGINE_KV_BYTES_FILE}"
+    python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 >/dev/null 2>&1
+    # The second number in that line would claim the whole free card, which is the one thing a
+    # split must never do.
+    assert_eq "the value that fits the divided claim is harvested, not the one that fills the card" \
+        "41943040000" "$(cat "${DOLPHIN_ENGINE_KV_BYTES_FILE}" 2>/dev/null)"
+    assert_eq "the engine's own log is kept, since the worker writes it nowhere readable" "yes" \
+        "$(grep -rql 'Free memory on device' "${DOLPHIN_ENGINE_LOG_DIR}" >/dev/null 2>&1 && echo yes || echo no)"
+    assert_eq "the vendor still sees every line the engine wrote" \
+        "VENDOR serve m --gpu-memory-utilization 0.4250 --kv-cache-memory-bytes 41943040000" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 2>/dev/null | head -1)"
+    assert_eq "the pinned size is named in the wrapper's line too" \
+        "[dolphin] engine vram wrapper: divisor=2, --gpu-memory-utilization 0.85 -> 0.4250, --kv-cache-memory-bytes 41943040000" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 2>&1 >/dev/null)"
+
+    # What the worker actually ships today (vLLM 0.23) prints no such suggestion at all — only
+    # the rounded GiB it settled on, which is why the harvest has to read that form too. 25.9 GiB
+    # is what the one clean engine of the 4-way B300 run reported on 2026-07-28.
+    cat >"${bin_dir}/vllm.real" <<'EOF'
+import sys
+print("VENDOR " + " ".join(sys.argv[1:]))
+print("(EngineCore pid=606) INFO [gpu_worker.py:480] Available KV cache memory: 25.9 GiB")
+EOF
+    rm -f "${DOLPHIN_ENGINE_KV_BYTES_FILE}"
+    python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 >/dev/null 2>&1
+    assert_eq "the rounded GiB form is harvested a percent under, never over" "27531814109" \
+        "$(cat "${DOLPHIN_ENGINE_KV_BYTES_FILE}" 2>/dev/null)"
+
+    # Its short-changed siblings report -22.6 and -566 GiB on their way out. Publishing one of
+    # those as the fleet's KV size would take down the engines that were still healthy.
+    cat >"${bin_dir}/vllm.real" <<'EOF'
+import sys
+print("VENDOR " + " ".join(sys.argv[1:]))
+print("(EngineCore pid=1950) INFO [gpu_worker.py:480] Available KV cache memory: -566.67 GiB")
+EOF
+    rm -f "${DOLPHIN_ENGINE_KV_BYTES_FILE}"
+    python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 >/dev/null 2>&1
+    assert_eq "a dying engine's negative report is never published" "no" \
+        "$([[ -f "${DOLPHIN_ENGINE_KV_BYTES_FILE}" ]] && echo yes || echo no)"
+
+    # First engine wins: every engine is its own process, so this cannot be a flag in one of them.
+    printf '111\n' >"${DOLPHIN_ENGINE_KV_BYTES_FILE}"
+    cat >"${bin_dir}/vllm.real" <<'EOF'
+import sys
+print("VENDOR " + " ".join(sys.argv[1:]))
+print("(EngineCore pid=1987) INFO [gpu_worker.py:480] Available KV cache memory: 2.35 GiB")
+EOF
+    python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 >/dev/null 2>&1
+    assert_eq "a later engine never overwrites the first one's value" "111" \
+        "$(cat "${DOLPHIN_ENGINE_KV_BYTES_FILE}" 2>/dev/null)"
+
+    # A vLLM with no such flag must be launched without it rather than not at all.
+    rm -f "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/vllm/engine/arg_utils.py"
+    install_engine_memory_wrapper 2>/dev/null
+    assert_eq "a vLLM without the flag is launched without it, not left unstarted" \
+        "VENDOR serve m --gpu-memory-utilization 0.4250" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 2>/dev/null | head -1)"
+
+    # The pin belongs to one model on one vLLM build on one card, and /tmp outlives all three
+    # across a container restart. Every start drops it and re-harvests.
+    publish_engines_per_card
+    assert_eq "a restart does not carry the old pin over" "no" \
+        "$([[ -f "${DOLPHIN_ENGINE_KV_BYTES_FILE}" ]] && echo yes || echo no)"
+
+    # The unsplit fleet is every filler container we actually ship, and it shares this launcher.
+    # It gets no thread, no log and no extra flag — the vendor's command line, byte for byte.
+    WORKERS_PER_BUNDLE=1
+    publish_engines_per_card
+    printf '4242\n' >"${DOLPHIN_ENGINE_KV_BYTES_FILE}"
+    assert_eq "an unsplit container is never pinned, even with a value lying around" \
+        "VENDOR serve m --gpu-memory-utilization 0.85" \
+        "$(python3 "${bin_dir}/vllm" serve m --gpu-memory-utilization 0.85 2>/dev/null | head -1)"
+    unset DOLPHIN_HOME DOLPHIN_ENGINE_KV_BYTES_FILE DOLPHIN_ENGINE_LOG_DIR
 }
 
 # Phase 1 of the split. The wrapper needs a launcher that only the worker writes, and only after
@@ -754,6 +901,11 @@ if [[ "\$1" == "start" ]]; then
     echo "\${HOME}" >>"${SANDBOX}/starts.log"
     ( sleep 1; mkdir -p "${engine_dir}"; printf 'import sys\n' >"${engine_dir}/vllm" ) &
     mkdir -p "${SANDBOX}/dp-\$\$" && touch "${SANDBOX}/dp-\$\$/v.sock"
+    # A real worker's engine ends up holding its share of the card, which is what releases the
+    # next worker on it. Not the priming worker: phase 2 refuses to start until IT lets go.
+    if [[ "\${HOME}" != */prime ]]; then
+        echo "0, 61000" >"${SANDBOX}/bin/gpus_used.txt"
+    fi
     exec sleep 300
 fi
 exit 0
@@ -843,6 +995,7 @@ watchdog.py gpus=all home=w1-gpuall state=dolphin_watchdog_state_w1-gpuall.json"
 
 test_plan
 test_intra_card_plan
+test_wait_for_bundle_sized
 test_engine_memory_wrapper
 test_prime_engine_runtime
 test_cold_intra_card_split_smoke
