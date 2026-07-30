@@ -16,12 +16,13 @@ MODEL="${MODEL:-qwen3.6-35b-a3b}"
 CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
 CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
-# Per-engine concurrency, and now also what ONE miner declares to the gateway as MAX_INFLIGHT.
-# 4, not the 8 this image shipped with. The gateway drives the whole node at ~4 concurrent, so a
-# per-worker 4 is already 8x real demand, while the probe burst it invites costs ~5-11s of GIL
-# against a 60s ping timeout. Raising it back is cheap now that worker ids survive a restart.
-# See ARCHITECTURE.md, "Why one miner per engine" and "Why the concurrency we declare is small".
-PER_ENGINE_REQUESTS="${ENGY_MAX_RUNNING_REQUESTS:-4}"
+# Per-engine concurrency, and also what ONE miner declares to the gateway as MAX_INFLIGHT.
+# 8 is a FLOOR, not a preference: the miner derives its gateway connection count from this number
+# (see _leg_plan), the gateway runs 8 workers, and a miner holding fewer than 8 connections is
+# refused onboarding outright — "offered N distinct clean legs, below the required 8". Measured by
+# running this image at 4: instant failure, zero traffic, ever.
+# See ARCHITECTURE.md, "Why every miner declares exactly 8".
+PER_ENGINE_REQUESTS="${ENGY_MAX_RUNNING_REQUESTS:-8}"
 FIRST_PORT="${ENGY_FIRST_PORT:-8000}"
 # The gateway's own model spec forces this; sglang refuses a shorter context for it.
 CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"

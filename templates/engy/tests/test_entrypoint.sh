@@ -139,6 +139,22 @@ fi
     || fail "worker ids ignore ENGY_WORKER_NAME"
 rm -rf "${SANDBOX}"
 
+echo "== the default declared concurrency is the onboarding floor, not lower =="
+# The miner derives its gateway connection count from MAX_INFLIGHT, and a worker holding fewer than
+# the gateway's 8 connections is refused onboarding outright. Measured on a rented H100: declaring 4
+# failed in three seconds with "offered 4 distinct clean legs, below the required 8", zero traffic.
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test
+if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
+    fail "default declared concurrency is not 8: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "with no override every miner declares 8"
+fi
+grep -q -- "--max-running-requests 8" "${SANDBOX}/calls.log" \
+    && pass "the engine is sized to match what the miner declares" \
+    || fail "engine --max-running-requests does not match the declared 8"
+rm -rf "${SANDBOX}"
+
 echo "== the event-loop lag probe is wired up =="
 # Without it, our own GIL stall and the gateway going quiet are the same Close(1011) in the log.
 new_sandbox 2

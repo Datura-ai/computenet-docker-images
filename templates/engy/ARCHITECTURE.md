@@ -27,40 +27,42 @@ nothing here because the model fits on one card, and it costs the interconnect o
 
 ## Why one miner per engine
 
-The image originally ran ONE miner driving every engine. That miner is a single Python process, and
-it is the bottleneck, not the GPUs.
+Because that is what the network does, and because it shrinks the blast radius of a bad minute.
 
-engy's protocol requires a TOPLOC proof with every answer, built from the model's hidden states. So
-an 8192-token answer comes back as **~157MB of JSON** instead of ~30KB of text. Measured on a live
-L40S: `json.loads` on one 78MB chunk takes **1.11s**, the numpy conversion another **0.22s** — about
-**2.7s per request**, all of it holding the GIL. The same interpreter owns the gateway websockets and
-must answer their keepalive pings.
+Surveyed on 2026-07-30 from `GET /v1/network`: **635 workers under 62 miner keys**. The dominant
+shape is many workers per key, one per card — **354 of 635 workers report exactly one visible GPU**,
+and the largest keys run 74, 53 and 52 workers each. Several name their workers `<host>-8001`,
+`<host>-8002`, one per engine port, which is exactly this file's layout. A single worker fronting
+eight cards, which is what this image used to ship, is a shape almost nobody else runs.
 
-On 2026-07-29 the capacity probe burst ~30 concurrent requests at one worker. 30 x 2.7s = ~81s of
-serialised work against a 60s ping timeout. At **13:43:47 UTC** five legs closed with
-`Close(code=1011, reason='keepalive ping timeout')`, the in-flight requests died with them, and engy
-marked the worker `capacity_http`. It stayed unqualified for a day.
+The operational argument is the capacity probe. engy probes a WORKER, and a worker that fails a
+probe is out until someone re-onboards it. With one worker per node a bad probe costs all eight
+cards; with one worker per card it costs one, and the other seven keep earning through it.
 
-The GIL is per PROCESS. One miner per engine turns one serialised queue into N independent ones, so a
-burst against any single worker only has to fit that worker's own budget. This is why the fix is more
-miners rather than forking the miner to move parsing into a process pool: the fork costs a permanent
-divergence from a file upstream edits weekly, and buys throughput nothing is asking for.
+It is NOT about the GIL. That was the working theory for a day and it is disproven — see "What the
+GIL turned out not to explain" below.
 
-## Why the concurrency we declare is small
+## Why every miner declares exactly 8
 
-`ENGY_MAX_RUNNING_REQUESTS` (default **4**) is both sglang's `--max-running-requests` and what one
-miner declares to the gateway as `MAX_INFLIGHT`. It used to be 8, and the whole node declared
-8 x cards = 64.
+`ENGY_MAX_RUNNING_REQUESTS` (default **8**) is both sglang's `--max-running-requests` and what one
+miner declares to the gateway as `MAX_INFLIGHT`. **8 is a floor, not a tuning choice.**
 
-Two facts decide the number. The gateway drives the **whole node** at about **4 concurrent** — 809
-requests over 4h with `sglang:num_queue_reqs` sitting at zero on every engine — so per worker the
-real demand is well under one. And the capacity probe's burst scales with what we declare, which is
-the only thing that has ever knocked us offline.
+The miner derives its gateway connection count from this number (`_leg_plan`): when `MAX_INFLIGHT`
+is below the gateway's worker count it opens that many connections instead, one inflight each. The
+gateway runs 8 workers, and a worker holding fewer than 8 connections is refused before it ever
+serves anything — the portal says so in as many words: *"Qualification and sampling only target
+workers with all 8 legs live, so it will receive no test traffic — and cannot be onboarded — until
+every leg connects."*
 
-So 4 per worker is already ~8x real demand, and it keeps a burst inside ~5-11s of GIL against the 60s
-timeout. Declaring more buys share we are not being offered and risks the one failure that costs a
-day. **Raise it when `sglang:num_queue_reqs` stops being zero, not before** — that counter is the
-honest signal that the gateway wants more than we accept.
+Measured by running this image at 4 on a rented H100 (2026-07-30): the worker connected, opened four
+connections, and was failed in three seconds with `offered 4 distinct clean legs, below the required
+8`. Zero requests, ever. **Never set this below 8.**
+
+Above 8 buys nothing either. Same box, same day: declaring 8 drew a burst of 8 concurrent; declaring
+**64 drew the same burst of 8**. The number we declare is an admission ticket, not a throttle — the
+gateway sends what it wants to send. Prod, meanwhile, sat at 2 concurrent across all eight engines
+over a 7-minute sample. 481 of the network's 635 workers declare 8; only 7 declare 64, and until
+this change we were one of them.
 
 ## Why worker ids are derived, not random
 
@@ -85,25 +87,52 @@ The same patch also scopes the miner's singleton lock to the worker. Upstream lo
 one per card: the first miner takes the lock and every other prints "another instance is running"
 and exits, leaving all but one GPU unmined with nothing in the log that looks like a failure.
 
-## How we tell OUR stall from the gateway going quiet
+## What the GIL turned out not to explain
 
-Everything above about the GIL is a mechanism, not a verdict. It is measured — one 78MB reply costs
-1.33s of GIL on a live L40S, and a bench of 14 GIL-seconds of concurrent parsing leaves an asyncio
-loop unserviced for 13.7s, close to 1:1 — but the mechanism does not prove it caused any particular
-outage. `Close(1011, 'keepalive ping timeout')` is emitted by OUR websocket client when it does not
-see a pong in time, and that happens both when our loop is too busy to READ the pong and when the
-gateway never SENT one. The log cannot tell those apart.
+Keep this section. It is the most expensive thing we learned, and the theory it kills is a plausible
+one that will occur to the next reader within five minutes of seeing the payload sizes.
+
+The mechanism is real. A TOPLOC proof ships the model's hidden states, so an 8192-token answer comes
+back as ~157MB of JSON instead of ~30KB of text; `json.loads` plus the numpy conversion on one chunk
+costs **1.33s on an L40S and 2.32s on the prod H200 box**, all of it holding the GIL, in the same
+interpreter that answers the gateway's keepalive. It is the obvious suspect for the 2026-07-29
+outage, when five connections closed at 13:43:47 UTC with `Close(1011, 'keepalive ping timeout')` and
+engy marked the worker `capacity_http`.
+
+It is not what happened. Three measurements, 2026-07-30:
+
+- **Full-path replay on a real engine** (`_process` itself: chunked generation, parses, proof build,
+  decode), eight concurrent 16384-token requests — the shape prod was in. Worst event-loop gap
+  **3.4s** against the 60s budget. Our code cannot manufacture a 60-second silence.
+- **Live probe during two real capacity bursts**, declaring 8 and then 64: worst lag **0.695s** and
+  **0.935s**, zero disconnects, 570 requests at 100%.
+- **Prod log forensics.** The engines wrote a log line every single second straight through the
+  "silent" minute, so the host was alive and scheduling. Meanwhile the connections died in
+  synchronized groups — 13:02 x7, 13:13 x7, 13:17 x5, 13:22 x3, 13:29 x3, 13:43 x5 UTC, each group
+  inside the same second, 60 keepalive timeouts plus 10 bare TCP resets. That is a 40-minute network
+  storm between the miner host and `api.engy.ai`, not a busy interpreter — a GIL stall cannot drop
+  five independent sockets in the same second while the process keeps logging. The capacity probe
+  was claimed at 12:47 and failed at 13:45, entirely inside the storm; its in-flight requests died
+  with the connections. There have been zero disconnects in the 18 hours since, and the re-probe
+  passed on the same configuration.
+
+The lesson for the next outage: `Close(1011)` is emitted by OUR client when it sees no pong in time,
+and that happens both when our loop is too busy to READ the pong and when the network never
+delivered one. The log alone cannot tell those apart. The probe can, which is why it stays.
+
+## How we tell OUR stall from the gateway going quiet
 
 `loop_probe.py` settles it. Each miner runs a coroutine on its own event loop that expects to wake
 every 250ms and records the overshoot: the loop's own delay is the measurement. The sidecar merges
 the resulting files into `/metrics`. The decision rule:
 
 - `engy_miner_loop_lag_seconds_max` near the 60s ping timeout, with
-  `engy_miner_loop_lag_peak_inflight` above zero — it is us. Lower `TOPLOC_GEN_CHUNK` (smaller JSON
-  per parse) or the declared concurrency.
-- a leg dropping while the lag stayed flat — it is not us. Take it to engy with the timestamp.
+  `engy_miner_loop_lag_peak_inflight` above zero — it is us. Lower `TOPLOC_GEN_CHUNK`, which caps
+  output tokens per serve call and so shrinks each parse.
+- connections dropping while the lag stayed flat — it is not us. Take the timestamp to engy. This is
+  what 2026-07-29 looked like.
 - `engy_miner_loop_stall_samples_total{ge="60"}` is the one to alert on: past that threshold we are
-  guaranteed to be dropping legs.
+  guaranteed to be dropping connections.
 
 The in-flight count is read BEFORE each wait as well as after, and the larger is kept. Reading it
 only on waking undercounts the exact case that matters: the miner drops a job from `_JOBS` on the
@@ -197,9 +226,12 @@ exactly the case they are most worth reading — every engine down, miners still
 
 ## What we deliberately did not do
 
-- **Fork the miner** to move parsing and proof building into worker processes. It fixes the GIL at the
-  cost of permanent divergence from a file upstream changes weekly, and buys concurrency nothing is
-  asking for. Revisit if `sglang:num_queue_reqs` stops being zero.
+- **Fork the miner** to move parsing and proof building into worker processes. Measured worst
+  event-loop gap under the real prod shape is 3.4s against a 60s budget, so there is nothing here to
+  fix; the fork would buy a permanent divergence from a file upstream changes weekly in exchange for
+  headroom we already have. Revisit only if the probe starts reporting stalls.
+- **Lower the declared concurrency.** Declaring 8 and declaring 64 drew the same burst of 8, so the
+  number throttles nothing — and below 8 the worker cannot be onboarded at all.
 - **Auto-update the vendored miner.** It is pinned (currently upstream v0.4.4 plus the worker-id
   patch) because it must match the gateway protocol exactly, and because every image bump costs a
   restart. Watch upstream and update deliberately, in batches, when acceptance drops or a needed fix
