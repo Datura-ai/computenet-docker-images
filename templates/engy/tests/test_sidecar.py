@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import http.server
+import threading
 import urllib.error
 import urllib.request
 
@@ -47,7 +49,60 @@ def get(path: str, token: str | None = TOKEN) -> tuple[int, bytes]:
         return error.code, error.read()
 
 
-def start_sidecar(log_file: str) -> subprocess.Popen:
+class FakeEngine:
+    """A minimal /metrics server standing in for one sglang engine."""
+
+    def __init__(self, delay_seconds: float, body: str) -> None:
+        self.delay_seconds: float = delay_seconds
+        self.body: str = body
+        handler = self._build_handler()
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.port: int = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def _build_handler(self) -> type:
+        engine = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                time.sleep(engine.delay_seconds)
+                payload = engine.body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        return Handler
+
+    def shutdown(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def start_slow_engine() -> FakeEngine:
+    # Longer than the whole scrape budget: sequentially this one alone consumed it.
+    return FakeEngine(delay_seconds=30.0, body="# TYPE sglang:slow gauge\nsglang:slow 1\n")
+
+
+def start_fast_engine() -> FakeEngine:
+    return FakeEngine(
+        delay_seconds=0.0,
+        body="# TYPE sglang:generation_tokens_total counter\nsglang:generation_tokens_total 42\n",
+    )
+
+
+def start_sidecar(log_file: str, probe_dir: str, targets: str = "http://127.0.0.1:1") -> subprocess.Popen:
     process = subprocess.Popen(
         [sys.executable, SIDECAR_PATH],
         env={
@@ -55,8 +110,8 @@ def start_sidecar(log_file: str) -> subprocess.Popen:
             "METRICS_TOKEN": TOKEN,
             "METRICS_PORT": str(PORT),
             "ENGY_LOG_FILE": log_file,
-            # No engine is running in a test; /metrics answers 503 and that is a covered case.
-            "ENGY_METRICS_TARGETS": "http://127.0.0.1:1",
+            "ENGY_PROBE_DIR": probe_dir,
+            "ENGY_METRICS_TARGETS": targets,
         },
     )
     for _ in range(50):
@@ -75,6 +130,14 @@ def check_token_comparison_is_constant_time() -> None:
     check("hmac.compare_digest" in source, "the bearer token is compared in constant time")
 
 
+def restart_sidecar_targeting(target_urls: list[str], log_file: str, probe_dir: str) -> None:
+    """Point a fresh sidecar at real engines; the module reads TARGETS once, at import."""
+    global sidecar
+    sidecar.terminate()
+    sidecar.wait(timeout=10)
+    sidecar = start_sidecar(log_file, probe_dir, targets=",".join(target_urls))
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as workdir:
         log_file: str = os.path.join(workdir, "miner.log")
@@ -83,7 +146,21 @@ def main() -> int:
                 handle.write(f"[engy-miner] line {line_number} padding-padding-padding\n")
             handle.write("[engy-miner] LAST-LINE\n")
 
-        sidecar = start_sidecar(log_file)
+        probe_dir: str = os.path.join(workdir, "probe")
+        os.makedirs(probe_dir)
+        # Two miners' files, plus the .tmp an in-progress atomic write leaves in the same directory.
+        for worker in ("g0", "g1"):
+            with open(os.path.join(probe_dir, f"loop-{worker}.prom"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# HELP engy_miner_loop_lag_seconds_max Worst event-loop delay.\n"
+                    "# TYPE engy_miner_loop_lag_seconds_max gauge\n"
+                    f'engy_miner_loop_lag_seconds_max{{engy_worker="{worker}"}} 12.5\n'
+                )
+        with open(os.path.join(probe_dir, "loop-g2.prom.tmp"), "w", encoding="utf-8") as handle:
+            handle.write("half-written garbage")
+
+        global sidecar
+        sidecar = start_sidecar(log_file, probe_dir)
         try:
             print("== /logs is behind the same bearer token as /metrics ==")
             status, _ = get("/logs", token=None)
@@ -122,9 +199,38 @@ def main() -> int:
             status, body = get("/logs")
             check(status == 200 and b"log unavailable" in body, "missing file -> 200 with a reason")
 
-            print("== the metrics route still works next to /logs ==")
-            status, _ = get("/metrics")
-            check(status == 503, "unreachable engines -> 503, not a crash")
+            print("== the miners' loop-lag files reach /metrics ==")
+            status, body = get("/metrics")
+            check(b'engy_worker="g0"' in body and b'engy_worker="g1"' in body,
+                  "both miners' loop-lag series are exposed")
+            check(body.count(b"# HELP engy_miner_loop_lag_seconds_max") == 1,
+                  "two miners produce ONE HELP line, so the exposition stays valid")
+            check(b"half-written garbage" not in body,
+                  "an in-progress atomic write (.tmp) is not served")
+
+            print("== a scrape with probe data but no engine still serves the probes ==")
+            # Prometheus discards the WHOLE body on a non-2xx, so a 503 here threw the loop-lag
+            # series away exactly when no engine answered — when they matter most.
+            check(status == 200, "unreachable engines + probe files -> 200, not 503")
+            check(b"engy_sidecar_engines_reachable 0" in body,
+                  "and engines_reachable 0 carries the engine alert instead")
+            print("== one slow engine must not starve the others ==")
+            # Sequentially, the first slow target spent the whole budget and every later engine was
+            # skipped without a connection attempt — the undercount the shared budget exists to stop.
+            slow = start_slow_engine()
+            fast = start_fast_engine()
+            try:
+                restart_sidecar_targeting([slow.url, fast.url], log_file, probe_dir)
+                status, body = get("/metrics")
+                check(status == 200, "a slow first engine still yields 200")
+                check(b"sglang:generation_tokens_total" in body,
+                      "the FAST engine's metrics land in the body despite the slow one being first")
+                check(b"engy_sidecar_engines_reachable 1" in body,
+                      "and it is counted as reachable")
+            finally:
+                slow.shutdown()
+                fast.shutdown()
+
             status, _ = get("/nope")
             check(status == 404, "unknown route -> 404")
         finally:

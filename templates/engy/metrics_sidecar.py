@@ -8,7 +8,8 @@ node total is a sum in the query, and a single wedged card stays visible on its 
   ENGY_METRICS_TARGETS=http://127.0.0.1:8000,http://127.0.0.1:8001 METRICS_TOKEN=… python3 metrics_sidecar.py
 
 Two routes, both behind the same bearer token:
-  /metrics        every engine's Prometheus exposition, stamped with the engine port
+  /metrics        every engine's Prometheus exposition stamped with the engine port, plus each
+                  miner's event-loop-lag series read off disk (see loop_probe.py)
   /logs?tail=N    the tail of the miner's log, because on a miner's host the container's stdout goes
                   to a docker pipe we cannot reach, and that log is the only record of WHY a routed
                   request failed
@@ -17,11 +18,14 @@ Without METRICS_TOKEN it refuses to start: an unauthenticated port on a miner's 
 our token throughput, and now our logs, to whoever scans it.
 """
 
+import concurrent.futures
 import hmac
+import http.client
 import http.server
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,24 +33,52 @@ import urllib.request
 PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN: str = os.environ.get("METRICS_TOKEN", "")
 TARGETS: list[str] = [t.strip() for t in os.environ.get("ENGY_METRICS_TARGETS", "").split(",") if t.strip()]
-FETCH_TIMEOUT_SECONDS: float = 5.0
+# ONE deadline for the whole fan-out, not per engine. A fixed per-target timeout silently drops
+# the tail once a node runs many engines: 8 cards x a slow /metrics is 40s sequentially, long past
+# any scraper's patience, so the last engines vanish from the body — the exact undercount this
+# fan-out exists to prevent. Shape borrowed from templates/dolphin.
+TOTAL_BUDGET_SECONDS: float = min(4.0 + 0.4 * max(0, len(TARGETS) - 1), 7.0)
+# A stale port can host a non-HTTP listener and sglang can die mid-response; cap what we read.
+MAX_BODY_BYTES: int = 5 * 1024 * 1024
+UNREACHABLE_LOG_INTERVAL_SECONDS: float = 300.0
 # The miner's log, tee'd to disk by the entrypoint. Served on /logs so a failure can be read without
 # SSH into the container and without host access to `docker logs`, which we never have on a miner box.
 LOG_FILE: str = os.environ.get("ENGY_LOG_FILE", "/opt/engy/logs/miner.log")
 LOG_TAIL_DEFAULT_BYTES: int = 262144
 LOG_TAIL_MAX_BYTES: int = 8388608
+# Where the miners drop their event-loop-lag expositions (loop_probe.py). Read from disk rather than
+# scraped over a port: the miner has no listener, and adding one to the process whose loop we are
+# measuring would make the measurement depend on the thing being measured.
+PROBE_DIR: str = os.environ.get("ENGY_PROBE_DIR", "")
+MAX_PROBE_BYTES: int = 65536
 
 # A Prometheus sample line: name, optional {labels}, then the value. HELP/TYPE lines and blanks pass
 # through untouched — rewriting them would break the exposition format.
 SAMPLE_LINE = re.compile(r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?P<labels>\{.*\})?(?P<rest>\s+.+)$")
 
 
+_last_unreachable_log: dict[str, float] = {}
+
+
 def _log(message: str) -> None:
     print(f"[engy-metrics] {message}", file=sys.stderr, flush=True)
 
 
+def _log_unreachable(target: str, error: BaseException) -> None:
+    """Rate-limited: a crash-looping engine must not flood the log we now serve over /logs."""
+    now: float = time.monotonic()
+    if now - _last_unreachable_log.get(target, 0.0) < UNREACHABLE_LOG_INTERVAL_SECONDS:
+        return
+    _last_unreachable_log[target] = now
+    _log(f"engine {target} unreachable: {error!r}")
+
+
 def label_with_engine(body: str, engine_port: str) -> str:
-    """Add engine="<port>" to every sample line so N engines can share one exposition."""
+    """Add engy_engine="<port>" to every sample line so N engines can share one exposition.
+
+    Namespaced on purpose: sglang already labels its own samples engine_type=, and a bare `engine`
+    key colliding with one of its own would make the exposition invalid.
+    """
     labelled: list[str] = []
     for line in body.splitlines():
         match = SAMPLE_LINE.match(line) if line and not line.startswith("#") else None
@@ -55,46 +87,155 @@ def label_with_engine(body: str, engine_port: str) -> str:
             continue
         existing_labels: str = match.group("labels") or ""
         merged_labels: str = (
-            existing_labels[:-1] + f',engine="{engine_port}"}}' if existing_labels else f'{{engine="{engine_port}"}}'
+            existing_labels[:-1] + f',engy_engine="{engine_port}"}}'
+            if existing_labels
+            else f'{{engy_engine="{engine_port}"}}'
         )
         labelled.append(f"{match.group('name')}{merged_labels}{match.group('rest')}")
     return "\n".join(labelled)
 
 
-def fetch_engine_metrics(target: str) -> str | None:
+def fetch_engine_metrics(target: str, deadline: float) -> str | None:
     engine_port: str = target.rsplit(":", 1)[-1]
-    try:
-        with urllib.request.urlopen(f"{target}/metrics", timeout=FETCH_TIMEOUT_SECONDS) as response:
-            body: str = response.read().decode("utf-8", "replace")
-    except (urllib.error.URLError, OSError, ValueError) as error:
-        _log(f"engine {target} unreachable: {error!r}")
+    remaining: float = deadline - time.monotonic()
+    if remaining <= 0:
+        _log_unreachable(target, TimeoutError("scrape budget spent before this engine was reached"))
         return None
-    return label_with_engine(body, engine_port)
+    try:
+        with urllib.request.urlopen(f"{target}/metrics", timeout=remaining) as response:
+            raw: bytes = response.read(MAX_BODY_BYTES + 1)
+    # http.client.HTTPException is NOT an OSError, and urllib re-raises it unwrapped: a stale port
+    # hosting a non-HTTP listener, or sglang dying mid-response, would kill the handler thread and
+    # the scraper would see a connection reset instead of a body.
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as error:
+        _log_unreachable(target, error)
+        return None
+    if len(raw) > MAX_BODY_BYTES:
+        _log_unreachable(target, ValueError(f"body over {MAX_BODY_BYTES} bytes"))
+        return None
+    return label_with_engine(raw.decode("utf-8", "replace"), engine_port)
+
+
+def metric_family(sample_name: str) -> str:
+    """The family a sample belongs to; histogram and counter suffixes share one HELP/TYPE block."""
+    for suffix in ("_bucket", "_sum", "_count", "_created", "_total"):
+        if sample_name.endswith(suffix):
+            return sample_name[: -len(suffix)]
+    return sample_name
+
+
+def merge_engine_bodies(bodies: list[str]) -> str:
+    """Regroup N engines' samples so each family's HELP/TYPE and all of its samples stay contiguous.
+
+    Concatenating whole bodies repeats every HELP/TYPE once per engine and interleaves families.
+    Prometheus rejects a second HELP for a metric name, so on a multi-GPU node the WHOLE scrape was
+    invalid, not one series. Measured on the 8-card prod node: 499 HELP lines for 65 families.
+    """
+    comments: dict[str, list[str]] = {}
+    samples: dict[str, list[str]] = {}
+    families_in_order: list[str] = []
+    for body in bodies:
+        for line in body.splitlines():
+            if not line.strip():
+                continue
+            if line.startswith("#"):
+                parts: list[str] = line.split(maxsplit=3)
+                if len(parts) >= 3 and parts[1] in ("HELP", "TYPE"):
+                    family: str = metric_family(parts[2])
+                    if family not in families_in_order:
+                        families_in_order.append(family)
+                    if line not in comments.setdefault(family, []):
+                        comments[family].append(line)
+                continue
+            match = SAMPLE_LINE.match(line)
+            if match is None:
+                continue
+            family = metric_family(match.group("name"))
+            if family not in families_in_order:
+                families_in_order.append(family)
+            samples.setdefault(family, []).append(line)
+    merged: list[str] = []
+    for family in families_in_order:
+        merged.extend(comments.get(family, []))
+        merged.extend(samples.get(family, []))
+    return "\n".join(merged)
+
+
+def read_probe_bodies() -> list[str]:
+    """Every miner's loop-lag exposition. A miner that died leaves its last file behind on purpose —
+    it carries its own written-at timestamp, and a frozen series says more than a vanished one."""
+    if not PROBE_DIR:
+        return []
+    try:
+        names: list[str] = sorted(os.listdir(PROBE_DIR))
+    except OSError as error:
+        _log_unreachable(PROBE_DIR, error)
+        return []
+    bodies: list[str] = []
+    for name in names:
+        if not name.endswith(".prom"):
+            continue                                   # skips the .tmp a concurrent write is using
+        path: str = os.path.join(PROBE_DIR, name)
+        try:
+            with open(path, "rb") as handle:
+                raw: bytes = handle.read(MAX_PROBE_BYTES)
+        except OSError as error:
+            _log_unreachable(path, error)
+            continue
+        bodies.append(raw.decode("utf-8", "replace"))
+    return bodies
+
+
+def fetch_all_engine_metrics() -> list[str]:
+    """Every engine that answered within ONE shared deadline, asked all at once.
+
+    Concurrently, not in a loop: with a sequential walk the first slow engine spends the whole
+    budget and every later one is skipped without a connection attempt — the tail engines vanish
+    and engines_reachable is undercounted, which is the exact failure the budget was added to
+    prevent. Threads rather than asyncio because this server is threaded already and each fetch is
+    one blocking urlopen.
+    """
+    if not TARGETS:
+        return []
+    deadline: float = time.monotonic() + TOTAL_BUDGET_SECONDS
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(TARGETS)) as pool:
+        futures = [pool.submit(fetch_engine_metrics, target, deadline) for target in TARGETS]
+        bodies: list[str] = []
+        for future in futures:
+            remaining: float = max(0.0, deadline - time.monotonic())
+            try:
+                # An absolute wait on top of the per-socket timeout: a body dripped one byte per
+                # read window satisfies every recv timeout and would otherwise hold the scrape open.
+                body: str | None = future.result(timeout=remaining)
+            except concurrent.futures.TimeoutError:
+                continue
+            if body is not None:
+                bodies.append(body)
+    return bodies
 
 
 def collect() -> tuple[bytes, int]:
-    """Every reachable engine's metrics, plus how many answered.
+    """Every reachable engine's metrics plus the miners' probes, and how much answered.
 
     A dead engine is skipped rather than failing the whole scrape: on a multi-card node the surviving
     engines are still earning, and the reachable-count series is what says a card went quiet.
     """
-    chunks: list[str] = []
-    reachable: int = 0
-    for target in TARGETS:
-        body: str | None = fetch_engine_metrics(target)
-        if body is None:
-            continue
-        reachable += 1
-        chunks.append(body)
-    chunks.append(
+    bodies: list[str] = fetch_all_engine_metrics()
+    own_series: str = (
         "# HELP engy_sidecar_engines_reachable Engines that answered the last scrape.\n"
         "# TYPE engy_sidecar_engines_reachable gauge\n"
-        f"engy_sidecar_engines_reachable {reachable}\n"
+        f"engy_sidecar_engines_reachable {len(bodies)}\n"
         "# HELP engy_sidecar_engines_configured Engines this container was told to scrape.\n"
         "# TYPE engy_sidecar_engines_configured gauge\n"
         f"engy_sidecar_engines_configured {len(TARGETS)}\n"
     )
-    return ("\n".join(chunks) + "\n").encode("utf-8"), reachable
+    probe_bodies: list[str] = read_probe_bodies()
+    merged: str = merge_engine_bodies(bodies + probe_bodies + [own_series])
+    # Anything to serve counts as an answer, engines or probes. Prometheus discards the WHOLE body
+    # on a non-2xx, so gating on engines alone threw the loop-lag series away exactly when no engine
+    # answered — the moment they are most worth reading. engy_sidecar_engines_reachable 0 carries
+    # that alert on its own.
+    return (merged + "\n").encode("utf-8"), len(bodies) + len(probe_bodies)
 
 
 def read_log_tail(max_bytes: int) -> bytes:
@@ -159,10 +300,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route == "/logs":
             self._reply(200, read_log_tail(requested_tail_bytes(query)), "text/plain")
             return
-        body, reachable = collect()
-        # 503 when nothing answered: an empty 200 reads as "this node earns zero", which is a very
-        # different alert from "the scrape could not reach the engines".
-        self._reply(200 if reachable else 503, body, "text/plain; version=0.0.4")
+        body, answered = collect()
+        # 503 only when NOTHING answered — no engine and no miner probe. An empty 200 reads as
+        # "this node earns zero", a very different alert from "the scrape reached nothing at all".
+        self._reply(200 if answered else 503, body, "text/plain; version=0.0.4")
 
 
 def main() -> None:
