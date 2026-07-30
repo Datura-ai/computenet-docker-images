@@ -172,7 +172,20 @@ every other card's qualification. The supervisor now kills the wedged engine (SI
 stuck in a kernel ignores TERM) along with its own miner, and starts both again on the next pass.
 One dead card costs one card.
 
-Three things are deliberately NOT treated as a wedge, all borrowed from dolphin's watchdog:
+Two more things are lifted from that watchdog, both of which it learned the hard way:
+
+- **A grace after every restart** (`ENGY_ENGINE_RESTART_GRACE_SECONDS`, 15 min). A reloading engine
+  answers `/metrics` with requests still attributed to it long before it generates again, which
+  reads exactly like a wedge. Without the grace the supervisor kills the engine it is waiting for,
+  forever. The grace covers an engine that died on its own too, not just one we killed.
+- **The counters go out on `/metrics`**, not only into the log: `engy_supervisor_engine_restarts_total`
+  and `engy_supervisor_miner_restarts_total` per engine, `engy_supervisor_miner_running`, plus a
+  heartbeat and the expected pass interval so staleness is judgeable. A container quietly restarting
+  one engine an hour is otherwise indistinguishable from a healthy one, and on a miner's host nobody
+  reads the log until something has already gone wrong. The supervisor writes them into `PROBE_DIR`,
+  so they ride the same merge the miners' probe files already use — no new plumbing.
+
+Three things are deliberately NOT treated as a wedge, also from dolphin's watchdog:
 
 - an engine that never came up — a cold start legitimately produces nothing for tens of minutes, and
   killing it restarts the download;

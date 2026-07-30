@@ -173,6 +173,31 @@ fi
 [[ -d "${SANDBOX}/home/probe" ]] && pass "the probe directory is created" || fail "no probe directory"
 rm -rf "${SANDBOX}"
 
+echo "== the supervisor publishes what it has done =="
+# A container that quietly restarts one engine an hour looks identical to a healthy one from
+# outside, and on a miner's host nobody reads the log until something has already gone wrong.
+new_sandbox 2
+start_entrypoint env MINER_KEY=mk-test ENGY_LIVENESS_INTERVAL_SECONDS=1
+sleep 4
+supervisor_file="${SANDBOX}/home/probe/supervisor.prom"
+if [[ -f "${supervisor_file}" ]]; then
+    pass "the supervisor writes its metrics file"
+    grep -q "engy_supervisor_engine_restarts_total{engy_engine=\"8000\"}" "${supervisor_file}" \
+        && pass "restart counters are labelled per engine" \
+        || fail "no per-engine restart counter: $(head -20 "${supervisor_file}")"
+    grep -q "engy_supervisor_heartbeat_timestamp_seconds [0-9]" "${supervisor_file}" \
+        && pass "a heartbeat says the supervisor is still passing" \
+        || fail "no heartbeat in the supervisor metrics"
+    # Two engines must not produce two HELP lines for one family, or the whole scrape is invalid.
+    helps="$(grep -c "^# HELP engy_supervisor_engine_restarts_total" "${supervisor_file}")"
+    [[ "${helps}" -eq 1 ]] && pass "one HELP line per family" || fail "${helps} HELP lines for one family"
+else
+    fail "supervisor.prom was never written"
+fi
+kill -TERM "${ENTRYPOINT_PID}" 2>/dev/null
+wait "${ENTRYPOINT_PID}" 2>/dev/null
+rm -rf "${SANDBOX}"
+
 echo "== stale probe files from a previous container are cleared =="
 # The directory lives on the shared cache volume, so a node that comes back with fewer cards would
 # otherwise keep publishing frozen lag series for GPUs it no longer has.

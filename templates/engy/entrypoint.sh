@@ -30,6 +30,11 @@ CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
 # producing a token before it counts as wedged.
 LIVENESS_INTERVAL_SECONDS="${ENGY_LIVENESS_INTERVAL_SECONDS:-60}"
 ENGINE_STALL_SECONDS="${ENGY_ENGINE_STALL_SECONDS:-300}"
+# After a kill, an engine reloads ~35GB of weights and re-JITs its kernels, and it answers /metrics
+# with requests still attributed to it long before it generates again. Without this grace the
+# supervisor reads that reload as a fresh wedge and kills the engine it is waiting for, forever.
+# Borrowed from templates/dolphin's watchdog (DOLPHIN_WATCHDOG_GRACE_SECONDS).
+ENGINE_RESTART_GRACE_SECONDS="${ENGY_ENGINE_RESTART_GRACE_SECONDS:-900}"
 # A miner exiting means something is genuinely wrong (it has its own websocket reconnect loop), so
 # back off before respawning rather than spinning against the gateway.
 MINER_RESTART_BACKOFF_SECONDS="${ENGY_MINER_RESTART_BACKOFF_SECONDS:-60}"
@@ -225,9 +230,14 @@ engine_metric() {
 # request even arrives).
 engine_is_wedged() {
     local index="$1" port="${engine_ports[$1]}" running tokens now
+    now="${SECONDS}"
+    # Inside the grace after its own restart this engine is reloading, not wedged.
+    if (( now < ${engine_kill_allowed_at[$index]:-0} )); then
+        engine_stall_since[index]=0
+        return 1
+    fi
     running="$(engine_metric "${port}" "num_running_reqs")"
     tokens="$(engine_metric "${port}" "generation_tokens_total")"
-    now="${SECONDS}"
     if [[ -z "${running}" || -z "${tokens}" ]]; then
         engine_stall_since[index]=0
         return 1
@@ -256,7 +266,42 @@ restart_engine() {
     miner_pids[index]=""
     engine_stall_since[index]=0
     engine_last_tokens[index]=""
+    engine_restarts[index]=$(( ${engine_restarts[$index]:-0} + 1 ))
+    engine_kill_allowed_at[index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
     start_engine "${index}" "${engine_ports[$index]}"
+}
+
+# Publish what the supervisor has done, through the same file the miners' probes use — the sidecar
+# already merges everything in PROBE_DIR into /metrics. Without this a container that quietly
+# restarts one engine every hour is indistinguishable from a healthy one: the log says so, but on a
+# miner's host nobody reads the log until something has already gone wrong. Shape borrowed from
+# templates/dolphin, whose watchdog publishes dolphin_watchdog_restarts_total the same way.
+write_supervisor_metrics() {
+    local index body=""
+    body+="# HELP engy_supervisor_heartbeat_timestamp_seconds When the supervisor last completed a pass.\n"
+    body+="# TYPE engy_supervisor_heartbeat_timestamp_seconds gauge\n"
+    body+="engy_supervisor_heartbeat_timestamp_seconds $(date +%s)\n"
+    body+="# HELP engy_supervisor_pass_interval_seconds How often a pass is expected, so staleness is judgeable.\n"
+    body+="# TYPE engy_supervisor_pass_interval_seconds gauge\n"
+    body+="engy_supervisor_pass_interval_seconds ${LIVENESS_INTERVAL_SECONDS}\n"
+    body+="# HELP engy_supervisor_engine_restarts_total Engines restarted in place since this container started.\n"
+    body+="# TYPE engy_supervisor_engine_restarts_total counter\n"
+    for index in "${!engine_ports[@]}"; do
+        body+="engy_supervisor_engine_restarts_total{engy_engine=\"${engine_ports[$index]}\"} ${engine_restarts[$index]:-0}\n"
+    done
+    body+="# HELP engy_supervisor_miner_restarts_total Miners respawned since this container started.\n"
+    body+="# TYPE engy_supervisor_miner_restarts_total counter\n"
+    for index in "${!engine_ports[@]}"; do
+        body+="engy_supervisor_miner_restarts_total{engy_engine=\"${engine_ports[$index]}\"} ${miner_restarts[$index]:-0}\n"
+    done
+    body+="# HELP engy_supervisor_miner_running Whether this engine currently has its miner attached.\n"
+    body+="# TYPE engy_supervisor_miner_running gauge\n"
+    for index in "${!engine_ports[@]}"; do
+        body+="engy_supervisor_miner_running{engy_engine=\"${engine_ports[$index]}\"} $([[ -n "${miner_pids[$index]:-}" ]] && echo 1 || echo 0)\n"
+    done
+    # Atomic, and never fatal: metrics must not be able to stop the supervisor.
+    { printf '%b' "${body}" > "${PROBE_DIR}/supervisor.prom.tmp" &&
+        mv -f "${PROBE_DIR}/supervisor.prom.tmp" "${PROBE_DIR}/supervisor.prom"; } 2>/dev/null || true
 }
 
 # One dead engine costs one card, not the node: it is restarted in place and its miner comes back
@@ -272,6 +317,8 @@ supervise_forever() {
                 wait "${engine_pids[$index]}" 2>/dev/null || true
                 [[ -n "${miner_pids[$index]:-}" ]] && kill -TERM "${miner_pids[$index]}" 2>/dev/null || true
                 miner_pids[index]=""
+                engine_restarts[index]=$(( ${engine_restarts[$index]:-0} + 1 ))
+                engine_kill_allowed_at[index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
                 start_engine "${index}" "${engine_ports[$index]}"
                 continue
             fi
@@ -291,9 +338,11 @@ supervise_forever() {
                 echo "[engy] miner ${miner_names[$index]} exited — respawning in ${MINER_RESTART_BACKOFF_SECONDS}s" >&2
                 miner_pids[index]=""
                 interruptible_sleep "${MINER_RESTART_BACKOFF_SECONDS}"
+                miner_restarts[index]=$(( ${miner_restarts[$index]:-0} + 1 ))
                 start_miner "${index}"
             fi
         done
+        write_supervisor_metrics
     done
 }
 
@@ -349,6 +398,9 @@ main() {
 }
 
 declare -a engine_stall_since=()
+declare -a engine_restarts=()
+declare -a miner_restarts=()
+declare -a engine_kill_allowed_at=()
 declare -a engine_last_tokens=()
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
