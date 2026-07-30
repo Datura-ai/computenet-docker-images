@@ -194,6 +194,33 @@ Three things are deliberately NOT treated as a wedge, also from dolphin's watchd
 - anything the supervisor cannot attribute to one engine. A wrong guess costs a healthy engine on top
   of the wedged one.
 
+## Why one dead card costs one card
+
+The readiness loop used to refuse the whole container when any engine failed to come up. That was
+right when a single miner fronted every engine, because losing one engine lost the only worker
+anyway. With a miner per engine it throws away seven earning cards to punish one, so a card that
+never becomes ready is now left to the supervisor and the rest start without it. Only a node where
+NOTHING came up is refused, and `engy_supervisor_miner_running` says which cards are actually
+mining.
+
+Readiness is polled in rounds against one shared deadline rather than waited on engine by engine.
+Sequentially, a card that never comes up holds the entire timeout before the next card is even
+looked at — one sick GPU delayed seven healthy ones by 40 minutes. Cards also warm at different
+speeds, and a fast one has no reason to wait for a slow one.
+
+## Why the first engine starts alone
+
+sglang JIT-compiles ~16k FP8 DeepGEMM kernels on a cold engine, 10-20 minutes, into
+`DG_JIT_CACHE_DIR` — which sits on the shared volume precisely so that cost is paid once. Started
+together, all N engines compile the same kernels at the same time into the same directory: N times
+the CPU for one cache, and N writers racing over the same files. So engine 0 starts alone and the
+rest follow once it can generate, finding the cache warm. Borrowed from `templates/dolphin`
+(`wait_for_cache_seed` plus its stagger).
+
+The wait is capped (`ENGY_CACHE_SEED_WAIT_SECONDS`, 25 min) and abandoned early if the seeding
+engine dies: a dead seed will never warm anything, and holding the other cards for the rest of the
+budget is pure lost mining.
+
 ## Why the whole container's output is captured, and stamped
 
 On a miner's host the container's stdout goes to a docker pipe we have no access to, and we never get

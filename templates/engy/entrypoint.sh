@@ -35,6 +35,12 @@ ENGINE_STALL_SECONDS="${ENGY_ENGINE_STALL_SECONDS:-300}"
 # supervisor reads that reload as a fresh wedge and kills the engine it is waiting for, forever.
 # Borrowed from templates/dolphin's watchdog (DOLPHIN_WATCHDOG_GRACE_SECONDS).
 ENGINE_RESTART_GRACE_SECONDS="${ENGY_ENGINE_RESTART_GRACE_SECONDS:-900}"
+# How long a cold start may take before an engine is left to the supervisor instead of held for.
+# A 35GB load plus ~16k JIT-compiled FP8 kernels is 10-20 minutes on an empty cache.
+ENGINE_READY_TIMEOUT_SECONDS="${ENGY_ENGINE_READY_TIMEOUT_SECONDS:-2400}"
+# How long the first engine gets to seed the shared DeepGEMM cache before the rest are started.
+# See start_engines_seeding_the_kernel_cache_first.
+CACHE_SEED_WAIT_SECONDS="${ENGY_CACHE_SEED_WAIT_SECONDS:-1500}"
 # A miner exiting means something is genuinely wrong (it has its own websocket reconnect loop), so
 # back off before respawning rather than spinning against the gateway.
 MINER_RESTART_BACKOFF_SECONDS="${ENGY_MINER_RESTART_BACKOFF_SECONDS:-60}"
@@ -61,6 +67,7 @@ trim_log_pid=""
 sidecar_pid=""
 log_pipe_pid=""
 gpu_count=0
+mining_engines=0
 
 # Everything after this lands in the log: the engines, the miners and this script. Redirect BEFORE
 # the first check — a container that refuses to start is exactly the one whose reason we cannot
@@ -135,17 +142,75 @@ start_engine() {
     engine_kill_allowed_at[gpu_index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
 }
 
+# Start engine 0 alone, let it fill the shared kernel cache, then release the rest.
+#
+# sglang JIT-compiles ~16k FP8 DeepGEMM kernels on a cold engine, 10-20 minutes, into
+# DG_JIT_CACHE_DIR — which lives on the shared volume precisely so it is paid once. Started
+# together, all N engines compile the same kernels at the same time into the same directory: N times
+# the CPU for one cache, and N writers racing over the same files. Started one behind the seed, the
+# rest find the cache warm. Borrowed from templates/dolphin (wait_for_cache_seed + its stagger).
+#
+# The wait is capped and never fatal: an engine that dies during seeding must not hold the node
+# hostage, so when the budget runs out the siblings start anyway and pay their own compile.
+start_engines_seeding_the_kernel_cache_first() {
+    local index waited=0
+    for index in $(seq 0 $((gpu_count - 1))); do
+        engine_ports[index]=$((FIRST_PORT + index))
+        start_engine "${index}" "${engine_ports[$index]}"
+        if (( index == 0 && gpu_count > 1 )); then
+            echo "[engy] engine on port ${engine_ports[0]} is seeding the shared kernel cache; the other $((gpu_count - 1)) wait up to ${CACHE_SEED_WAIT_SECONDS}s"
+            while (( waited < CACHE_SEED_WAIT_SECONDS )) && ! engine_is_generating "${engine_ports[0]}"; do
+                # A dead seed will never warm anything, and holding the other cards for the rest of
+                # the budget is pure lost mining. The supervisor restarts it either way.
+                if ! kill -0 "${engine_pids[0]}" 2>/dev/null; then
+                    echo "[engy] the seeding engine exited after ${waited}s; starting the rest now" >&2
+                    break
+                fi
+                interruptible_sleep 10
+                waited=$((waited + 10))
+            done
+            if engine_is_generating "${engine_ports[0]}"; then
+                echo "[engy] kernel cache seeded after ${waited}s; starting the remaining engines warm"
+            elif kill -0 "${engine_pids[0]}" 2>/dev/null; then
+                echo "[engy] cache not seeded after ${waited}s; starting the remaining engines anyway" >&2
+            fi
+        fi
+    done
+}
+
 # /health_generate, not /health: it answers only once the engine can actually GENERATE. A miner
 # connected to a loaded-but-not-generating serve is how you fail the acceptance gate.
-wait_for_engine() {
-    local port="$1" deadline=$((SECONDS + 2400))
-    while [[ ${SECONDS} -lt ${deadline} ]]; do
-        if curl -sf "http://127.0.0.1:${port}/health_generate" >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 10
+engine_is_generating() {
+    curl -sf -m 5 "http://127.0.0.1:$1/health_generate" >/dev/null 2>&1
+}
+
+# Give each engine its miner the moment THAT engine can generate, and return how many got one.
+#
+# Polled in rounds against one shared deadline rather than waiting on each engine in turn: a card
+# that never comes up would otherwise hold the whole deadline before the next card is even looked
+# at, so one sick GPU delayed seven healthy ones by the full timeout. Cards also warm at different
+# speeds, and there is no reason a fast one should wait for a slow one.
+start_miners_as_engines_become_ready() {
+    local deadline=$((SECONDS + ENGINE_READY_TIMEOUT_SECONDS)) index
+    mining_engines=0
+    while true; do
+        for index in "${!engine_ports[@]}"; do
+            [[ -n "${miner_pids[$index]:-}" ]] && continue
+            if engine_is_generating "${engine_ports[$index]}"; then
+                echo "[engy] engine on port ${engine_ports[$index]} ready"
+                start_miner "${index}"
+                mining_engines=$((mining_engines + 1))
+            fi
+        done
+        (( mining_engines == ${#engine_ports[@]} )) && break
+        (( SECONDS >= deadline )) && break
+        interruptible_sleep 10
     done
-    return 1
+    for index in "${!engine_ports[@]}"; do
+        if [[ -z "${miner_pids[$index]:-}" ]]; then
+            echo "[engy] engine on port ${engine_ports[$index]} never became ready — leaving it to the supervisor" >&2
+        fi
+    done
 }
 
 # One name per miner, and one id derived from it. The id is what engy's control plane keys a worker
@@ -193,7 +258,7 @@ REQUIRED_MINER_HOOKS=("^WORKER_ID" "^async def _serve_all" "^def main" "^_JOBS")
 why_staged_miner_is_unusable() {
     local staged="$1" hook
     for hook in "${REQUIRED_MINER_HOOKS[@]}"; do
-        if ! grep -qE "${hook}" "${staged}"; then
+        if ! grep -qE "${hook}" "${staged}" 2>/dev/null; then
             echo "it is missing '${hook}', so Lium's modifications would not apply"
             return 0
         fi
@@ -383,7 +448,7 @@ supervise_forever() {
                 continue
             fi
             if [[ -z "${miner_pids[$index]:-}" ]]; then
-                if curl -sf -m 5 "http://127.0.0.1:${engine_ports[$index]}/health_generate" >/dev/null 2>&1; then
+                if engine_is_generating "${engine_ports[$index]}"; then
                     echo "[engy] engine on port ${engine_ports[$index]} is generating again — starting its miner" >&2
                     start_miner "${index}"
                 fi
@@ -409,7 +474,7 @@ main() {
         refuse_to_start "MINER_KEY is required (gateway key from provider.engy.ai)."
     fi
 
-    gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)"
+    gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | grep -c .)"
     if [[ "${gpu_count}" -lt 1 ]]; then
         refuse_to_start "no GPUs visible to the container."
     fi
@@ -430,25 +495,22 @@ main() {
     trap shutdown TERM INT
 
     local index
-    for index in $(seq 0 $((gpu_count - 1))); do
-        engine_ports[index]=$((FIRST_PORT + index))
-        engine_stall_since[index]=0
-        engine_last_tokens[index]=""
-        start_engine "${index}" "${engine_ports[$index]}"
-    done
+    start_engines_seeding_the_kernel_cache_first
 
     start_metrics_sidecar
     # After the engines are spawned, not before: the miner is not needed until they are ready, and a
     # slow GitHub would otherwise add a minute of dead time to every cold start.
     refresh_vendored_miner
 
-    for index in "${!engine_ports[@]}"; do
-        if ! wait_for_engine "${engine_ports[$index]}"; then
-            refuse_to_start "engine on port ${engine_ports[$index]} never became ready"
-        fi
-        echo "[engy] engine on port ${engine_ports[$index]} ready"
-        start_miner "${index}"
-    done
+    # One card that never comes up costs one card. This used to end the container, which was right
+    # when a single miner fronted every engine — losing one engine lost the worker anyway. With a
+    # miner per engine the healthy cards keep earning, and the supervisor retries the sick one for as
+    # long as the container lives. Only a node where NOTHING came up is worth refusing.
+    start_miners_as_engines_become_ready
+    if (( mining_engines == 0 )); then
+        refuse_to_start "no engine became ready on any of the ${gpu_count} GPU(s)."
+    fi
+    echo "[engy] ${mining_engines} of ${gpu_count} engine(s) mining"
 
     trim_log_forever &
     trim_log_pid=$!
