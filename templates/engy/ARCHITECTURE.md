@@ -79,8 +79,10 @@ often and for reasons that have nothing to do with engy. So the entrypoint deriv
 worker name (`sha256(name)[:32]`) and the vendored miner honours `ENGY_WORKER_ID`
 (one-line LIUM PATCH, DAH-2531). A restart is then a re-dial, not a new worker.
 
-Unverified, and worth asking engy directly: whether their control plane is happy with a stable id, or
-whether it relies on the per-process uuid to tell a re-dial from a new process.
+Verified live on 2026-07-30: worker `04955ec4…` was restarted mid-`active` and came back as the SAME
+worker — no new `pending`, no re-onboarding, the request history intact. A restart really is a
+re-dial. (The portal's worker page shows the reconnect as a new "this leg connected" timestamp on
+the same worker, with the event log unchanged.)
 
 The same patch also scopes the miner's singleton lock to the worker. Upstream locks
 `/tmp/engy_miner.singleton` node-wide, which is right for one miner per box and silently fatal for
