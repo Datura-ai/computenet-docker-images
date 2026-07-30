@@ -38,6 +38,10 @@ ENGINE_RESTART_GRACE_SECONDS="${ENGY_ENGINE_RESTART_GRACE_SECONDS:-900}"
 # A miner exiting means something is genuinely wrong (it has its own websocket reconnect loop), so
 # back off before respawning rather than spinning against the gateway.
 MINER_RESTART_BACKOFF_SECONDS="${ENGY_MINER_RESTART_BACKOFF_SECONDS:-60}"
+# Where the miner is refreshed from on every boot, and the switch to stop doing that. Upstream tags
+# lag their own default branch badly (the newest release was v0.4.1 while tags were at v0.4.4), so
+# the branch is the honest source of "current".
+ENGY_MINER_SOURCE_URL="${ENGY_MINER_SOURCE_URL:-https://raw.githubusercontent.com/hanlinai/engy/main/miner/engy_miner.py}"
 # The container's output is the ONLY record of why a routed request failed, and on a miner's host it
 # goes to a docker pipe we cannot reach.
 LOG_FILE="${ENGY_HOME}/logs/miner.log"
@@ -126,6 +130,9 @@ start_engine() {
         --enable-metrics \
         --host 127.0.0.1 --port "${port}" &
     engine_pids[gpu_index]=$!
+    # Every start earns the reload grace, first one included: a cold start JITs ~16k FP8 kernels and
+    # is the longest window in which a healthy engine looks wedged.
+    engine_kill_allowed_at[gpu_index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
 }
 
 # /health_generate, not /health: it answers only once the engine can actually GENERATE. A miner
@@ -156,7 +163,7 @@ miner_worker_id() {
 }
 
 start_miner() {
-    local index="$1" port=$((FIRST_PORT + $1)) name
+    local index="$1" port="${engine_ports[$1]}" name
     name="$(miner_worker_name "${index}")"
     miner_names[index]="${name}"
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
@@ -164,10 +171,57 @@ start_miner() {
     ENGY_WORKER_NAME="${name}" \
     ENGY_WORKER_ID="$(miner_worker_id "${name}")" \
     ENGY_PROBE_DIR="${PROBE_DIR}" \
-        python3 "${ENGY_MINER_DIR}/engy_miner.py" \
+        python3 "${ENGY_MINER_DIR}/engy_launch.py" \
         --checkpoint "${CKPT_DIR}" \
         --serve-url "http://127.0.0.1:${port}" &
     miner_pids[index]=$!
+}
+
+# Pull the newest upstream miner before anything starts. The vendored copy in the image is a
+# byte-identical fallback, never a patch target: Lium's modifications live in engy_launch.py, which
+# applies them from outside, so a refresh cannot silently drop them.
+#
+# Deliberately fail-soft. A miner that runs a week-old upstream still earns; a miner that refuses to
+# boot because GitHub was unreachable earns nothing. Anything that fails validation is discarded and
+# the baked-in copy stays.
+# The hooks engy_launch.py assigns after import. Kept next to the validator on purpose: adding a
+# modification there means adding its hook here, or a refresh can hand us an upstream we cannot
+# modify and every miner runs with a random worker id and no probe — working, earning less, silent.
+REQUIRED_MINER_HOOKS=("^WORKER_ID" "^async def _serve_all" "^def main" "^_JOBS")
+
+# Empty when the staged file is usable; otherwise the reason it is not.
+why_staged_miner_is_unusable() {
+    local staged="$1" hook
+    for hook in "${REQUIRED_MINER_HOOKS[@]}"; do
+        if ! grep -qE "${hook}" "${staged}"; then
+            echo "it is missing '${hook}', so Lium's modifications would not apply"
+            return 0
+        fi
+    done
+    if ! python3 -m py_compile "${staged}" 2>/dev/null; then
+        echo "it does not compile"
+    fi
+}
+
+refresh_vendored_miner() {
+    if [[ "${ENGY_MINER_AUTO_UPDATE:-1}" != "1" ]]; then
+        echo "[engy] miner auto-update disabled; using the copy baked into the image"
+        return 0
+    fi
+    local staged="${ENGY_MINER_DIR}/engy_miner.py.new" reason
+    if ! curl -sfL -m 60 "${ENGY_MINER_SOURCE_URL}" -o "${staged}"; then
+        echo "[engy] could not fetch the upstream miner; keeping the image's copy" >&2
+        rm -f "${staged}"
+        return 0
+    fi
+    reason="$(why_staged_miner_is_unusable "${staged}")"
+    if [[ -n "${reason}" ]]; then
+        echo "[engy] discarding the fetched miner: ${reason}; keeping the image's copy" >&2
+        rm -f "${staged}"
+        return 0
+    fi
+    mv -f "${staged}" "${ENGY_MINER_DIR}/engy_miner.py"
+    echo "[engy] miner refreshed from ${ENGY_MINER_SOURCE_URL} ($(wc -l < "${ENGY_MINER_DIR}/engy_miner.py") lines)"
 }
 
 # Token counters for the platform scraper, and the log. Started BEFORE the readiness wait: a cold
@@ -212,10 +266,15 @@ trim_log_forever() {
     done
 }
 
-engine_metric() {
-    local port="$1" name="$2"
-    curl -sf -m 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null \
-        | awk -v key="^sglang:${name}" '$0 ~ key { print $2; exit }'
+# "<running> <tokens>", or empty when the engine did not answer. One scrape per pass, not one per
+# counter: an sglang exposition is 65 metric families, and an 8-card node was pulling 16 of them a
+# minute to read two numbers.
+engine_running_and_tokens() {
+    local port="$1"
+    curl -sf -m 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null | awk '
+        /^sglang:num_running_reqs/ { running = $2 }
+        /^sglang:generation_tokens_total/ { tokens = $2 }
+        END { if (running != "" && tokens != "") print running, tokens }'
 }
 
 # A wedged engine is the one failure nothing else notices: requests sit in flight, the process is
@@ -229,15 +288,15 @@ engine_metric() {
 # (no demand is not a wedge, and arming the clock while idle would spend the budget before the first
 # request even arrives).
 engine_is_wedged() {
-    local index="$1" port="${engine_ports[$1]}" running tokens now
+    local index="$1" port="${engine_ports[$1]}" counters running tokens now
     now="${SECONDS}"
     # Inside the grace after its own restart this engine is reloading, not wedged.
     if (( now < ${engine_kill_allowed_at[$index]:-0} )); then
         engine_stall_since[index]=0
         return 1
     fi
-    running="$(engine_metric "${port}" "num_running_reqs")"
-    tokens="$(engine_metric "${port}" "generation_tokens_total")"
+    counters="$(engine_running_and_tokens "${port}")"
+    read -r running tokens <<<"${counters}"
     if [[ -z "${running}" || -z "${tokens}" ]]; then
         engine_stall_since[index]=0
         return 1
@@ -257,9 +316,12 @@ engine_is_wedged() {
 # SIGKILL, not SIGTERM: a process stuck inside a CUDA kernel ignores TERM (measured by dolphin in 12
 # of 12 cases). The miner on this engine goes with it — it holds websockets advertising capacity the
 # engine cannot serve, and the supervisor respawns both on the next pass.
+# The only way an engine is restarted, whether it wedged or exited on its own. Both used to have
+# their own copy and they drifted: the exited path forgot to reset the stall state, so the new
+# engine inherited the dead one's clock.
 restart_engine() {
-    local index="$1"
-    echo "[engy] engine on port ${engine_ports[$index]} produced no tokens for ${ENGINE_STALL_SECONDS}s with requests in flight — restarting it" >&2
+    local index="$1" reason="$2"
+    echo "[engy] engine on port ${engine_ports[$index]} ${reason} — restarting it" >&2
     [[ -n "${miner_pids[$index]:-}" ]] && kill -TERM "${miner_pids[$index]}" 2>/dev/null || true
     kill -KILL "${engine_pids[$index]}" 2>/dev/null || true
     wait "${engine_pids[$index]}" 2>/dev/null || true
@@ -267,7 +329,6 @@ restart_engine() {
     engine_stall_since[index]=0
     engine_last_tokens[index]=""
     engine_restarts[index]=$(( ${engine_restarts[$index]:-0} + 1 ))
-    engine_kill_allowed_at[index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
     start_engine "${index}" "${engine_ports[$index]}"
 }
 
@@ -277,31 +338,31 @@ restart_engine() {
 # miner's host nobody reads the log until something has already gone wrong. Shape borrowed from
 # templates/dolphin, whose watchdog publishes dolphin_watchdog_restarts_total the same way.
 write_supervisor_metrics() {
-    local index body=""
-    body+="# HELP engy_supervisor_heartbeat_timestamp_seconds When the supervisor last completed a pass.\n"
-    body+="# TYPE engy_supervisor_heartbeat_timestamp_seconds gauge\n"
-    body+="engy_supervisor_heartbeat_timestamp_seconds $(date +%s)\n"
-    body+="# HELP engy_supervisor_pass_interval_seconds How often a pass is expected, so staleness is judgeable.\n"
-    body+="# TYPE engy_supervisor_pass_interval_seconds gauge\n"
-    body+="engy_supervisor_pass_interval_seconds ${LIVENESS_INTERVAL_SECONDS}\n"
-    body+="# HELP engy_supervisor_engine_restarts_total Engines restarted in place since this container started.\n"
-    body+="# TYPE engy_supervisor_engine_restarts_total counter\n"
-    for index in "${!engine_ports[@]}"; do
-        body+="engy_supervisor_engine_restarts_total{engy_engine=\"${engine_ports[$index]}\"} ${engine_restarts[$index]:-0}\n"
-    done
-    body+="# HELP engy_supervisor_miner_restarts_total Miners respawned since this container started.\n"
-    body+="# TYPE engy_supervisor_miner_restarts_total counter\n"
-    for index in "${!engine_ports[@]}"; do
-        body+="engy_supervisor_miner_restarts_total{engy_engine=\"${engine_ports[$index]}\"} ${miner_restarts[$index]:-0}\n"
-    done
-    body+="# HELP engy_supervisor_miner_running Whether this engine currently has its miner attached.\n"
-    body+="# TYPE engy_supervisor_miner_running gauge\n"
-    for index in "${!engine_ports[@]}"; do
-        body+="engy_supervisor_miner_running{engy_engine=\"${engine_ports[$index]}\"} $([[ -n "${miner_pids[$index]:-}" ]] && echo 1 || echo 0)\n"
-    done
+    local index staged="${PROBE_DIR}/supervisor.prom.tmp"
     # Atomic, and never fatal: metrics must not be able to stop the supervisor.
-    { printf '%b' "${body}" > "${PROBE_DIR}/supervisor.prom.tmp" &&
-        mv -f "${PROBE_DIR}/supervisor.prom.tmp" "${PROBE_DIR}/supervisor.prom"; } 2>/dev/null || true
+    {
+        echo "# HELP engy_supervisor_heartbeat_timestamp_seconds When the supervisor last completed a pass."
+        echo "# TYPE engy_supervisor_heartbeat_timestamp_seconds gauge"
+        echo "engy_supervisor_heartbeat_timestamp_seconds $(date +%s)"
+        echo "# HELP engy_supervisor_pass_interval_seconds How often a pass is expected, so staleness is judgeable."
+        echo "# TYPE engy_supervisor_pass_interval_seconds gauge"
+        echo "engy_supervisor_pass_interval_seconds ${LIVENESS_INTERVAL_SECONDS}"
+        echo "# HELP engy_supervisor_engine_restarts_total Engines restarted in place since this container started."
+        echo "# TYPE engy_supervisor_engine_restarts_total counter"
+        for index in "${!engine_ports[@]}"; do
+            echo "engy_supervisor_engine_restarts_total{engy_engine=\"${engine_ports[$index]}\"} ${engine_restarts[$index]:-0}"
+        done
+        echo "# HELP engy_supervisor_miner_restarts_total Miners respawned since this container started."
+        echo "# TYPE engy_supervisor_miner_restarts_total counter"
+        for index in "${!engine_ports[@]}"; do
+            echo "engy_supervisor_miner_restarts_total{engy_engine=\"${engine_ports[$index]}\"} ${miner_restarts[$index]:-0}"
+        done
+        echo "# HELP engy_supervisor_miner_running Whether this engine currently has its miner attached."
+        echo "# TYPE engy_supervisor_miner_running gauge"
+        for index in "${!engine_ports[@]}"; do
+            echo "engy_supervisor_miner_running{engy_engine=\"${engine_ports[$index]}\"} $([[ -n "${miner_pids[$index]:-}" ]] && echo 1 || echo 0)"
+        done
+    } > "${staged}" 2>/dev/null && mv -f "${staged}" "${PROBE_DIR}/supervisor.prom" 2>/dev/null || true
 }
 
 # One dead engine costs one card, not the node: it is restarted in place and its miner comes back
@@ -313,17 +374,12 @@ supervise_forever() {
         interruptible_sleep "${LIVENESS_INTERVAL_SECONDS}"
         for index in "${!engine_ports[@]}"; do
             if ! kill -0 "${engine_pids[$index]}" 2>/dev/null; then
-                echo "[engy] engine on port ${engine_ports[$index]} exited — restarting it" >&2
-                wait "${engine_pids[$index]}" 2>/dev/null || true
-                [[ -n "${miner_pids[$index]:-}" ]] && kill -TERM "${miner_pids[$index]}" 2>/dev/null || true
-                miner_pids[index]=""
-                engine_restarts[index]=$(( ${engine_restarts[$index]:-0} + 1 ))
-                engine_kill_allowed_at[index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
-                start_engine "${index}" "${engine_ports[$index]}"
+                restart_engine "${index}" "exited"
                 continue
             fi
             if engine_is_wedged "${index}"; then
-                restart_engine "${index}"
+                restart_engine "${index}" \
+                    "produced no tokens for ${ENGINE_STALL_SECONDS}s with requests in flight"
                 continue
             fi
             if [[ -z "${miner_pids[$index]:-}" ]]; then
@@ -382,6 +438,9 @@ main() {
     done
 
     start_metrics_sidecar
+    # After the engines are spawned, not before: the miner is not needed until they are ready, and a
+    # slow GitHub would otherwise add a minute of dead time to every cold start.
+    refresh_vendored_miner
 
     for index in "${!engine_ports[@]}"; do
         if ! wait_for_engine "${engine_ports[$index]}"; then

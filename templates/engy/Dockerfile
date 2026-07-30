@@ -65,8 +65,10 @@ ENV DG_JIT_CACHE_DIR=${ENGY_HOME}/deepgemm-cache
 
 WORKDIR ${ENGY_HOME}
 
-# Vendored from github.com/hanlinai/engy @ v0.4.4 (miner/). Upstream publishes no package, and the
-# miner must match the gateway protocol exactly — so it is pinned here rather than fetched at boot.
+# Vendored from github.com/hanlinai/engy (miner/) — a byte-identical copy, refreshed from the
+# default branch on every boot by the entrypoint. NEVER patch this file: Lium's modifications
+# live in engy_launch.py and are applied from outside, so a refresh cannot drop them.
+# This copy is the fallback for when GitHub is unreachable. Originally vendored at v0.4.4.
 # PYTHONPATH points at this dir so sitecustomize.py can trim the hidden states sglang returns.
 COPY vendor/engy_miner.py vendor/sitecustomize.py ${ENGY_MINER_DIR}/
 
@@ -74,7 +76,7 @@ COPY vendor/engy_miner.py vendor/sitecustomize.py ${ENGY_MINER_DIR}/
 # image puts there is shadowed the moment a volume is mounted over it (found by running it — the
 # sidecar silently vanished). ENGY_HOME holds data only.
 # loop_probe.py rides in ENGY_MINER_DIR so the miner can `import loop_probe` off its own sys.path[0].
-COPY metrics_sidecar.py loop_probe.py ${ENGY_MINER_DIR}/
+COPY metrics_sidecar.py loop_probe.py engy_launch.py ${ENGY_MINER_DIR}/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

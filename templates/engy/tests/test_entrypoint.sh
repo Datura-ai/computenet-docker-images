@@ -31,7 +31,7 @@ new_sandbox() {
 #!/usr/bin/env bash
 echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
 case "$*" in
-    *engy_miner.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
+    *engy_launch.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
     *) sleep 30 ;;
 esac
 STUB
@@ -52,11 +52,16 @@ start_entrypoint() {
     # reports "0 engines" on a busy machine and reads like a real regression.
     local waited=0
     while (( waited < 150 )); do
-        grep -q "engy_miner.py" "${SANDBOX}/calls.log" 2>/dev/null && return 0
+        grep -q "engy_launch.py" "${SANDBOX}/calls.log" 2>/dev/null && return 0
         sleep 0.2
         waited=$((waited + 1))
     done
     fail "the miner never started within 30s; entrypoint said: $(tail -2 "${SANDBOX}/out.log" 2>&1)"
+}
+
+# The distinct worker ids the miners were started with, one per line.
+worker_ids() {
+    grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u
 }
 
 run_entrypoint() {
@@ -102,17 +107,17 @@ echo "== one miner per engine, each declaring only its own engine's capacity =="
 # one interpreter. One miner per engine turns that single queue into N. See ARCHITECTURE.md.
 new_sandbox 2
 run_entrypoint env MINER_KEY=mk-test ENGY_MAX_RUNNING_REQUESTS=8
-miners="$(grep -c "engy_miner.py" "${SANDBOX}/calls.log")"
+miners="$(grep -c "engy_launch.py" "${SANDBOX}/calls.log")"
 [[ "${miners}" -eq 2 ]] && pass "2 engines -> 2 miners" || fail "2 engines -> ${miners} miners"
 for port in 8000 8001; do
-    grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -q -- "--serve-url http://127.0.0.1:${port} " \
+    grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -q -- "--serve-url http://127.0.0.1:${port} " \
         || fail "no miner dedicated to the engine on port ${port}"
 done
 pass "each miner drives exactly one engine"
 # Each miner declares its OWN engine's concurrency, never the node total: the probe burst the gateway
 # sends is sized against what a single worker advertises.
-if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
-    fail "a miner declared something other than its engine's 8: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
+    fail "a miner declared something other than its engine's 8: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
     pass "every miner declares MAX_INFLIGHT=8, not the node sum"
 fi
@@ -120,17 +125,17 @@ fi
 echo "== worker ids are stable and unique per card =="
 # The id is what engy's control plane keys a worker on, and a fresh one per restart sends the worker
 # back to the end of an hours-long onboarding queue.
-ids="$(grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u | wc -l | tr -d ' ')"
-[[ "${ids}" -eq 2 ]] && pass "each card gets its own worker id" || fail "expected 2 distinct worker ids, got ${ids}"
-first_run_ids="$(grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u)"
+distinct_worker_ids="$(worker_ids | wc -l | tr -d " ")"
+[[ "${distinct_worker_ids}" -eq 2 ]] && pass "each card gets its own worker id" || fail "expected 2 distinct worker ids, got ${distinct_worker_ids}"
+first_run_ids="$(worker_ids)"
 rm -rf "${SANDBOX}"
 new_sandbox 2
 run_entrypoint env MINER_KEY=mk-test ENGY_WORKER_NAME=lium-fixed
-second_ids="$(grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u)"
+second_ids="$(worker_ids)"
 rm -rf "${SANDBOX}"
 new_sandbox 2
 run_entrypoint env MINER_KEY=mk-test ENGY_WORKER_NAME=lium-fixed
-if [[ "${second_ids}" == "$(grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u)" ]]; then
+if [[ "${second_ids}" == "$(worker_ids)" ]]; then
     pass "a restart re-uses the same worker ids"
 else
     fail "worker ids changed across a restart"
@@ -145,8 +150,8 @@ echo "== the default declared concurrency is the onboarding floor, not lower =="
 # failed in three seconds with "offered 4 distinct clean legs, below the required 8", zero traffic.
 new_sandbox 2
 run_entrypoint env MINER_KEY=mk-test
-if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
-    fail "default declared concurrency is not 8: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
+    fail "default declared concurrency is not 8: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
     pass "with no override every miner declares 8"
 fi
@@ -160,8 +165,8 @@ echo "== the event-loop lag probe is wired up =="
 new_sandbox 2
 # METRICS_TOKEN, or the sidecar never starts and its assertion below would pass on an empty log.
 run_entrypoint env MINER_KEY=mk-test METRICS_TOKEN=probe-test-token
-if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -qv "ENGY_PROBE_DIR=${SANDBOX}/home/probe"; then
-    fail "a miner started without ENGY_PROBE_DIR: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "ENGY_PROBE_DIR=${SANDBOX}/home/probe"; then
+    fail "a miner started without ENGY_PROBE_DIR: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
     pass "every miner is told where to publish its loop lag"
 fi
@@ -171,6 +176,51 @@ else
     fail "sidecar started without ENGY_PROBE_DIR"
 fi
 [[ -d "${SANDBOX}/home/probe" ]] && pass "the probe directory is created" || fail "no probe directory"
+rm -rf "${SANDBOX}"
+
+echo "== the boot-time miner refresh never breaks the container =="
+# The vendored miner is refreshed from upstream on every boot. A refresh that can brick a node is
+# worse than a stale miner, so every failure path must fall back to the copy baked into the image.
+BAKED_IN_MARKER="MARKER_BAKED_IN_COPY"
+
+# Runs the entrypoint with `curl` replaced by `stub_body`, then asserts whether the image's copy of
+# the miner survived. `expectation` is kept|replaced.
+assert_refresh_outcome() {
+    local description="$1" stub_body="$2" expectation="$3"
+    shift 3
+    new_sandbox 1
+    echo "${BAKED_IN_MARKER}" >"${SANDBOX}/miner/engy_miner.py"
+    { echo '#!/usr/bin/env bash'; echo "${stub_body}"; } >"${SANDBOX}/bin/curl"
+    chmod +x "${SANDBOX}/bin/curl"
+    run_entrypoint env MINER_KEY=mk-test "$@"
+    if grep -q "${BAKED_IN_MARKER}" "${SANDBOX}/miner/engy_miner.py"; then
+        [[ "${expectation}" == "kept" ]] && pass "${description}" || fail "${description}"
+    else
+        [[ "${expectation}" == "replaced" ]] && pass "${description}" || fail "${description}"
+    fi
+}
+
+# A download that produces nothing at all.
+assert_refresh_outcome "a failed download leaves the image's copy in place" 'exit 0' kept
+
+# A download that succeeds but hands back something without the hooks engy_launch.py needs. Taking
+# it would leave every miner on a random worker id with no probe: working, earning less, and silent.
+CURL_STUB_WRITES_PAYLOAD='for a in "$@"; do [[ "$prev" == "-o" ]] && printf "%s" "$PAYLOAD" > "$a"; prev="$a"; done; exit 0'
+PAYLOAD='print(1)' assert_refresh_outcome "an upstream missing our hooks is discarded" \
+    "${CURL_STUB_WRITES_PAYLOAD}" kept
+grep -q "discarding the fetched miner" "${SANDBOX}/out.log" \
+    && pass "and the log says why" || fail "discarded silently"
+rm -rf "${SANDBOX}"
+
+PAYLOAD='WORKER_ID = 1
+async def _serve_all(): pass
+def main(): pass
+_JOBS = {}' assert_refresh_outcome "a valid upstream replaces the image's copy" \
+    "${CURL_STUB_WRITES_PAYLOAD}" replaced
+rm -rf "${SANDBOX}"
+
+assert_refresh_outcome "ENGY_MINER_AUTO_UPDATE=0 pins the image's copy" \
+    "${CURL_STUB_WRITES_PAYLOAD}" kept ENGY_MINER_AUTO_UPDATE=0
 rm -rf "${SANDBOX}"
 
 echo "== the supervisor publishes what it has done =="
@@ -189,8 +239,9 @@ if [[ -f "${supervisor_file}" ]]; then
         && pass "a heartbeat says the supervisor is still passing" \
         || fail "no heartbeat in the supervisor metrics"
     # Two engines must not produce two HELP lines for one family, or the whole scrape is invalid.
-    helps="$(grep -c "^# HELP engy_supervisor_engine_restarts_total" "${supervisor_file}")"
-    [[ "${helps}" -eq 1 ]] && pass "one HELP line per family" || fail "${helps} HELP lines for one family"
+    help_line_count="$(grep -c "^# HELP engy_supervisor_engine_restarts_total" "${supervisor_file}")"
+    [[ "${help_line_count}" -eq 1 ]] && pass "one HELP line per family" \
+        || fail "${help_line_count} HELP lines for one family"
 else
     fail "supervisor.prom was never written"
 fi
@@ -270,7 +321,7 @@ if [[ -n "${sidecar_started}" ]]; then
 else
     fail "sidecar never started while engines were unready"
 fi
-grep -q "engy_miner.py" "${SANDBOX}/calls.log" 2>/dev/null \
+grep -q "engy_launch.py" "${SANDBOX}/calls.log" 2>/dev/null \
     && fail "the miner started even though no engine was ready" \
     || pass "the miner still waits for a ready engine"
 kill -TERM "${never_ready_pid}" 2>/dev/null
