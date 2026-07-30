@@ -277,7 +277,12 @@ MINER_KEY = None          # set at startup
 _tokenizer = None
 _model_root = None
 WORKER_NAME = None             # set at startup (see _worker_name)
-WORKER_ID = uuid.uuid4().hex   # this process's identity, HELLO'd on every leg
+# LIUM PATCH (DAH-2531): honour ENGY_WORKER_ID. Upstream mints a fresh uuid4 per PROCESS, and engy's
+# control plane keys a worker on that id — so on a preemptible filler every restart registered a NEW
+# worker and threw away hours of onboarding progress. Measured on prod: the same ENGY_WORKER_NAME
+# came back as a103ec01… then 0b7d4fe0… across one restart, and the second worker went to the back of
+# the queue. Unset, the behaviour is upstream's.
+WORKER_ID = os.environ.get("ENGY_WORKER_ID") or uuid.uuid4().hex
 
 
 def _worker_name() -> str:
@@ -810,7 +815,11 @@ def main():
 
 if __name__ == "__main__":
     import fcntl                                       # single instance per node
-    _sing = open("/tmp/engy_miner.singleton", "w")
+    # LIUM PATCH (DAH-2531): scope the lock to the WORKER, not the node. Upstream assumes one miner
+    # per box; we run one per GPU in a single container, and a node-wide lock let the first miner in
+    # and made the other seven print "another instance is running" and exit — silently leaving every
+    # card but one unmined. Unset, the path is upstream's.
+    _sing = open(f"/tmp/engy_miner.singleton.{WORKER_ID}", "w")
     try:
         fcntl.flock(_sing, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

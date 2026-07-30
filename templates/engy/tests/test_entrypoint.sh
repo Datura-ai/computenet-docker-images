@@ -29,7 +29,7 @@ new_sandbox() {
     # python3 records how it was invoked and, for the miner, blocks so the loop does not spin.
     cat >"${SANDBOX}/bin/python3" <<'STUB'
 #!/usr/bin/env bash
-echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
+echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
 case "$*" in
     *engy_miner.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
     *) sleep 30 ;;
@@ -97,37 +97,57 @@ done
 pass "each engine pinned to its own GPU"
 rm -rf "${SANDBOX}"
 
-echo "== declared capacity is the SUM across engines =="
+echo "== one miner per engine, each declaring only its own engine's capacity =="
+# The GIL is per PROCESS, so one miner driving N engines serialises every hidden-state parse behind
+# one interpreter. One miner per engine turns that single queue into N. See ARCHITECTURE.md.
 new_sandbox 2
 run_entrypoint env MINER_KEY=mk-test ENGY_MAX_RUNNING_REQUESTS=8
-if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -q "MAX_INFLIGHT=16"; then
-    pass "2 engines x 8 -> MAX_INFLIGHT=16"
-else
-    fail "expected MAX_INFLIGHT=16, got: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
-fi
-if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -q -- "--serve-url http://127.0.0.1:8000,http://127.0.0.1:8001"; then
-    pass "the miner drives every engine"
-else
-    fail "miner serve-url wrong: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
-fi
-rm -rf "${SANDBOX}"
-
-echo "== exactly one miner process, whatever the GPU count =="
-new_sandbox 8
-run_entrypoint env MINER_KEY=mk-test
 miners="$(grep -c "engy_miner.py" "${SANDBOX}/calls.log")"
-[[ "${miners}" -eq 1 ]] && pass "8 GPUs -> 1 miner (one hotkey, one blast radius)" || fail "8 GPUs -> ${miners} miners"
+[[ "${miners}" -eq 2 ]] && pass "2 engines -> 2 miners" || fail "2 engines -> ${miners} miners"
+for port in 8000 8001; do
+    grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -q -- "--serve-url http://127.0.0.1:${port} " \
+        || fail "no miner dedicated to the engine on port ${port}"
+done
+pass "each miner drives exactly one engine"
+# Each miner declares its OWN engine's concurrency, never the node total: the probe burst the gateway
+# sends is sized against what a single worker advertises.
+if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
+    fail "a miner declared something other than its engine's 8: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "every miner declares MAX_INFLIGHT=8, not the node sum"
+fi
+
+echo "== worker ids are stable and unique per card =="
+# The id is what engy's control plane keys a worker on, and a fresh one per restart sends the worker
+# back to the end of an hours-long onboarding queue.
+ids="$(grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u | wc -l | tr -d ' ')"
+[[ "${ids}" -eq 2 ]] && pass "each card gets its own worker id" || fail "expected 2 distinct worker ids, got ${ids}"
+first_run_ids="$(grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u)"
+rm -rf "${SANDBOX}"
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_WORKER_NAME=lium-fixed
+second_ids="$(grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u)"
+rm -rf "${SANDBOX}"
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_WORKER_NAME=lium-fixed
+if [[ "${second_ids}" == "$(grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u)" ]]; then
+    pass "a restart re-uses the same worker ids"
+else
+    fail "worker ids changed across a restart"
+fi
+[[ "${first_run_ids}" != "${second_ids}" ]] && pass "a different worker name yields different ids" \
+    || fail "worker ids ignore ENGY_WORKER_NAME"
 rm -rf "${SANDBOX}"
 
 echo "== the event-loop lag probe is wired up =="
 # Without it, our own GIL stall and the gateway going quiet are the same Close(1011) in the log.
 new_sandbox 2
-# METRICS_TOKEN, or the sidecar never starts and the assertion below would pass on an empty log.
+# METRICS_TOKEN, or the sidecar never starts and its assertion below would pass on an empty log.
 run_entrypoint env MINER_KEY=mk-test METRICS_TOKEN=probe-test-token
-if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -q "ENGY_PROBE_DIR=${SANDBOX}/home/probe"; then
-    pass "the miner is told where to publish its loop lag"
+if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -qv "ENGY_PROBE_DIR=${SANDBOX}/home/probe"; then
+    fail "a miner started without ENGY_PROBE_DIR: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    fail "miner started without ENGY_PROBE_DIR: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
+    pass "every miner is told where to publish its loop lag"
 fi
 if grep "metrics_sidecar.py" "${SANDBOX}/calls.log" | grep -q "ENGY_PROBE_DIR=${SANDBOX}/home/probe"; then
     pass "the sidecar is told where to read it from"
@@ -142,7 +162,7 @@ echo "== stale probe files from a previous container are cleared =="
 # otherwise keep publishing frozen lag series for GPUs it no longer has.
 new_sandbox 1
 mkdir -p "${SANDBOX}/home/probe"
-echo 'engy_miner_loop_lag_seconds_max{engy_worker="gone-g7"} 99' >"${SANDBOX}/home/probe/loop-stale.prom"
+echo "engy_miner_loop_lag_seconds_max{engy_worker=\"gone-g7\"} 99" >"${SANDBOX}/home/probe/loop-stale.prom"
 run_entrypoint env MINER_KEY=mk-test
 [[ -f "${SANDBOX}/home/probe/loop-stale.prom" ]] && fail "a stale probe file survived startup" \
     || pass "stale probe files are removed at startup"
