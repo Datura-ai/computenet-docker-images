@@ -47,7 +47,7 @@ def get(path: str, token: str | None = TOKEN) -> tuple[int, bytes]:
         return error.code, error.read()
 
 
-def start_sidecar(log_file: str) -> subprocess.Popen:
+def start_sidecar(log_file: str, probe_dir: str) -> subprocess.Popen:
     process = subprocess.Popen(
         [sys.executable, SIDECAR_PATH],
         env={
@@ -55,6 +55,7 @@ def start_sidecar(log_file: str) -> subprocess.Popen:
             "METRICS_TOKEN": TOKEN,
             "METRICS_PORT": str(PORT),
             "ENGY_LOG_FILE": log_file,
+            "ENGY_PROBE_DIR": probe_dir,
             # No engine is running in a test; /metrics answers 503 and that is a covered case.
             "ENGY_METRICS_TARGETS": "http://127.0.0.1:1",
         },
@@ -83,7 +84,20 @@ def main() -> int:
                 handle.write(f"[engy-miner] line {line_number} padding-padding-padding\n")
             handle.write("[engy-miner] LAST-LINE\n")
 
-        sidecar = start_sidecar(log_file)
+        probe_dir: str = os.path.join(workdir, "probe")
+        os.makedirs(probe_dir)
+        # Two miners' files, plus the .tmp an in-progress atomic write leaves in the same directory.
+        for worker in ("g0", "g1"):
+            with open(os.path.join(probe_dir, f"loop-{worker}.prom"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# HELP engy_miner_loop_lag_seconds_max Worst event-loop delay.\n"
+                    "# TYPE engy_miner_loop_lag_seconds_max gauge\n"
+                    f'engy_miner_loop_lag_seconds_max{{engy_worker="{worker}"}} 12.5\n'
+                )
+        with open(os.path.join(probe_dir, "loop-g2.prom.tmp"), "w", encoding="utf-8") as handle:
+            handle.write("half-written garbage")
+
+        sidecar = start_sidecar(log_file, probe_dir)
         try:
             print("== /logs is behind the same bearer token as /metrics ==")
             status, _ = get("/logs", token=None)
@@ -122,9 +136,17 @@ def main() -> int:
             status, body = get("/logs")
             check(status == 200 and b"log unavailable" in body, "missing file -> 200 with a reason")
 
+            print("== the miners' loop-lag files reach /metrics ==")
+            status, body = get("/metrics")
+            check(b'engy_worker="g0"' in body and b'engy_worker="g1"' in body,
+                  "both miners' loop-lag series are exposed")
+            check(body.count(b"# HELP engy_miner_loop_lag_seconds_max") == 1,
+                  "two miners produce ONE HELP line, so the exposition stays valid")
+            check(b"half-written garbage" not in body,
+                  "an in-progress atomic write (.tmp) is not served")
+
             print("== the metrics route still works next to /logs ==")
-            status, _ = get("/metrics")
-            check(status == 503, "unreachable engines -> 503, not a crash")
+            check(status == 503, "unreachable engines -> 503 even with probe files present")
             status, _ = get("/nope")
             check(status == 404, "unknown route -> 404")
         finally:

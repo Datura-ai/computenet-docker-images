@@ -29,7 +29,7 @@ new_sandbox() {
     # python3 records how it was invoked and, for the miner, blocks so the loop does not spin.
     cat >"${SANDBOX}/bin/python3" <<'STUB'
 #!/usr/bin/env bash
-echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
+echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
 case "$*" in
     *engy_miner.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
     *) sleep 30 ;;
@@ -117,6 +117,35 @@ new_sandbox 8
 run_entrypoint env MINER_KEY=mk-test
 miners="$(grep -c "engy_miner.py" "${SANDBOX}/calls.log")"
 [[ "${miners}" -eq 1 ]] && pass "8 GPUs -> 1 miner (one hotkey, one blast radius)" || fail "8 GPUs -> ${miners} miners"
+rm -rf "${SANDBOX}"
+
+echo "== the event-loop lag probe is wired up =="
+# Without it, our own GIL stall and the gateway going quiet are the same Close(1011) in the log.
+new_sandbox 2
+# METRICS_TOKEN, or the sidecar never starts and the assertion below would pass on an empty log.
+run_entrypoint env MINER_KEY=mk-test METRICS_TOKEN=probe-test-token
+if grep "engy_miner.py" "${SANDBOX}/calls.log" | grep -q "ENGY_PROBE_DIR=${SANDBOX}/home/probe"; then
+    pass "the miner is told where to publish its loop lag"
+else
+    fail "miner started without ENGY_PROBE_DIR: $(grep 'engy_miner.py' "${SANDBOX}/calls.log" | head -1)"
+fi
+if grep "metrics_sidecar.py" "${SANDBOX}/calls.log" | grep -q "ENGY_PROBE_DIR=${SANDBOX}/home/probe"; then
+    pass "the sidecar is told where to read it from"
+else
+    fail "sidecar started without ENGY_PROBE_DIR"
+fi
+[[ -d "${SANDBOX}/home/probe" ]] && pass "the probe directory is created" || fail "no probe directory"
+rm -rf "${SANDBOX}"
+
+echo "== stale probe files from a previous container are cleared =="
+# The directory lives on the shared cache volume, so a node that comes back with fewer cards would
+# otherwise keep publishing frozen lag series for GPUs it no longer has.
+new_sandbox 1
+mkdir -p "${SANDBOX}/home/probe"
+echo 'engy_miner_loop_lag_seconds_max{engy_worker="gone-g7"} 99' >"${SANDBOX}/home/probe/loop-stale.prom"
+run_entrypoint env MINER_KEY=mk-test
+[[ -f "${SANDBOX}/home/probe/loop-stale.prom" ]] && fail "a stale probe file survived startup" \
+    || pass "stale probe files are removed at startup"
 rm -rf "${SANDBOX}"
 
 echo "== the miner's stdout is kept on disk =="

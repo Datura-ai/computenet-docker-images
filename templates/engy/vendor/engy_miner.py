@@ -45,6 +45,8 @@ os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
 import numpy as np
 import requests
+
+import loop_probe                                      # LIUM PATCH (DAH-2532): event-loop lag probe
 import torch
 import websockets
 from toploc import build_proofs_base64
@@ -753,6 +755,12 @@ async def _leg(i, n, cap):
 
 
 async def _serve_all(n, leg_ids, cap):
+    # LIUM PATCH (DAH-2532): start the event-loop lag probe. This loop answers the gateway's keepalive
+    # pings AND shares an interpreter with the hidden-state parsing, so when the parsing saturates the
+    # GIL the legs die with Close(1011, 'keepalive ping timeout') — which is indistinguishable in the
+    # log from the gateway going quiet. The probe measures the loop's own delay and the in-flight count
+    # at that moment, which tells the two apart. Off unless ENGY_PROBE_DIR is set. See loop_probe.py.
+    loop_probe.start(WORKER_NAME, WORKER_ID, lambda: len(_JOBS))
     # leg_ids is a subset of range(n); `n` still forms the per-worker URL.
     await asyncio.gather(*[_leg(i, n, cap) for i in leg_ids])
 

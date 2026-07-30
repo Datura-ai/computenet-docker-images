@@ -31,6 +31,10 @@ CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
 # over SSH or pulled from the sidecar's /logs.
 LOG_FILE="${ENGY_HOME}/logs/miner.log"
 LOG_MAX_BYTES="${ENGY_LOG_MAX_BYTES:-268435456}"   # 256MB, head-trimmed in place
+# The miner publishes its event-loop lag here and the sidecar merges the files into /metrics.
+# This is how we tell OUR stall (GIL saturated by hidden-state parsing) from the gateway going
+# quiet — both reach the log as the same Close(1011, 'keepalive ping timeout').
+PROBE_DIR="${ENGY_HOME}/probe"
 # The trim keeps half the cap, so anything under 2 bytes would round to `tail -c 0` and wipe the log.
 if (( LOG_MAX_BYTES < 8192 )); then LOG_MAX_BYTES=8192; fi
 
@@ -86,7 +90,10 @@ echo "[engy] ${gpu_count} GPU(s) -> ${gpu_count} engine(s), ${PER_ENGINE_REQUEST
 export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
 export HF_HOME="${ENGY_HOME}/hf"
 
-mkdir -p "${CKPT_DIR}" "${HF_HOME}"
+mkdir -p "${CKPT_DIR}" "${HF_HOME}" "${PROBE_DIR}"
+# The probe dir sits on the shared cache volume, so a container that comes back with fewer cards
+# would keep publishing frozen lag series for GPUs it no longer has.
+rm -f "${PROBE_DIR}"/*.prom "${PROBE_DIR}"/*.prom.tmp
 if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
     echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
     HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
@@ -158,6 +165,7 @@ if [[ -n "${METRICS_TOKEN:-}" ]]; then
         while true; do
             ENGY_METRICS_TARGETS="$(IFS=,; echo "${serve_urls[*]}")" \
             ENGY_LOG_FILE="${LOG_FILE}" \
+            ENGY_PROBE_DIR="${PROBE_DIR}" \
                 python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" || true
             sleep 5
         done
@@ -214,6 +222,7 @@ while true; do
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
     MAX_INFLIGHT="$((PER_ENGINE_REQUESTS * gpu_count))" \
     ENGY_WORKER_NAME="${ENGY_WORKER_NAME:-$(hostname)}" \
+    ENGY_PROBE_DIR="${PROBE_DIR}" \
         python3 "${ENGY_MINER_DIR}/engy_miner.py" \
         --checkpoint "${CKPT_DIR}" \
         --serve-url "$(IFS=,; echo "${serve_urls[*]}")" &

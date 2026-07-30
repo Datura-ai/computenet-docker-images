@@ -73,7 +73,8 @@ COPY vendor/engy_miner.py vendor/sitecustomize.py ${ENGY_MINER_DIR}/
 # Code lives OUTSIDE ENGY_HOME on purpose: ENGY_HOME is the cache-volume root, and anything the
 # image puts there is shadowed the moment a volume is mounted over it (found by running it — the
 # sidecar silently vanished). ENGY_HOME holds data only.
-COPY metrics_sidecar.py ${ENGY_MINER_DIR}/metrics_sidecar.py
+# loop_probe.py rides in ENGY_MINER_DIR so the miner can `import loop_probe` off its own sys.path[0].
+COPY metrics_sidecar.py loop_probe.py ${ENGY_MINER_DIR}/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
