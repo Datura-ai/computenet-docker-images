@@ -60,6 +60,7 @@ class LoopLagProbe:
         self.worst_inflight: int = 0
         self.stall_counts: dict[float, int] = {threshold: 0 for threshold in STALL_THRESHOLDS_SECONDS}
         self.last_write_error: str = ""
+        self.task: asyncio.Task | None = None
 
     def record_sample(self, lag_seconds: float, inflight_before_wait: int, inflight_after_wait: int) -> None:
         """Both in-flight readings, because the stall is measured only after it has ENDED.
@@ -151,16 +152,36 @@ class LoopLagProbe:
                 next_write = now + self.write_interval_seconds
 
 
-def start(worker_name: str, worker_id: str, count_inflight_requests: Callable[[], int]) -> LoopLagProbe | None:
+def probe_file_name(worker_name: str) -> str:
+    """The probe file for one miner, keyed on its WORKER NAME.
+
+    Not on the worker id: upstream mints that per PROCESS, so a miner restarted in place inside a
+    living container would write a second file and the first would stay — the directory is only
+    cleared at container start. Both files carry the same `engy_worker` label, Prometheus keeps
+    exactly one sample per label set, and which one it keeps is undefined. The dead miner's frozen
+    lag could win, and the stall counter could appear to go backwards: the diagnosis this probe
+    exists for, broken in the one case (a flapping miner) it matters most.
+
+    The name is stable across restarts and unique per miner, so a restart overwrites its own file.
+    Sanitised because it reaches the filesystem: it comes from ENGY_WORKER_NAME or the hostname.
+    """
+    safe_name: str = "".join(character if character.isalnum() or character in "-_." else "_"
+                             for character in worker_name) or "unnamed"
+    return f"loop-{safe_name[:120]}.prom"
+
+
+def start(worker_name: str, count_inflight_requests: Callable[[], int]) -> LoopLagProbe | None:
     """Attach a probe to the running loop. Returns None when the probe is switched off."""
     output_dir: str = os.environ.get("ENGY_PROBE_DIR", "")
     if not output_dir:
         return None
-    # Keyed on the worker id, which is stable across restarts and unique per miner in the container,
-    # so a restarted miner overwrites its own file instead of leaving a frozen one behind forever.
-    probe = LoopLagProbe(worker_name, os.path.join(output_dir, f"loop-{worker_id}.prom"), count_inflight_requests)
+    probe = LoopLagProbe(
+        worker_name, os.path.join(output_dir, probe_file_name(worker_name)), count_inflight_requests
+    )
     try:
-        asyncio.get_running_loop().create_task(probe.run_forever())
+        # Held, not fire-and-forget: an unreferenced task is only kept alive by the timer handle
+        # inside its own sleep, which is the pattern RUF006 flags.
+        probe.task = asyncio.get_running_loop().create_task(probe.run_forever())
     except RuntimeError:
         print("[engy-miner] loop probe needs a running loop; not started", file=sys.stderr, flush=True)
         return None

@@ -76,6 +76,13 @@ only on waking undercounts the exact case that matters: the miner drops a job fr
 event loop, so a stall that ends with its requests complete would report an idle queue and read as
 somebody else's fault. Caught by the test, not by review.
 
+Each miner's file is keyed on its worker NAME, never on the worker id: upstream mints that id per
+PROCESS, so a miner restarted inside a living container would write a second file while the first
+stayed (the directory is only cleared at container start). Both carry the same `engy_worker` label,
+Prometheus keeps one sample per label set, and which one it keeps is undefined — the dead miner's
+frozen lag could win and the stall counter could appear to go backwards, breaking this diagnosis in
+the one case (a flapping miner) it exists for.
+
 The probe is off unless `ENGY_PROBE_DIR` is set, and it costs four wakeups a second and a 1KB file
 every 10s.
 
@@ -108,9 +115,18 @@ contiguous, and every sample carries `engy_engine="<port>"`. The label is namesp
 labels its own samples and a bare `engine` key could collide. The miners' probe files go through the
 same merge, which is why two miners cannot produce a second HELP line between them.
 
-The fan-out shares **one** deadline across all engines rather than a per-target timeout: 8 slow
-engines at 5s each is 40s sequentially, long past any scraper's patience, and the tail engines would
-silently vanish — the exact undercount the fan-out exists to prevent.
+The fan-out is concurrent under **one** shared deadline, not a per-target timeout and not a loop.
+A per-target timeout makes 8 slow engines 40s sequentially, long past any scraper's patience; a
+shared deadline walked in a loop is no better, because the first slow engine spends the whole budget
+and every later one is skipped without a connection attempt. Both leave the tail engines silently
+missing, which is the undercount the budget exists to prevent. Each future is also waited on against
+the absolute deadline, so a body dripped one byte per read window — which satisfies every socket
+timeout — cannot hold the scrape open.
+
+`/metrics` answers 503 only when NOTHING answered: no engine and no miner probe. Prometheus discards
+the whole body on a non-2xx, so gating the 503 on engines alone threw the loop-lag series away in
+exactly the case they are most worth reading — every engine down, miners still reporting why.
+`engy_sidecar_engines_reachable 0` carries the engine alert on its own.
 
 ## What we deliberately did not do
 

@@ -18,6 +18,7 @@ Without METRICS_TOKEN it refuses to start: an unauthenticated port on a miner's 
 our token throughput, and now our logs, to whoever scans it.
 """
 
+import concurrent.futures
 import hmac
 import http.client
 import http.server
@@ -185,18 +186,41 @@ def read_probe_bodies() -> list[str]:
     return bodies
 
 
+def fetch_all_engine_metrics() -> list[str]:
+    """Every engine that answered within ONE shared deadline, asked all at once.
+
+    Concurrently, not in a loop: with a sequential walk the first slow engine spends the whole
+    budget and every later one is skipped without a connection attempt — the tail engines vanish
+    and engines_reachable is undercounted, which is the exact failure the budget was added to
+    prevent. Threads rather than asyncio because this server is threaded already and each fetch is
+    one blocking urlopen.
+    """
+    if not TARGETS:
+        return []
+    deadline: float = time.monotonic() + TOTAL_BUDGET_SECONDS
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(TARGETS)) as pool:
+        futures = [pool.submit(fetch_engine_metrics, target, deadline) for target in TARGETS]
+        bodies: list[str] = []
+        for future in futures:
+            remaining: float = max(0.0, deadline - time.monotonic())
+            try:
+                # An absolute wait on top of the per-socket timeout: a body dripped one byte per
+                # read window satisfies every recv timeout and would otherwise hold the scrape open.
+                body: str | None = future.result(timeout=remaining)
+            except concurrent.futures.TimeoutError:
+                continue
+            if body is not None:
+                bodies.append(body)
+    return bodies
+
+
 def collect() -> tuple[bytes, int]:
-    """Every reachable engine's metrics, plus how many answered.
+    """Every reachable engine's metrics plus the miners' probes, and how much answered.
 
     A dead engine is skipped rather than failing the whole scrape: on a multi-card node the surviving
     engines are still earning, and the reachable-count series is what says a card went quiet.
     """
-    deadline: float = time.monotonic() + TOTAL_BUDGET_SECONDS
-    bodies: list[str] = []
-    for target in TARGETS:
-        body: str | None = fetch_engine_metrics(target, deadline)
-        if body is not None:
-            bodies.append(body)
+    bodies: list[str] = fetch_all_engine_metrics()
     own_series: str = (
         "# HELP engy_sidecar_engines_reachable Engines that answered the last scrape.\n"
         "# TYPE engy_sidecar_engines_reachable gauge\n"
@@ -205,8 +229,13 @@ def collect() -> tuple[bytes, int]:
         "# TYPE engy_sidecar_engines_configured gauge\n"
         f"engy_sidecar_engines_configured {len(TARGETS)}\n"
     )
-    merged: str = merge_engine_bodies(bodies + read_probe_bodies() + [own_series])
-    return (merged + "\n").encode("utf-8"), len(bodies)
+    probe_bodies: list[str] = read_probe_bodies()
+    merged: str = merge_engine_bodies(bodies + probe_bodies + [own_series])
+    # Anything to serve counts as an answer, engines or probes. Prometheus discards the WHOLE body
+    # on a non-2xx, so gating on engines alone threw the loop-lag series away exactly when no engine
+    # answered — the moment they are most worth reading. engy_sidecar_engines_reachable 0 carries
+    # that alert on its own.
+    return (merged + "\n").encode("utf-8"), len(bodies) + len(probe_bodies)
 
 
 def read_log_tail(max_bytes: int) -> bytes:
@@ -271,10 +300,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route == "/logs":
             self._reply(200, read_log_tail(requested_tail_bytes(query)), "text/plain")
             return
-        body, reachable = collect()
-        # 503 when nothing answered: an empty 200 reads as "this node earns zero", which is a very
-        # different alert from "the scrape could not reach the engines".
-        self._reply(200 if reachable else 503, body, "text/plain; version=0.0.4")
+        body, answered = collect()
+        # 503 only when NOTHING answered — no engine and no miner probe. An empty 200 reads as
+        # "this node earns zero", a very different alert from "the scrape reached nothing at all".
+        self._reply(200 if answered else 503, body, "text/plain; version=0.0.4")
 
 
 def main() -> None:

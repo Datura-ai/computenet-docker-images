@@ -154,6 +154,24 @@ def main() -> int:
             "every rendered sample line still parses",
         )
 
+        print("== a restarted miner overwrites its own file, it does not duplicate it ==")
+        # Upstream mints the worker id per PROCESS, so keying the file on it left the dead miner's
+        # file behind. Both files carry the same engy_worker label, Prometheus keeps one sample per
+        # label set, and which one it keeps is undefined — the flapping-miner case this exists for.
+        restart_dir: str = os.path.join(workdir, "restarts")
+        os.makedirs(restart_dir)
+        os.environ["ENGY_PROBE_DIR"] = restart_dir
+        first: loop_probe.LoopLagProbe | None = asyncio.run(start_and_report())
+        second: loop_probe.LoopLagProbe | None = asyncio.run(start_and_report())
+        check(first is not None and second is not None and first.output_path == second.output_path,
+              "two runs of the same worker write the SAME file")
+        check(len(list(pathlib.Path(restart_dir).glob("*.prom"))) <= 1,
+              "a restart leaves no second file behind")
+        hostile_name: str = loop_probe.probe_file_name("lium-x/../../etc")
+        check(os.sep not in hostile_name and "/" not in hostile_name,
+              f"a hostile worker name cannot escape the probe directory (got {hostile_name})")
+        os.environ["ENGY_PROBE_DIR"] = os.path.join(workdir, "probe")
+
         print("== the probe is off unless it is asked for ==")
         os.environ.pop("ENGY_PROBE_DIR", None)
         check(asyncio.run(start_and_report()) is None, "no ENGY_PROBE_DIR -> no probe")
@@ -161,9 +179,11 @@ def main() -> int:
         started: loop_probe.LoopLagProbe | None = asyncio.run(start_and_report())
         check(started is not None, "ENGY_PROBE_DIR -> a probe attached to the running loop")
         check(
-            started is not None and started.output_path.endswith("loop-abc123.prom"),
-            "the file is keyed on the stable worker id, so a restart overwrites its own",
+            started is not None and started.output_path.endswith("loop-lium-test-g0.prom"),
+            "the file is keyed on the worker NAME, which survives a restart",
         )
+        check(started is not None and started.task is not None,
+              "the probe task is held, not left to its own timer handle")
 
         print("== an unwritable directory does not take the miner down ==")
         unwritable = loop_probe.LoopLagProbe("w", "/proc/nonexistent/loop.prom", lambda: 0)
@@ -180,7 +200,7 @@ def main() -> int:
 
 
 async def start_and_report() -> loop_probe.LoopLagProbe | None:
-    return loop_probe.start("lium-test-g0", "abc123", lambda: 0)
+    return loop_probe.start("lium-test-g0", lambda: 0)
 
 
 if __name__ == "__main__":
