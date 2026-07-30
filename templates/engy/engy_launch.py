@@ -93,7 +93,9 @@ def install_loop_probe() -> None:
     jobs_in_flight: dict[str, object] = require("_JOBS")
 
     async def serve_all_with_probe(*args: Any, **kwargs: Any) -> Any:
-        loop_probe.start(engy_miner.WORKER_NAME, engy_miner.WORKER_ID, lambda: len(jobs_in_flight))
+        # Keyed on the worker NAME inside start(): the id is per-process, so a restarted miner
+        # would leave a second, frozen file behind for the same engy_worker label.
+        globals()["_loop_probe"] = loop_probe.start(engy_miner.WORKER_NAME, lambda: len(jobs_in_flight))
         return await original_serve_all(*args, **kwargs)
 
     engy_miner._serve_all = serve_all_with_probe
