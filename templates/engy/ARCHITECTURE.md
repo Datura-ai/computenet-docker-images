@@ -174,6 +174,15 @@ every other card's qualification. The supervisor now kills the wedged engine (SI
 stuck in a kernel ignores TERM) along with its own miner, and starts both again on the next pass.
 One dead card costs one card.
 
+**Killing the one recorded pid is enough, and this was checked rather than assumed.** `launch_server`
+is only the parent: on the prod 8-card node it holds 634MB while its `sglang::scheduler` child holds
+123GB — the weights. Killing a parent does not normally kill that child, which would leave the card's
+memory held forever and every restart OOM-ing. sglang closes this itself: `kill_itself_when_parent_died()`
+sets `PR_SET_PDEATHSIG` to SIGKILL, and the scheduler calls it as the first line of its own setup
+(`sglang/srt/managers/scheduler.py`), as does the detokenizer. The kernel reaps the children when the
+parent dies, so we need no process group and no `setsid`. Re-check this if sglang is ever upgraded —
+without it, in-place restart silently turns a wedged card into a dead one.
+
 Two more things are lifted from that watchdog, both of which it learned the hard way:
 
 - **A grace after every restart** (`ENGY_ENGINE_RESTART_GRACE_SECONDS`, 15 min). A reloading engine

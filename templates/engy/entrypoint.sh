@@ -252,7 +252,7 @@ start_miner() {
 # The hooks engy_launch.py assigns after import. Kept next to the validator on purpose: adding a
 # modification there means adding its hook here, or a refresh can hand us an upstream we cannot
 # modify and every miner runs with a random worker id and no probe — working, earning less, silent.
-REQUIRED_MINER_HOOKS=("^WORKER_ID" "^async def _serve_all" "^def main" "^_JOBS")
+REQUIRED_MINER_HOOKS=("^WORKER_ID" "^WORKER_NAME" "^async def _serve_all" "^def main" "^_JOBS")
 
 # Empty when the staged file is usable; otherwise the reason it is not.
 why_staged_miner_is_unusable() {
@@ -474,7 +474,11 @@ main() {
         refuse_to_start "MINER_KEY is required (gateway key from provider.engy.ai)."
     fi
 
-    gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | grep -c .)"
+    # `|| true` is load-bearing: grep -c exits 1 on empty input, and under set -e that would kill
+    # the script at this assignment — before refuse_to_start could put the reason on disk. A node
+    # with no GPUs would then die with a completely empty log, which is the one outcome the whole
+    # log-capture machinery exists to prevent. (wc -l never failed, but padded its output.)
+    gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | grep -c . || true)"
     if [[ "${gpu_count}" -lt 1 ]]; then
         refuse_to_start "no GPUs visible to the container."
     fi

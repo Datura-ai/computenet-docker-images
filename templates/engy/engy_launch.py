@@ -91,6 +91,10 @@ def install_loop_probe() -> None:
     # hook, not at the first served request. Bound by identity because upstream mutates this dict in
     # place and never reassigns it.
     jobs_in_flight: dict[str, object] = require("_JOBS")
+    # Checked at startup even though it is read later: the wrapper below reaches for WORKER_NAME at
+    # call time, so without this a renamed WORKER_NAME passes every boot check and then kills the
+    # miner with an AttributeError on its first serve — every card, every 60s, forever.
+    require("WORKER_NAME")
 
     async def serve_all_with_probe(*args: Any, **kwargs: Any) -> Any:
         # Keyed on the worker NAME inside start(): the id is per-process, so a restarted miner

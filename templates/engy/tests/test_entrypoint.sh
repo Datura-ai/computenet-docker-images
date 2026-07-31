@@ -180,6 +180,38 @@ fi
 [[ -d "${SANDBOX}/home/probe" ]] && pass "the probe directory is created" || fail "no probe directory"
 rm -rf "${SANDBOX}"
 
+echo "== a node with no GPUs is refused loudly, never silently =="
+# grep -c exits 1 on empty input; under set -e that killed the script at the assignment, before
+# refuse_to_start could put the reason on disk — a dead node with a completely empty log.
+new_sandbox 1
+{ echo '#!/usr/bin/env bash'; echo 'exit 0'; } >"${SANDBOX}/bin/nvidia-smi"   # succeeds, lists nothing
+chmod +x "${SANDBOX}/bin/nvidia-smi"
+PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" ENGY_MINER_DIR="${SANDBOX}/miner" \
+    CALLS_LOG="${SANDBOX}/calls.log" env MINER_KEY=mk-test bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
+entrypoint_status=$?
+sleep 1
+[[ ${entrypoint_status} -ne 0 ]] && pass "zero GPUs -> non-zero exit" || fail "exited 0 with no GPUs"
+grep -q "no GPUs visible" "${SANDBOX}/out.log" \
+    && pass "and the reason reaches the log" \
+    || fail "died without a reason: $(tail -2 "${SANDBOX}/out.log")"
+rm -rf "${SANDBOX}"
+
+echo "== a refreshed upstream missing WORKER_NAME is discarded =="
+# engy_launch reads WORKER_NAME at call time, so without this hook a rename passes every boot check
+# and then kills the miner on its first serve — every card, every 60s, forever.
+new_sandbox 1
+echo "${BAKED_IN_MARKER:-MARKER_BAKED_IN_COPY}" >"${SANDBOX}/miner/engy_miner.py"
+{ echo '#!/usr/bin/env bash'
+  echo 'for a in "$@"; do [[ "$prev" == "-o" ]] && printf "WORKER_ID = 1\nasync def _serve_all(): pass\ndef main(): pass\n_JOBS = {}\n" > "$a"; prev="$a"; done; exit 0'
+} >"${SANDBOX}/bin/curl"
+chmod +x "${SANDBOX}/bin/curl"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+grep -q "MARKER_BAKED_IN_COPY" "${SANDBOX}/miner/engy_miner.py" \
+    && pass "an upstream without WORKER_NAME is rejected" \
+    || fail "took an upstream engy_launch cannot use"
+grep -q "WORKER_NAME" "${SANDBOX}/out.log" && pass "and names the missing hook" || fail "silent about which hook"
+rm -rf "${SANDBOX}"
+
 echo "== the first engine seeds the shared kernel cache before the rest start =="
 # sglang JIT-compiles ~16k FP8 kernels into DG_JIT_CACHE_DIR on the shared volume. Started together,
 # every engine pays that 10-20 minute compile and they race over the same files.
@@ -283,6 +315,7 @@ grep -q "discarding the fetched miner" "${SANDBOX}/out.log" \
 rm -rf "${SANDBOX}"
 
 PAYLOAD='WORKER_ID = 1
+WORKER_NAME = "w"
 async def _serve_all(): pass
 def main(): pass
 _JOBS = {}' assert_refresh_outcome "a valid upstream replaces the image's copy" \
