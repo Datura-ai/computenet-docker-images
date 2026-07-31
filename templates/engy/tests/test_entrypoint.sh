@@ -32,6 +32,9 @@ new_sandbox() {
 echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
 case "$*" in
     *engy_launch.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
+    # Faithful to the image: PYTHONPATH points at sitecustomize.py, which prints an "armed" banner
+    # on STDOUT at interpreter startup. Anything reading this command's stdout as a verdict breaks.
+    *py_compile*) [[ -n "${PYTHONPATH:-}" ]] && echo "[engy] hidden-states trim armed"; exit 0 ;;
     *) sleep 30 ;;
 esac
 STUB

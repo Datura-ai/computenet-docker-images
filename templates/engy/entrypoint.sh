@@ -24,6 +24,13 @@ CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
 # See ARCHITECTURE.md, "Why every miner declares exactly 8".
 GATEWAY_REQUIRED_INFLIGHT=8
 PER_ENGINE_REQUESTS="${ENGY_MAX_RUNNING_REQUESTS:-${GATEWAY_REQUIRED_INFLIGHT}}"
+# Checked as text before any arithmetic: under `set -u` a non-numeric value makes (( )) treat it as
+# an unset variable NAME and kill the script here, before the log capture that would explain why.
+if [[ ! "${PER_ENGINE_REQUESTS}" =~ ^[0-9]+$ ]]; then
+    echo "[engy] ENGY_MAX_RUNNING_REQUESTS='${PER_ENGINE_REQUESTS}' is not a number;" \
+         "using ${GATEWAY_REQUIRED_INFLIGHT}." >&2
+    PER_ENGINE_REQUESTS="${GATEWAY_REQUIRED_INFLIGHT}"
+fi
 if (( PER_ENGINE_REQUESTS < GATEWAY_REQUIRED_INFLIGHT )); then
     echo "[engy] ENGY_MAX_RUNNING_REQUESTS=${PER_ENGINE_REQUESTS} is below the gateway's floor;" \
          "using ${GATEWAY_REQUIRED_INFLIGHT} instead — a lower value earns nothing at all." >&2
@@ -301,7 +308,10 @@ why_staged_miner_is_unusable() {
             return 0
         fi
     done
-    if ! python3 -m py_compile "${staged}" 2>/dev/null; then
+    # PYTHONPATH is cleared and stdout dropped: by this point PYTHONPATH points at our own dir, and
+    # importing sitecustomize.py prints an "armed" banner on stdout that this function's caller reads
+    # as a rejection reason. That silently discarded EVERY valid refresh in the image.
+    if ! PYTHONPATH= python3 -m py_compile "${staged}" >/dev/null 2>&1; then
         echo "it does not compile"
     fi
 }

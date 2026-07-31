@@ -212,8 +212,10 @@ Three things are deliberately NOT treated as a wedge, also from dolphin's watchd
 The sidecar and the log trimmer are subshells that run a program in a loop. TERM to the subshell
 leaves that program alive — and it still holds the log pipe open, so `refuse_to_start`'s wait for
 the pipe to drain never returns. A container that was supposed to refuse loudly hangs instead, and
-the platform sees it as running. `terminate_supervised_loop` kills the loop's current child first
-(`pkill -P`), then the loop.
+the platform sees it as running. `terminate_supervised_loop` signals the loop first and its current
+child second (`pkill -P`). That order matters: bash defers a TERM taken while it waits on a
+foreground child until that child exits, so the loop dies instead of running one more iteration.
+Killing the child first leaves a window in which the loop starts a fresh pipe holder.
 
 ## Why an engine that never becomes ready is eventually restarted
 
