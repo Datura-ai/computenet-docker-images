@@ -22,7 +22,13 @@ CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
 # refused onboarding outright — "offered N distinct clean legs, below the required 8". Measured by
 # running this image at 4: instant failure, zero traffic, ever.
 # See ARCHITECTURE.md, "Why every miner declares exactly 8".
-PER_ENGINE_REQUESTS="${ENGY_MAX_RUNNING_REQUESTS:-8}"
+GATEWAY_REQUIRED_INFLIGHT=8
+PER_ENGINE_REQUESTS="${ENGY_MAX_RUNNING_REQUESTS:-${GATEWAY_REQUIRED_INFLIGHT}}"
+if (( PER_ENGINE_REQUESTS < GATEWAY_REQUIRED_INFLIGHT )); then
+    echo "[engy] ENGY_MAX_RUNNING_REQUESTS=${PER_ENGINE_REQUESTS} is below the gateway's floor;" \
+         "using ${GATEWAY_REQUIRED_INFLIGHT} instead — a lower value earns nothing at all." >&2
+    PER_ENGINE_REQUESTS="${GATEWAY_REQUIRED_INFLIGHT}"
+fi
 FIRST_PORT="${ENGY_FIRST_PORT:-8000}"
 # The gateway's own model spec forces this; sglang refuses a shorter context for it.
 CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
@@ -44,6 +50,8 @@ CACHE_SEED_WAIT_SECONDS="${ENGY_CACHE_SEED_WAIT_SECONDS:-1500}"
 # A miner exiting means something is genuinely wrong (it has its own websocket reconnect loop), so
 # back off before respawning rather than spinning against the gateway.
 MINER_RESTART_BACKOFF_SECONDS="${ENGY_MINER_RESTART_BACKOFF_SECONDS:-60}"
+# How long engines and miners get to act on TERM during a refusal before they are killed outright.
+REFUSAL_KILL_GRACE_SECONDS="${ENGY_REFUSAL_KILL_GRACE_SECONDS:-10}"
 # Where the miner is refreshed from on every boot, and the switch to stop doing that. Upstream tags
 # lag their own default branch badly (the newest release was v0.4.1 while tags were at v0.4.4), so
 # the branch is the honest source of "current".
@@ -90,12 +98,22 @@ start_capturing_output() {
 # that loop is a no-op. Then closing our end lets the pipe reach EOF and we wait for it to flush.
 refuse_to_start() {
     echo "[engy] $1" >&2
+    local children=(${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"})
     local pid
-    for pid in ${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"}; do
+    for pid in ${children[@]+"${children[@]}"}; do
         [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
     done
     terminate_supervised_loop "${trim_log_pid}"
     terminate_supervised_loop "${sidecar_pid}"
+    # An engine wedged in a driver call never acts on TERM, and it holds the log pipe: without the
+    # KILL the wait below never returns and the container hangs instead of refusing loudly. Only
+    # the late refusal ("no engine became ready") has children at all; the early ones skip the wait.
+    if (( ${#children[@]} > 0 )); then
+        sleep "${REFUSAL_KILL_GRACE_SECONDS}"
+        for pid in "${children[@]}"; do
+            [[ -n "${pid}" ]] && kill -KILL "${pid}" 2>/dev/null || true
+        done
+    fi
     exec 1>&- 2>&-
     wait "${log_pipe_pid}" 2>/dev/null || true
     exit 1
@@ -107,11 +125,15 @@ refuse_to_start() {
 # grandchild alive, and that grandchild still holds the log pipe open. `refuse_to_start` then waits
 # for the pipe to drain and never returns: a container that was supposed to refuse loudly hangs
 # forever instead, and the platform sees it as running. Reproduced on bare bash.
+#
+# The loop is signalled BEFORE its child: bash defers a TERM taken while it waits on a foreground
+# child until that child exits, so the loop dies instead of starting one more iteration. Killing the
+# child first leaves a window in which the loop spawns a fresh pipe holder and the hang comes back.
 terminate_supervised_loop() {
     local pid="$1"
     [[ -n "${pid}" ]] || return 0
-    pkill -TERM -P "${pid}" 2>/dev/null || true
     kill -TERM "${pid}" 2>/dev/null || true
+    pkill -TERM -P "${pid}" 2>/dev/null || true
 }
 
 # SIGTERM is a DROP, not a drain. A customer rental stops the filler and must not wait: the platform

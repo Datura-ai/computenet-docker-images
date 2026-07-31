@@ -56,7 +56,9 @@ every leg connects."*
 
 Measured by running this image at 4 on a rented H100 (2026-07-30): the worker connected, opened four
 connections, and was failed in three seconds with `offered 4 distinct clean legs, below the required
-8`. Zero requests, ever. **Never set this below 8.**
+8`. Zero requests, ever. **Never set this below 8.** The entrypoint no longer lets anyone: a lower
+override is logged and raised back to 8, because a knob whose wrong value silently earns nothing is
+a trap, not a setting.
 
 Above 8 buys nothing either. Same box, same day: declaring 8 drew a burst of 8 concurrent; declaring
 **64 drew the same burst of 8**. The number we declare is an admission ticket, not a throttle — the

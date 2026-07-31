@@ -162,6 +162,15 @@ grep -q -- "--max-running-requests 8" "${SANDBOX}/calls.log" \
     || fail "engine --max-running-requests does not match the declared 8"
 rm -rf "${SANDBOX}"
 
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_MAX_RUNNING_REQUESTS=4
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
+    fail "an override below the floor reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "an override below the floor is raised back to 8 instead of earning nothing"
+fi
+rm -rf "${SANDBOX}"
+
 echo "== the event-loop lag probe is wired up =="
 # Without it, our own GIL stall and the gateway going quiet are the same Close(1011) in the log.
 new_sandbox 2
