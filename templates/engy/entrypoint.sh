@@ -129,6 +129,27 @@ refuse_to_start() {
     exit 1
 }
 
+# Start a supervised loop in a session of its own and echo its pid, which `setsid` also makes the
+# process-GROUP id. That group is the only reliable handle on it: the loop's child is reparented to
+# PID 1 the moment the loop dies, and `pkill -P <loop>` then finds nothing. Measured on the H100 test
+# node — the sidecar's python survived TERM and KILL, kept the log pipe open, and a refusal that had
+# already printed its reason hung for 400s instead of exiting.
+# The pid lands in started_loop_pid rather than on stdout: a $(…) around a background job never
+# returns, because the job inherits the substitution's pipe and holds it open for its whole life.
+start_supervised_loop() {
+    local loop_function="$1"
+    export -f "${loop_function}" interruptible_sleep
+    export LOG_FILE ENGY_MINER_DIR PROBE_DIR ENGY_LOG_MAX_BYTES
+    # Without setsid the loop shares our process group and signalling the group would hit the whole
+    # container, so that case falls back to the parent/child handles the kill helpers also accept.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid bash -c "${loop_function}" &
+    else
+        bash -c "${loop_function}" &
+    fi
+    started_loop_pid=$!
+}
+
 # Kill a supervised background loop AND the child it is currently running.
 #
 # The sidecar and the log trimmer are subshells; TERM to the subshell leaves its python/`tail`
@@ -144,7 +165,7 @@ refuse_to_start() {
 terminate_supervised_loop() {
     local pid="$1"
     [[ -n "${pid}" ]] || return 0
-    kill -TERM "${pid}" 2>/dev/null || true
+    kill -TERM -"${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
     pkill -TERM -P "${pid}" 2>/dev/null || true
 }
 
@@ -153,7 +174,7 @@ terminate_supervised_loop() {
 kill_supervised_loop_hard() {
     local pid="$1"
     [[ -n "${pid}" ]] || return 0
-    kill -KILL "${pid}" 2>/dev/null || true
+    kill -KILL -"${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
     pkill -KILL -P "${pid}" 2>/dev/null || true
 }
 
@@ -374,15 +395,16 @@ start_metrics_sidecar() {
     for port in "${engine_ports[@]}"; do
         targets+="${targets:+,}http://127.0.0.1:${port}"
     done
-    (
-        while true; do
-            ENGY_METRICS_TARGETS="${targets}" ENGY_LOG_FILE="${LOG_FILE}" \
-            ENGY_PROBE_DIR="${PROBE_DIR}" \
-                python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" || true
-            sleep 5
-        done
-    ) &
-    sidecar_pid=$!
+    export ENGY_METRICS_TARGETS="${targets}" ENGY_LOG_FILE="${LOG_FILE}" ENGY_PROBE_DIR="${PROBE_DIR}"
+    start_supervised_loop run_metrics_sidecar_forever
+    sidecar_pid="${started_loop_pid}"
+}
+
+run_metrics_sidecar_forever() {
+    while true; do
+        python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" || true
+        sleep 5
+    done
 }
 
 # Head-trim the log in place rather than rotating it: `cat >` keeps the inode, so the tee holding the
@@ -599,8 +621,8 @@ main() {
     fi
     echo "[engy] ${mining_engines} of ${gpu_count} engine(s) mining"
 
-    trim_log_forever &
-    trim_log_pid=$!
+    start_supervised_loop trim_log_forever
+    trim_log_pid="${started_loop_pid}"
 
     supervise_forever
 }
