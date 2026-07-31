@@ -21,6 +21,10 @@ ARG DEBIAN_FRONTEND=noninteractive
 # headers it does not fail loudly — it prints "Triton is not supported on current platform, roll
 # back to CPU" and the engine limps along on the CPU path. Caught by running the container, not by
 # building it.
+# procps: for `pkill`, which terminate_supervised_loop uses to kill a supervised subshell's child
+# before the subshell. The CUDA base happens to ship it, but the failure mode if a future base does
+# not is silent — pkill missing is swallowed, the orphan keeps the log pipe, and a refusal hangs
+# instead of exiting. Pinned rather than assumed.
 # moreutils: for `ts`, which stamps every captured line. The miner prints without a timestamp, and
 # reading our log against engy's per-request dashboard is guesswork without one.
 RUN apt-get update && \
@@ -30,6 +34,7 @@ RUN apt-get update && \
     jq \
     libnuma1 \
     moreutils \
+    procps \
     python3 \
     python3-dev \
     python3-pip \
