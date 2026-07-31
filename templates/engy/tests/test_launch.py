@@ -87,7 +87,7 @@ def check_a_renamed_hook_refuses_to_start() -> None:
     print("== a renamed hook refuses to start instead of running unmodified ==")
     # The whole point of the refresh being safe. Running with a random worker id and no probe would
     # look healthy and quietly cost re-onboarding on every restart.
-    for hook in ("_serve_all", "WORKER_ID", "main"):
+    for hook in ("_serve_all", "WORKER_ID", "main", "HW"):
         original_hook = getattr(engy_miner, hook)
         delattr(engy_miner, hook)
         try:

@@ -112,15 +112,18 @@ refuse_to_start() {
     done
     terminate_supervised_loop "${trim_log_pid}"
     terminate_supervised_loop "${sidecar_pid}"
-    # An engine wedged in a driver call never acts on TERM, and it holds the log pipe: without the
-    # KILL the wait below never returns and the container hangs instead of refusing loudly. Only
-    # the late refusal ("no engine became ready") has children at all; the early ones skip the wait.
+    # Everything above is a request; this is not. An engine wedged in a driver call never acts on
+    # TERM, and whether a signalled subshell dies before or after its child is bash semantics we
+    # would rather not depend on — either way something can still hold the log pipe and the wait
+    # below would never return, hanging the container instead of refusing loudly.
     if (( ${#children[@]} > 0 )); then
         sleep "${REFUSAL_KILL_GRACE_SECONDS}"
         for pid in "${children[@]}"; do
             [[ -n "${pid}" ]] && kill -KILL "${pid}" 2>/dev/null || true
         done
     fi
+    kill_supervised_loop_hard "${trim_log_pid}"
+    kill_supervised_loop_hard "${sidecar_pid}"
     exec 1>&- 2>&-
     wait "${log_pipe_pid}" 2>/dev/null || true
     exit 1
@@ -136,11 +139,22 @@ refuse_to_start() {
 # The loop is signalled BEFORE its child: bash defers a TERM taken while it waits on a foreground
 # child until that child exits, so the loop dies instead of starting one more iteration. Killing the
 # child first leaves a window in which the loop spawns a fresh pipe holder and the hang comes back.
+# Neither race reproduced in 20 trials on bare bash, which is exactly why `refuse_to_start` does not
+# rely on this ordering being right and follows up with kill_supervised_loop_hard.
 terminate_supervised_loop() {
     local pid="$1"
     [[ -n "${pid}" ]] || return 0
     kill -TERM "${pid}" 2>/dev/null || true
     pkill -TERM -P "${pid}" 2>/dev/null || true
+}
+
+# The same pair with KILL, for when the container is going down anyway and nothing may be left
+# holding the log pipe. The loop dies first so it cannot answer its child's death with a new one.
+kill_supervised_loop_hard() {
+    local pid="$1"
+    [[ -n "${pid}" ]] || return 0
+    kill -KILL "${pid}" 2>/dev/null || true
+    pkill -KILL -P "${pid}" 2>/dev/null || true
 }
 
 # SIGTERM is a DROP, not a drain. A customer rental stops the filler and must not wait: the platform
@@ -271,7 +285,9 @@ miner_worker_name() {
 # and ignores CUDA_VISIBLE_DEVICES. Every miner here fronts ONE engine on ONE card, so without this
 # all eight of ours announce the node's eight cards each. HW_GPUS is upstream's own override for it.
 one_gpu_name() {
-    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^ *//;s/ *$//'
+    local name
+    name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^ *//;s/ *$//')"
+    echo "${name:-GPU}"
 }
 
 miner_worker_id() {
@@ -305,7 +321,7 @@ start_miner() {
 # The hooks engy_launch.py assigns after import. Kept next to the validator on purpose: adding a
 # modification there means adding its hook here, or a refresh can hand us an upstream we cannot
 # modify and every miner runs with a random worker id and no probe — working, earning less, silent.
-REQUIRED_MINER_HOOKS=("^WORKER_ID" "^WORKER_NAME" "^async def _serve_all" "^def main" "^_JOBS")
+REQUIRED_MINER_HOOKS=("^WORKER_ID" "^WORKER_NAME" "^async def _serve_all" "^def main" "^_JOBS" "^HW")
 
 # Empty when the staged file is usable; otherwise the reason it is not.
 why_staged_miner_is_unusable() {

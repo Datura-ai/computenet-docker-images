@@ -80,6 +80,19 @@ def apply_stable_worker_id() -> str:
     return engy_miner.WORKER_ID
 
 
+def announce_only_this_workers_card() -> None:
+    """Report ONE card, because this miner fronts one engine on one card.
+
+    Upstream builds the HELLO hardware summary from `nvidia-smi`, which lists the whole node and
+    ignores CUDA_VISIBLE_DEVICES, so all eight of our miners announced the node's eight cards each.
+    `HW_GPUS` (set by the entrypoint) only overrides the human-readable string; the count beside it
+    has to be corrected here or the frame contradicts itself.
+    """
+    hardware: dict[str, Any] = require("HW")
+    if hardware.get("gpu_count"):
+        hardware["gpu_count"] = 1
+
+
 def install_loop_probe() -> None:
     """Start the event-loop lag probe inside the miner's own loop, by wrapping `_serve_all`.
 
@@ -108,6 +121,7 @@ def install_loop_probe() -> None:
 def main() -> None:
     worker_id: str = apply_stable_worker_id()
     take_worker_singleton(worker_id)
+    announce_only_this_workers_card()
     install_loop_probe()
     print(f"[engy-launch] upstream miner with Lium modifications, worker_id={worker_id}", flush=True)
     require("main")()

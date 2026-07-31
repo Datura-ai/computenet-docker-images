@@ -319,6 +319,15 @@ dolphin's fleet totals ~2.8x.
 than summarised. lium-stats compares it between consecutive scrapes and books 0 when it moves. It is
 NULL on images without the gauge, where the count comparison is still used.
 
+## Why each miner announces one card
+
+The HELLO frame's hardware summary comes from `nvidia-smi`, which lists the whole node and ignores
+CUDA_VISIBLE_DEVICES, so all eight miners announced the node's eight cards each. The entrypoint sets
+`HW_GPUS` — upstream's own override — and `engy_launch.py` corrects `HW["gpu_count"]` beside it,
+because overriding only the string leaves the frame contradicting itself. It costs nothing in routing
+or scoring (legs and per-worker acceptance decide those); it is about not appearing to claim hardware
+we are not backing that worker with.
+
 ## Why a refusal kills as well as terminates
 
 `refuse_to_start` cannot return until the log pipe drains, because the reason has to reach disk — and

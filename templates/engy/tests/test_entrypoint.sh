@@ -330,7 +330,8 @@ PAYLOAD='WORKER_ID = 1
 WORKER_NAME = "w"
 async def _serve_all(): pass
 def main(): pass
-_JOBS = {}' assert_refresh_outcome "a valid upstream replaces the image's copy" \
+_JOBS = {}
+HW = {}' assert_refresh_outcome "a valid upstream replaces the image's copy" \
     "${CURL_STUB_WRITES_PAYLOAD}" replaced
 rm -rf "${SANDBOX}"
 
