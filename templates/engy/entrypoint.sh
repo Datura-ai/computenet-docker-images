@@ -91,13 +91,27 @@ start_capturing_output() {
 refuse_to_start() {
     echo "[engy] $1" >&2
     local pid
-    for pid in ${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"} \
-               "${trim_log_pid}" "${sidecar_pid}"; do
+    for pid in ${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"}; do
         [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
     done
+    terminate_supervised_loop "${trim_log_pid}"
+    terminate_supervised_loop "${sidecar_pid}"
     exec 1>&- 2>&-
     wait "${log_pipe_pid}" 2>/dev/null || true
     exit 1
+}
+
+# Kill a supervised background loop AND the child it is currently running.
+#
+# The sidecar and the log trimmer are subshells; TERM to the subshell leaves its python/`tail`
+# grandchild alive, and that grandchild still holds the log pipe open. `refuse_to_start` then waits
+# for the pipe to drain and never returns: a container that was supposed to refuse loudly hangs
+# forever instead, and the platform sees it as running. Reproduced on bare bash.
+terminate_supervised_loop() {
+    local pid="$1"
+    [[ -n "${pid}" ]] || return 0
+    pkill -TERM -P "${pid}" 2>/dev/null || true
+    kill -TERM "${pid}" 2>/dev/null || true
 }
 
 # SIGTERM is a DROP, not a drain. A customer rental stops the filler and must not wait: the platform
@@ -106,10 +120,11 @@ refuse_to_start() {
 # the in-flight requests are lost.
 shutdown() {
     local pid
-    for pid in ${miner_pids[@]+"${miner_pids[@]}"} "${trim_log_pid}" "${sidecar_pid}" \
-               ${engine_pids[@]+"${engine_pids[@]}"}; do
+    for pid in ${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"}; do
         [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
     done
+    terminate_supervised_loop "${trim_log_pid}"
+    terminate_supervised_loop "${sidecar_pid}"
     # Wait for the MINERS only, never a bare `wait`. The tee behind the exec redirect is a child too
     # and cannot see EOF while this script holds the pipe open, so a bare wait never returns under
     # bash 5 and the stop blows the platform's 30s budget.
@@ -140,6 +155,7 @@ start_engine() {
     # Every start earns the reload grace, first one included: a cold start JITs ~16k FP8 kernels and
     # is the longest window in which a healthy engine looks wedged.
     engine_kill_allowed_at[gpu_index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
+    engine_started_at[gpu_index]="${SECONDS}"
 }
 
 # Start engine 0 alone, let it fill the shared kernel cache, then release the rest.
@@ -448,9 +464,18 @@ supervise_forever() {
                 continue
             fi
             if [[ -z "${miner_pids[$index]:-}" ]]; then
+                if (( SECONDS < ${miner_restart_allowed_at[$index]:-0} )); then
+                    continue                     # still inside this miner's respawn backoff
+                fi
                 if engine_is_generating "${engine_ports[$index]}"; then
                     echo "[engy] engine on port ${engine_ports[$index]} is generating again — starting its miner" >&2
                     start_miner "${index}"
+                elif (( SECONDS - ${engine_started_at[$index]:-0} >= ENGINE_READY_TIMEOUT_SECONDS )); then
+                    # An engine that is alive but has never served is not "wedged" by the token test
+                    # (it has no requests, so the stall clock never arms) and would otherwise sit
+                    # here forever — one card silently idle for the life of the container.
+                    restart_engine "${index}" \
+                        "never became ready in ${ENGINE_READY_TIMEOUT_SECONDS}s"
                 fi
                 continue
             fi
@@ -458,9 +483,11 @@ supervise_forever() {
                 wait "${miner_pids[$index]}" 2>/dev/null || true
                 echo "[engy] miner ${miner_names[$index]} exited — respawning in ${MINER_RESTART_BACKOFF_SECONDS}s" >&2
                 miner_pids[index]=""
-                interruptible_sleep "${MINER_RESTART_BACKOFF_SECONDS}"
+                # Deadline, not a sleep: sleeping here stalls the whole pass, so one crash-looping
+                # miner would delay wedge detection on every other card and freeze the heartbeat
+                # the ETL charts.
+                miner_restart_allowed_at[index]=$(( SECONDS + MINER_RESTART_BACKOFF_SECONDS ))
                 miner_restarts[index]=$(( ${miner_restarts[$index]:-0} + 1 ))
-                start_miner "${index}"
             fi
         done
         write_supervisor_metrics
@@ -523,6 +550,8 @@ main() {
 }
 
 declare -a engine_stall_since=()
+declare -a engine_started_at=()
+declare -a miner_restart_allowed_at=()
 declare -a engine_restarts=()
 declare -a miner_restarts=()
 declare -a engine_kill_allowed_at=()

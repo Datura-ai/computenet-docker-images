@@ -205,6 +205,21 @@ Three things are deliberately NOT treated as a wedge, also from dolphin's watchd
 - anything the supervisor cannot attribute to one engine. A wrong guess costs a healthy engine on top
   of the wedged one.
 
+## Why a supervised background loop is killed with its child
+
+The sidecar and the log trimmer are subshells that run a program in a loop. TERM to the subshell
+leaves that program alive — and it still holds the log pipe open, so `refuse_to_start`'s wait for
+the pipe to drain never returns. A container that was supposed to refuse loudly hangs instead, and
+the platform sees it as running. `terminate_supervised_loop` kills the loop's current child first
+(`pkill -P`), then the loop.
+
+## Why an engine that never becomes ready is eventually restarted
+
+The wedge detector cannot see it: with no miner attached the engine holds no requests, so the stall
+clock never arms and it is excluded by the same rule that protects a cold start. Left alone it sits
+idle for the life of the container. After `ENGY_ENGINE_READY_TIMEOUT_SECONDS` from its own start it
+is restarted like any other fault — the cold-start exclusion is a grace, not a permanent pass.
+
 ## Why one dead card costs one card
 
 The readiness loop used to refuse the whole container when any engine failed to come up. That was

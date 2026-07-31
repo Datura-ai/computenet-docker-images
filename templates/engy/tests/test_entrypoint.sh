@@ -326,6 +326,48 @@ assert_refresh_outcome "ENGY_MINER_AUTO_UPDATE=0 pins the image's copy" \
     "${CURL_STUB_WRITES_PAYLOAD}" kept ENGY_MINER_AUTO_UPDATE=0
 rm -rf "${SANDBOX}"
 
+echo "== a container that refuses to start actually exits =="
+# Killing the sidecar subshell leaves its python holding the log pipe, so refuse_to_start's wait
+# for the pipe never returns and the container hangs instead of refusing. Reproduced on bare bash.
+new_sandbox 2
+{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *health_generate*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
+chmod +x "${SANDBOX}/bin/curl"
+CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
+    ENGY_MINER_DIR="${SANDBOX}/miner" \
+    env MINER_KEY=mk-test METRICS_TOKEN=t ENGY_CACHE_SEED_WAIT_SECONDS=2 \
+        ENGY_ENGINE_READY_TIMEOUT_SECONDS=2 bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
+refusal_pid=$!
+waited=0
+while (( waited < 40 )) && kill -0 "${refusal_pid}" 2>/dev/null; do sleep 1; waited=$((waited + 1)); done
+if kill -0 "${refusal_pid}" 2>/dev/null; then
+    fail "the refusal hung — the sidecar's child still holds the log pipe"
+    kill -9 "${refusal_pid}" 2>/dev/null
+else
+    pass "a sidecar with a live child does not block the refusal"
+fi
+grep -q "no engine became ready" "${SANDBOX}/out.log" && pass "and the reason is on disk" || fail "no reason logged"
+rm -rf "${SANDBOX}"
+
+echo "== an engine that never becomes ready is eventually restarted =="
+# It is alive and holds no requests, so the token-based wedge test never arms; without this the
+# card sits idle for the life of the container. Two GPUs: one healthy so the container survives.
+new_sandbox 2
+{ echo '#!/usr/bin/env bash'
+  echo 'case "$*" in *8001/health_generate*) exit 7 ;; *8001/metrics*) exit 7 ;; esac; exit 0'
+} >"${SANDBOX}/bin/curl"
+chmod +x "${SANDBOX}/bin/curl"
+start_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 \
+    ENGY_ENGINE_READY_TIMEOUT_SECONDS=3 ENGY_LIVENESS_INTERVAL_SECONDS=1 \
+    ENGY_ENGINE_RESTART_GRACE_SECONDS=0
+sleep 14
+grep -q "port 8001 never became ready in .*restarting it" "${SANDBOX}/out.log" \
+    && pass "a permanently unready engine is restarted, not abandoned" \
+    || fail "never restarted; log tail: $(grep '\[engy\]' "${SANDBOX}/out.log" | tail -2 | tr '\n' ' ')"
+grep -q "port 8000 ready" "${SANDBOX}/out.log" \
+    && pass "and the healthy card kept mining throughout" || fail "the healthy card was disturbed"
+kill -TERM "${ENTRYPOINT_PID}" 2>/dev/null; wait "${ENTRYPOINT_PID}" 2>/dev/null
+rm -rf "${SANDBOX}"
+
 echo "== the supervisor publishes what it has done =="
 # A container that quietly restarts one engine an hour looks identical to a healthy one from
 # outside, and on a miner's host nobody reads the log until something has already gone wrong.
