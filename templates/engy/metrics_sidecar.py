@@ -186,7 +186,7 @@ def read_probe_bodies() -> list[str]:
     return bodies
 
 
-def fetch_all_engine_metrics() -> list[str]:
+def fetch_all_engine_metrics() -> list[tuple[int, str]]:
     """Every engine that answered within ONE shared deadline, asked all at once.
 
     Concurrently, not in a loop: with a sequential walk the first slow engine spends the whole
@@ -200,8 +200,8 @@ def fetch_all_engine_metrics() -> list[str]:
     deadline: float = time.monotonic() + TOTAL_BUDGET_SECONDS
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(TARGETS)) as pool:
         futures = [pool.submit(fetch_engine_metrics, target, deadline) for target in TARGETS]
-        bodies: list[str] = []
-        for future in futures:
+        answered: list[tuple[int, str]] = []
+        for index, future in enumerate(futures):
             remaining: float = max(0.0, deadline - time.monotonic())
             try:
                 # An absolute wait on top of the per-socket timeout: a body dripped one byte per
@@ -210,8 +210,8 @@ def fetch_all_engine_metrics() -> list[str]:
             except concurrent.futures.TimeoutError:
                 continue
             if body is not None:
-                bodies.append(body)
-    return bodies
+                answered.append((index, body))
+    return answered
 
 
 def collect() -> tuple[bytes, int]:
@@ -220,11 +220,20 @@ def collect() -> tuple[bytes, int]:
     A dead engine is skipped rather than failing the whole scrape: on a multi-card node the surviving
     engines are still earning, and the reachable-count series is what says a card went quiet.
     """
-    bodies: list[str] = fetch_all_engine_metrics()
+    answered_engines: list[tuple[int, str]] = fetch_all_engine_metrics()
+    bodies: list[str] = [body for _, body in answered_engines]
+    # WHICH engines answered, as one bit per configured engine. The counters above are a SUM over
+    # this set, so a consumer differencing them needs to know the set is the same one — and a count
+    # cannot tell "engine 3 left" from "engine 3 left and engine 5 came back", which re-books a
+    # returning engine's lifetime counter as one interval's work.
+    reachable_mask: int = sum(1 << index for index, _ in answered_engines)
     own_series: str = (
         "# HELP engy_sidecar_engines_reachable Engines that answered the last scrape.\n"
         "# TYPE engy_sidecar_engines_reachable gauge\n"
         f"engy_sidecar_engines_reachable {len(bodies)}\n"
+        "# HELP engy_sidecar_engines_reachable_mask Bit per configured engine that answered.\n"
+        "# TYPE engy_sidecar_engines_reachable_mask gauge\n"
+        f"engy_sidecar_engines_reachable_mask {reachable_mask}\n"
         "# HELP engy_sidecar_engines_configured Engines this container was told to scrape.\n"
         "# TYPE engy_sidecar_engines_configured gauge\n"
         f"engy_sidecar_engines_configured {len(TARGETS)}\n"

@@ -294,6 +294,40 @@ the whole body on a non-2xx, so gating the 503 on engines alone threw the loop-l
 exactly the case they are most worth reading — every engine down, miners still reporting why.
 `engy_sidecar_engines_reachable 0` carries the engine alert on its own.
 
+## Why the boot refresh judges the download in silence
+
+`why_staged_miner_is_unusable` returns its reason as text, and empty means "take it". By the time it
+runs, `PYTHONPATH` already points at our own directory, so starting any interpreter loads
+`sitecustomize.py` — which prints `[engy] hidden-states trim armed` on **stdout**. That banner landed
+in the reason string, so every valid refresh was discarded with a nonsense excuse and the feature was
+dead in the image while looking healthy. Verified on the live prod container: with the entrypoint's
+own `PYTHONPATH`, `py_compile` of a one-line file captures the banner; with it cleared, nothing.
+
+So the validation runs as `PYTHONPATH= python3 -m py_compile … >/dev/null 2>&1`: it must not load our
+hooks, and no future chatter on either stream can be mistaken for a verdict. Anything added to this
+function has to keep that property — write reasons, never let a child write anything.
+
+## Why the sidecar reports WHICH engines answered, not just how many
+
+The token counters in one scrape are a SUM over the engines that answered, so two scrapes are only
+comparable when that set is the same. A count almost says this and gets one case wrong: engine 3
+leaving while engine 5 returns keeps the count at 8, and engine 5's whole lifetime counter re-enters
+the sum and is booked as one interval's work. That is the same class of overcount that inflated
+dolphin's fleet totals ~2.8x.
+
+`engy_sidecar_engines_reachable_mask` is one bit per configured engine, so the set is exact rather
+than summarised. lium-stats compares it between consecutive scrapes and books 0 when it moves. It is
+NULL on images without the gauge, where the count comparison is still used.
+
+## Why a refusal kills as well as terminates
+
+`refuse_to_start` cannot return until the log pipe drains, because the reason has to reach disk — and
+anything still holding that pipe keeps it open. The late refusal ("no engine became ready") runs with
+engines alive, and an engine wedged in a driver call never acts on TERM. So after a grace period
+every engine and miner is killed outright. Without that, the container that was supposed to refuse
+loudly hangs forever and the platform sees it as running: the exact failure this whole path exists to
+avoid.
+
 ## What we deliberately did not do
 
 - **Fork the miner** to move parsing and proof building into worker processes. Measured worst
@@ -302,9 +336,9 @@ exactly the case they are most worth reading — every engine down, miners still
   headroom we already have. Revisit only if the probe starts reporting stalls.
 - **Lower the declared concurrency.** Declaring 8 and declaring 64 drew the same burst of 8, so the
   number throttles nothing — and below 8 the worker cannot be onboarded at all.
-- **Auto-update the vendored miner.** It is pinned (currently upstream v0.4.4 plus the worker-id
-  patch) because it must match the gateway protocol exactly, and because every image bump costs a
-  restart. Watch upstream and update deliberately, in batches, when acceptance drops or a needed fix
-  lands.
+- **Pin the vendored miner to a release tag.** Upstream's tags lag their own default branch badly —
+  the newest release was v0.4.1 while the tags read v0.4.4 — so a tag is not "current". The image
+  refreshes from the branch on every boot and keeps its own copy when anything about the download
+  looks wrong. `ENGY_MINER_AUTO_UPDATE=0` pins it.
 - **Ship logs to Loki.** The value is real but almost all of it is in Dolphin, which is 175 of the
   ~200 fillers in prod. Doing it for engy alone would be building infrastructure for one node.

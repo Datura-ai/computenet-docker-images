@@ -267,6 +267,13 @@ miner_worker_name() {
     echo "${ENGY_WORKER_NAME:-$(hostname)}-g${index}"
 }
 
+# The hardware summary a miner sends the gateway comes from `nvidia-smi`, which lists the whole node
+# and ignores CUDA_VISIBLE_DEVICES. Every miner here fronts ONE engine on ONE card, so without this
+# all eight of ours announce the node's eight cards each. HW_GPUS is upstream's own override for it.
+one_gpu_name() {
+    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^ *//;s/ *$//'
+}
+
 miner_worker_id() {
     local name="$1"
     printf '%s' "${name}" | sha256sum | cut -c1-32
@@ -278,6 +285,7 @@ start_miner() {
     miner_names[index]="${name}"
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
     MAX_INFLIGHT="${PER_ENGINE_REQUESTS}" \
+    HW_GPUS="1x $(one_gpu_name)" \
     ENGY_WORKER_NAME="${name}" \
     ENGY_WORKER_ID="$(miner_worker_id "${name}")" \
     ENGY_PROBE_DIR="${PROBE_DIR}" \
