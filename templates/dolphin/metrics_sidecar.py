@@ -64,10 +64,10 @@ WATCHDOG_STATE_GLOB = os.environ.get(
 # 0 means "unknown" — the single-worker image does not set it.
 ENGINES_EXPECTED = int(os.environ.get("DOLPHIN_ENGINES_EXPECTED", "0") or "0")
 SIDECAR_VERSION = 2
-# One deadline covers ALL engines, so a fixed 4 s silently drops the tail once a node runs many
-# of them: 8 engines x a slow /metrics would exhaust it and the last engines would vanish from
-# the body — the very undercount this fan-out exists to prevent. Grow with the engine count but
-# stay under the scraper's 8 s client timeout.
+# One deadline covers ALL engines. Since DAH-2542 the sidecar fetches them concurrently, so
+# the growth term no longer protects the scrape itself — it survives for the two still-serial
+# consumers: the watchdog's fetch_vllm_metrics() fall-through over stale sockets, and pool
+# queueing past 16 sockets. Stays under the scraper's 8 s client timeout either way.
 TOTAL_BUDGET_S = min(4.0 + 0.4 * max(0, ENGINES_EXPECTED - 1), 7.0)
 CONNECT_TIMEOUT_S = 1.0
 MAX_BODY_BYTES = 5 * 1024 * 1024
@@ -184,7 +184,13 @@ def fetch_one_engine(path: str, deadline: float) -> bytes | None:
     # One engine's /metrics, inside the caller's shared deadline. None means this socket did
     # not deliver; the caller decides whether that ends the scrape or just skips one engine.
     global _last_ok_ts, _last_socket, _last_error
-    conn = UdsHTTPConnection(path, timeout=min(CONNECT_TIMEOUT_S, deadline - time.monotonic()))
+    remaining_s = deadline - time.monotonic()
+    if remaining_s <= 0:
+        # A pool-queued fetch can start after the deadline (more sockets than workers);
+        # a negative timeout would raise ValueError past the except below.
+        _last_error = "budget exhausted"
+        return None
+    conn = UdsHTTPConnection(path, timeout=min(CONNECT_TIMEOUT_S, remaining_s))
     try:
         conn.connect()
         conn.sock.settimeout(max(0.1, deadline - time.monotonic()))
@@ -368,22 +374,21 @@ def fetch_all_engines(sockets: list[str]) -> list[EngineMetrics]:
     # that do not answer are simply absent from the result and show up as up < expected. Stale
     # socket files fail to connect and drop out the same way.
     global _last_error
-    if not sockets:
-        return []
     deadline = time.monotonic() + TOTAL_BUDGET_S
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(len(sockets), 16))
-    futures = {pool.submit(fetch_one_engine, path, deadline): path for path in sockets}
-    done, not_done = concurrent.futures.wait(futures, timeout=TOTAL_BUDGET_S)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+    future_to_path = {pool.submit(fetch_one_engine, path, deadline): path for path in sockets}
+    done, not_done = concurrent.futures.wait(future_to_path, timeout=deadline - time.monotonic())
     # Late threads must not block the response; their socket timeouts end them on their own.
     pool.shutdown(wait=False)
     if not_done:
         _last_error = "budget exhausted"
-    bodies = {futures[future]: future.result() for future in done}
-    return [
-        EngineMetrics(socket_path=path, body=bodies[path])
-        for path in sockets
-        if bodies.get(path) is not None
-    ]
+    body_by_path = {future_to_path[future]: future.result() for future in done}
+    results: list[EngineMetrics] = []
+    for path in sockets:
+        body = body_by_path.get(path)
+        if body is not None:
+            results.append(EngineMetrics(socket_path=path, body=body))
+    return results
 
 
 def sidecar_series(sockets_found: int, proxy_ok: bool, engines_up: int = 0) -> bytes:
