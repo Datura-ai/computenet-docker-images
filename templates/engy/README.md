@@ -10,21 +10,22 @@ Two kinds of process, unlike Dolphin's single self-updating binary:
 ```
 gateway (wss://api.engy.ai/gw)
         │  outbound websocket, no inbound port
-   engy_miner.py  ──►  sglang engine :8000  (GPU 0)
-                  ──►  sglang engine :8001  (GPU 1)
-                  ──►  …                    (one per card)
+   miner 0  ──►  sglang engine :8000  (GPU 0)
+   miner 1  ──►  sglang engine :8001  (GPU 1)
+   …        ──►  …                    (one pair per card)
 ```
 
-**One engine per card, one miner per container.** Measured on 2xH100 (2026-07-27):
+**One engine per card, and one miner in front of each.** Measured on 2xH100 (2026-07-27):
 
 | shape | tok/s | TTFT p99 | failed |
 |---|---|---|---|
 | 1 engine, `--tp-size 2` | 329 | 15.3s | 0 |
 | 2 engines, `--tp-size 1` | **564** | **8.7s** | 0 |
 
-1.72x, and latency improves rather than degrades. The miner stays single because engy's acceptance
-gate is per `(miner, model)`: a second miner needs its own registered SN53 hotkey, and one bad
-worker zeroes the whole key for that day.
+1.72x, and latency improves rather than degrades. Every miner shares the node's single SN53 hotkey
+and is told apart by a worker name derived from the machine and the card, so its worker id survives
+a restart. Each declares only its own engine's capacity, and each is restarted on its own by the
+supervisor: one dead card costs one card, not the node. See ARCHITECTURE.md.
 
 ## Environment
 
@@ -33,8 +34,9 @@ worker zeroes the whole key for that day.
 | `MINER_KEY` | **yes** | — | gateway key from provider.engy.ai, bound to a registered SN53 hotkey |
 | `GW` | no | `wss://api.engy.ai/gw` | gateway websocket |
 | `MODEL` | no | `qwen3.6-35b-a3b` | the gateway's model id |
-| `ENGY_MAX_RUNNING_REQUESTS` | no | `8` | per engine; the sum is declared to the gateway as `MAX_INFLIGHT` |
-| `ENGY_WORKER_NAME` | no | hostname | must be unique per machine when several share one key |
+| `ENGY_MAX_RUNNING_REQUESTS` | no | `8` | per engine, and what each miner declares as `MAX_INFLIGHT`; 8 is the gateway's onboarding floor, so lower values are raised back to it |
+| `ENGY_WORKER_NAME` | no | hostname | prefix for the per-card worker names; must be unique per machine |
+| `ENGY_MINER_AUTO_UPDATE` | no | `1` | refresh the miner from upstream on boot; `0` pins the image's copy |
 | `METRICS_TOKEN` | no | — | when set, the sidecar is started on `:9101` |
 | `ENGY_LOG_MAX_BYTES` | no | `268435456` | the on-disk log is head-trimmed back to half this size |
 

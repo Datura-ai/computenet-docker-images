@@ -21,6 +21,10 @@ ARG DEBIAN_FRONTEND=noninteractive
 # headers it does not fail loudly — it prints "Triton is not supported on current platform, roll
 # back to CPU" and the engine limps along on the CPU path. Caught by running the container, not by
 # building it.
+# procps: for `pkill`, which terminate_supervised_loop uses to kill a supervised subshell's child
+# before the subshell. The CUDA base happens to ship it, but the failure mode if a future base does
+# not is silent — pkill missing is swallowed, the orphan keeps the log pipe, and a refusal hangs
+# instead of exiting. Pinned rather than assumed.
 # moreutils: for `ts`, which stamps every captured line. The miner prints without a timestamp, and
 # reading our log against engy's per-request dashboard is guesswork without one.
 RUN apt-get update && \
@@ -30,6 +34,7 @@ RUN apt-get update && \
     jq \
     libnuma1 \
     moreutils \
+    procps \
     python3 \
     python3-dev \
     python3-pip \
@@ -65,8 +70,10 @@ ENV DG_JIT_CACHE_DIR=${ENGY_HOME}/deepgemm-cache
 
 WORKDIR ${ENGY_HOME}
 
-# Vendored from github.com/hanlinai/engy @ v0.4.4 (miner/). Upstream publishes no package, and the
-# miner must match the gateway protocol exactly — so it is pinned here rather than fetched at boot.
+# Vendored from github.com/hanlinai/engy (miner/) — a byte-identical copy, refreshed from the
+# default branch on every boot by the entrypoint. NEVER patch this file: Lium's modifications
+# live in engy_launch.py and are applied from outside, so a refresh cannot drop them.
+# This copy is the fallback for when GitHub is unreachable. Originally vendored at v0.4.4.
 # PYTHONPATH points at this dir so sitecustomize.py can trim the hidden states sglang returns.
 COPY vendor/engy_miner.py vendor/sitecustomize.py ${ENGY_MINER_DIR}/
 
@@ -74,7 +81,7 @@ COPY vendor/engy_miner.py vendor/sitecustomize.py ${ENGY_MINER_DIR}/
 # image puts there is shadowed the moment a volume is mounted over it (found by running it — the
 # sidecar silently vanished). ENGY_HOME holds data only.
 # loop_probe.py rides in ENGY_MINER_DIR so the miner can `import loop_probe` off its own sys.path[0].
-COPY metrics_sidecar.py loop_probe.py ${ENGY_MINER_DIR}/
+COPY metrics_sidecar.py loop_probe.py engy_launch.py ${ENGY_MINER_DIR}/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

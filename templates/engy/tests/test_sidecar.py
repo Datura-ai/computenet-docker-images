@@ -227,6 +227,10 @@ def main() -> int:
                       "the FAST engine's metrics land in the body despite the slow one being first")
                 check(b"engy_sidecar_engines_reachable 1" in body,
                       "and it is counted as reachable")
+                # Bit 1, not bit 0: WHICH engine answered is what makes two scrapes' counters
+                # comparable, and a bare count of 1 cannot say that the slow one was the absent one.
+                check(b"engy_sidecar_engines_reachable_mask 2" in body,
+                      "the mask names the engine that answered, not just how many did")
             finally:
                 slow.shutdown()
                 fast.shutdown()
