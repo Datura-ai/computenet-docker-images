@@ -28,6 +28,7 @@ good response wins") would have silently published 1/N of the tokens.
   restarts reach the scraper.
 """
 
+import concurrent.futures
 import glob
 import hmac
 import http.client
@@ -361,20 +362,28 @@ def merge_engine_bodies(engines: list[EngineMetrics]) -> bytes:
 
 
 def fetch_all_engines(sockets: list[str]) -> list[EngineMetrics]:
-    # Every engine within ONE shared deadline, so N engines cannot stretch the response past
-    # the scraper's timeout. Engines that do not answer are simply absent from the result and
-    # show up as up < expected. Stale socket files fail to connect and drop out the same way.
+    # Every engine within ONE shared deadline — fetched concurrently, so the wall time is the
+    # slowest engine, not the sum: fetched serially, 8 engines at ~1 s each would exhaust the
+    # budget and the tail would read as down (up < expected) while alive (DAH-2542). Engines
+    # that do not answer are simply absent from the result and show up as up < expected. Stale
+    # socket files fail to connect and drop out the same way.
     global _last_error
-    results: list[EngineMetrics] = []
+    if not sockets:
+        return []
     deadline = time.monotonic() + TOTAL_BUDGET_S
-    for path in sockets:
-        if time.monotonic() >= deadline:
-            _last_error = "budget exhausted"
-            break
-        body = fetch_one_engine(path, deadline)
-        if body is not None:
-            results.append(EngineMetrics(socket_path=path, body=body))
-    return results
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(len(sockets), 16))
+    futures = {pool.submit(fetch_one_engine, path, deadline): path for path in sockets}
+    done, not_done = concurrent.futures.wait(futures, timeout=TOTAL_BUDGET_S)
+    # Late threads must not block the response; their socket timeouts end them on their own.
+    pool.shutdown(wait=False)
+    if not_done:
+        _last_error = "budget exhausted"
+    bodies = {futures[future]: future.result() for future in done}
+    return [
+        EngineMetrics(socket_path=path, body=bodies[path])
+        for path in sockets
+        if bodies.get(path) is not None
+    ]
 
 
 def sidecar_series(sockets_found: int, proxy_ok: bool, engines_up: int = 0) -> bytes:

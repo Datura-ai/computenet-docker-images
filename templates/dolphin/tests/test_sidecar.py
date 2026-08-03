@@ -38,8 +38,11 @@ def free_port() -> int:
 class _UdsHandler(http.server.BaseHTTPRequestHandler):
     body: bytes = b""
     status: int = 200
+    delay_s: float = 0.0
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.delay_s:
+            time.sleep(self.delay_s)
         self.send_response(self.status)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(self.body)))
@@ -68,9 +71,9 @@ class _UdsServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 
 @contextlib.contextmanager
-def fake_vllm(sock_path: pathlib.Path, body: bytes, status: int = 200):
+def fake_vllm(sock_path: pathlib.Path, body: bytes, status: int = 200, delay_s: float = 0.0):
     # minimal HTTP-over-unix-socket server standing in for the vLLM engine
-    handler = type("H", (_UdsHandler,), {"body": body, "status": status})
+    handler = type("H", (_UdsHandler,), {"body": body, "status": status, "delay_s": delay_s})
     server = _UdsServer(str(sock_path), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -451,6 +454,28 @@ def test_tag_series_adds_braces_when_line_has_no_labels() -> None:
 def test_engine_id_comes_from_the_socket_directory() -> None:
     module = _load_sidecar_module()
     assert module.engine_id("/tmp/dp-4f2a/v.sock") == "dp-4f2a"
+
+
+def test_slow_engines_all_answer_within_one_budget() -> None:
+    # DAH-2542: engines are fetched concurrently, so the scrape's wall time is the SLOWEST
+    # engine, not the sum. Serially, four engines at 2 s each would blow the 5.2 s budget
+    # (ENGINES_EXPECTED=4) and the tail would read as down while alive — the false
+    # "engines_up < expected" the B300 investigation traced dashboards' dead nodes to.
+    delay_s = 2.0
+    with tempfile.TemporaryDirectory() as tmp:
+        with contextlib.ExitStack() as stack:
+            for name in ("dp-aaa", "dp-bbb", "dp-ccc", "dp-ddd"):
+                sock = pathlib.Path(tmp) / name / "v.sock"
+                sock.parent.mkdir()
+                stack.enter_context(fake_vllm(sock, FIXTURE, delay_s=delay_s))
+            base = stack.enter_context(
+                sidecar(f"{tmp}/dp-*/v.sock", TOKEN, {"DOLPHIN_ENGINES_EXPECTED": "4"})
+            )
+            started = time.monotonic()
+            _, body, _ = get(f"{base}/metrics")
+            elapsed = time.monotonic() - started
+    assert b"dolphin_engines_up 4\n" in body, body[-400:]
+    assert elapsed < 2 * delay_s, f"scrape took {elapsed:.1f}s — engines were fetched serially"
 
 
 def test_scrape_budget_grows_with_engine_count_but_stays_under_the_client_timeout() -> None:
