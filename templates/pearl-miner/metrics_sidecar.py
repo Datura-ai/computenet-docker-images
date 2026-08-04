@@ -14,7 +14,8 @@ hashrate-weighted split of the wallet payout, never measured accepted work.
   PEARL_LOG_DIR=/var/log/pearl PEARL_GPU_COUNT=8 METRICS_TOKEN=… python3 metrics_sidecar.py
 
 Two routes, both behind the same bearer token:
-  /metrics        per-GPU hashrate, per-GPU age of that sample, reporting vs expected GPU count
+  /metrics        per-GPU hashrate, per-GPU age of that sample, the node total over GPUs still
+                  hashing, and reporting vs expected GPU count
   /logs?tail=N    the tail of the miner logs, because on a miner's host the container's stdout goes
                   to a docker pipe we cannot reach
 
@@ -102,15 +103,17 @@ def last_hashrate(text: str) -> float | None:
 def collect() -> MetricsSnapshot:
     """Per-GPU hashrate series plus the reporting/expected counts, and how many GPUs answered.
 
-    A GPU whose file stopped growing keeps its last value and grows an age instead of disappearing:
-    a vanished series reads as "this card was never here", while a frozen one plus its age says the
-    miner stopped — which is the failure we cannot see today. It stops counting as REPORTING though,
-    so reporting-vs-expected answers "how many cards are mining right now".
+    A GPU whose rate file stopped growing keeps its last value and grows an age instead of
+    disappearing: a vanished series reads as "this card was never here", while a frozen one plus its
+    age says the miner stopped. It leaves the node TOTAL and the reporting count though — those two
+    answer "what is this node hashing right now", and a dead card's last rate would otherwise be
+    credited with work (and, downstream, with money) forever.
     """
     now: float = time.time()
     hashrate_lines: list[str] = []
     age_lines: list[str] = []
     reporting_gpus: int = 0
+    fresh_total_hs: float = 0.0
     try:
         names: list[str] = sorted(os.listdir(LOG_DIR))
     except OSError as error:
@@ -133,14 +136,18 @@ def collect() -> MetricsSnapshot:
         age_lines.append(f'pearl_sidecar_gpu_sample_age_seconds{{gpu="{index}"}} {age:.1f}')
         if age <= STALE_AFTER_SECONDS:
             reporting_gpus += 1
+            fresh_total_hs += rate
     body: str = "\n".join(
         [
             "# HELP pearl_sidecar_gpu_hashrate_hs Last hashrate the miner printed for this GPU, in hashes per second.",
             "# TYPE pearl_sidecar_gpu_hashrate_hs gauge",
             *hashrate_lines,
-            "# HELP pearl_sidecar_gpu_sample_age_seconds Seconds since that GPU's log was last written.",
+            "# HELP pearl_sidecar_gpu_sample_age_seconds Seconds since that GPU last printed a hashrate.",
             "# TYPE pearl_sidecar_gpu_sample_age_seconds gauge",
             *age_lines,
+            "# HELP pearl_sidecar_hashrate_total_hs Node hashrate counting only GPUs still printing rates.",
+            "# TYPE pearl_sidecar_hashrate_total_hs gauge",
+            f"pearl_sidecar_hashrate_total_hs {fresh_total_hs:.0f}",
             "# HELP pearl_sidecar_gpus_reporting GPUs whose hashrate line is younger than the stale cutoff.",
             "# TYPE pearl_sidecar_gpus_reporting gauge",
             f"pearl_sidecar_gpus_reporting {reporting_gpus}",

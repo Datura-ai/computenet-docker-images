@@ -128,6 +128,10 @@ def check_hashrate_and_freshness_series() -> None:
         "a GPU silent past the stale cutoff stops counting as reporting",
     )
     check(
+        sample(body, "pearl_sidecar_hashrate_total_hs") == 51.02e12,
+        "the node total counts the hashing GPU only, so a dead card earns nothing downstream",
+    )
+    check(
         sample(body, "pearl_sidecar_gpus_expected") == 3,
         "expected GPU count comes from the launcher, so a dead process is visible",
     )

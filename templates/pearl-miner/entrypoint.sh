@@ -41,6 +41,9 @@ mkdir -p "${LOG_DIR}"
 # The hashrate lines ALSO go to a file of their own, and that is what the sidecar measures freshness
 # by: the miner keeps printing job and pool lines after a card stops hashing, so the full log's
 # mtime would call a dead card fresh. A file only hashrate lines can touch cannot lie about it.
+# grep hangs off a SECOND tee sink rather than a pipe after it: piping tee into grep would make
+# grep the only consumer of tee's stdout, and the miner's output would vanish from the container's
+# own stdout — the one place the platform's failure diagnostics can still read it.
 pids=()
 for ((i = 0; i < GPU_COUNT; i++)); do
     name="${WORKER}"
@@ -50,7 +53,7 @@ for ((i = 0; i < GPU_COUNT; i++)); do
     CUDA_VISIBLE_DEVICES="${i}" /usr/local/bin/pearl-miner \
         --host "${POOL}" --user "${PEARL_POOL_WALLET}" --worker "${name}" \
         > >(tee -a "${LOG_DIR}/gpu-${i}.log" \
-             | grep --line-buffered -E "^Hashrate GPU" >> "${LOG_DIR}/rate-${i}.log") 2>&1 &
+             >(grep --line-buffered -E "^Hashrate GPU" >> "${LOG_DIR}/rate-${i}.log")) 2>&1 &
     pids+=($!)
 done
 
