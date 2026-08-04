@@ -3,7 +3,7 @@ variable "IMAGE_NAME" {
 }
 
 variable "RELEASE" {
-    default = "0.1.0"
+    default = "0.2.0"
 }
 
 target "default" {

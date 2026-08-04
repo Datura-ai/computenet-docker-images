@@ -26,9 +26,17 @@ if [[ "${GPU_COUNT}" -eq 0 ]]; then
     exit 1
 fi
 
+LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
+mkdir -p "${LOG_DIR}"
+
 # One process per GPU: pearl-miner's multi-GPU behavior is undocumented, per-GPU processes with
 # CUDA_VISIBLE_DEVICES pinning work the same on 1-GPU and 8-GPU nodes. Worker names get a -g<i>
 # suffix on multi-GPU nodes so the pool shows each GPU separately.
+#
+# Each process is tee'd into its own log file as well as the container's stdout: the sidecar reads
+# per-GPU hashrate off those files, and on a miner's host we can reach neither `docker logs` nor the
+# container filesystem. Process substitution rather than a `| tee` pipeline so $! stays the MINER's
+# pid — through a pipe it would be tee's, and every miner crash would report tee's exit code 0.
 pids=()
 for ((i = 0; i < GPU_COUNT; i++)); do
     name="${WORKER}"
@@ -36,9 +44,25 @@ for ((i = 0; i < GPU_COUNT; i++)); do
         name="${WORKER}-g${i}"
     fi
     CUDA_VISIBLE_DEVICES="${i}" /usr/local/bin/pearl-miner \
-        --host "${POOL}" --user "${PEARL_POOL_WALLET}" --worker "${name}" &
+        --host "${POOL}" --user "${PEARL_POOL_WALLET}" --worker "${name}" \
+        > >(tee -a "${LOG_DIR}/gpu-${i}.log") 2>&1 &
     pids+=($!)
 done
+
+# The metrics sidecar, only when the platform gave us a token — it refuses to start without one, and
+# an unguarded restart loop would spin forever on nodes that never enable metrics. Wrapped in a
+# forever-loop so it never exits: `wait -n` below has no way to tell WHICH child died, so a sidecar
+# that could exit would look exactly like a dead miner and take the whole container down with it.
+if [[ -n "${METRICS_TOKEN:-}" ]]; then
+    (
+        while true; do
+            PEARL_LOG_DIR="${LOG_DIR}" PEARL_GPU_COUNT="${GPU_COUNT}" \
+                python3 /usr/local/bin/metrics_sidecar.py || true
+            echo "metrics sidecar exited, restarting in 5s" >&2
+            sleep 5
+        done
+    ) &
+fi
 
 # Exit (and let the platform restart the container) as soon as any miner dies. `wait -n` is called
 # WITHOUT pids (bash 5.1 returns a bogus 0 for an explicit pid that already exited) and with an
