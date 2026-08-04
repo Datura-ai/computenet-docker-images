@@ -5,8 +5,9 @@
 The sidecar runs as a real subprocess, the same code path production runs, so the bearer check and
 the log parsing are exercised over HTTP rather than by importing the functions.
 
-Covered: auth, TH/s -> H/s per GPU, a card that stopped writing showing up as stale rather than
-vanishing, an empty log directory answering 503, and the /logs tail.
+Covered: auth, TH/s -> H/s per GPU, a card that stopped writing showing up as stale (value kept,
+no longer counted as reporting) rather than vanishing, an empty log directory answering 503, and
+the /logs tail.
 """
 
 import os
@@ -72,65 +73,86 @@ def start_sidecar(log_dir: str, gpu_count: str) -> subprocess.Popen:
     return process
 
 
-def main() -> None:
-    with tempfile.TemporaryDirectory() as log_dir:
-        fresh = pathlib.Path(log_dir) / "gpu-0.log"
-        fresh.write_text(
-            "GPU #0 (sm: 86) initialized\n"
-            "Hashrate GPU #0 = 47.50 TH/s\n"
-            "Hashrate Total = 47.50 TH/s\n"
-            "Hashrate GPU #0 = 51.02 TH/s\n"
-            "Hashrate Total = 51.02 TH/s\n"
-        )
-        stale = pathlib.Path(log_dir) / "gpu-1.log"
-        stale.write_text("Hashrate GPU #0 = 12.25 TH/s\n")
-        stale_age_seconds: int = 600
-        stale_mtime: float = time.time() - stale_age_seconds
-        os.utime(stale, (stale_mtime, stale_mtime))
+STALE_AGE_SECONDS: int = 600
 
+
+def write_gpu_logs(log_dir: str) -> None:
+    """One GPU still printing, one that went quiet ten minutes ago."""
+    fresh = pathlib.Path(log_dir) / "gpu-0.log"
+    fresh.write_text(
+        "GPU #0 (sm: 86) initialized\n"
+        "Hashrate GPU #0 = 47.50 TH/s\n"
+        "Hashrate Total = 47.50 TH/s\n"
+        "Hashrate GPU #0 = 51.02 TH/s\n"
+        "Hashrate Total = 51.02 TH/s\n"
+    )
+    stale = pathlib.Path(log_dir) / "gpu-1.log"
+    stale.write_text("Hashrate GPU #0 = 12.25 TH/s\n")
+    stale_mtime: float = time.time() - STALE_AGE_SECONDS
+    os.utime(stale, (stale_mtime, stale_mtime))
+
+
+def check_bearer_token_is_required() -> None:
+    print("auth")
+    status, _ = get("/metrics", token=None)
+    check(status == 401, "no bearer token is rejected")
+    status, _ = get("/metrics", token="wrong")
+    check(status == 401, "wrong bearer token is rejected")
+    status, _ = get("/logs", token=None)
+    check(status == 401, "log tail needs the bearer token too")
+
+
+def check_hashrate_and_freshness_series() -> None:
+    print("metrics")
+    status, body = get("/metrics")
+    check(status == 200, "authorized scrape answers 200")
+    check(
+        sample(body, 'pearl_sidecar_gpu_hashrate_hs{gpu="0"}') == 51.02e12,
+        "last TH/s sample of gpu 0 is exposed in hashes per second",
+    )
+    check(
+        sample(body, 'pearl_sidecar_gpu_hashrate_hs{gpu="1"}') == 12.25e12,
+        "a GPU that stopped writing keeps its last value instead of vanishing",
+    )
+    check(
+        (sample(body, 'pearl_sidecar_gpu_sample_age_seconds{gpu="1"}') or 0) >= STALE_AGE_SECONDS,
+        "the stale GPU's sample age reports how long it has been quiet",
+    )
+    check(
+        (sample(body, 'pearl_sidecar_gpu_sample_age_seconds{gpu="0"}') or 999) < 60,
+        "the live GPU's sample age is fresh",
+    )
+    check(
+        sample(body, "pearl_sidecar_gpus_reporting") == 1,
+        "a GPU silent past the stale cutoff stops counting as reporting",
+    )
+    check(
+        sample(body, "pearl_sidecar_gpus_expected") == 3,
+        "expected GPU count comes from the launcher, so a dead process is visible",
+    )
+
+
+def check_log_tail_serves_miner_lines() -> None:
+    print("logs")
+    status, body = get("/logs?tail=64")
+    check(status == 200, "log tail answers 200")
+    check("TH/s" in body, "log tail carries the miner's own lines")
+
+
+def check_live_and_stale_gpus() -> None:
+    with tempfile.TemporaryDirectory() as log_dir:
+        write_gpu_logs(log_dir)
         process = start_sidecar(log_dir, gpu_count="3")
         try:
-            print("auth")
-            status, _ = get("/metrics", token=None)
-            check(status == 401, "no bearer token is rejected")
-            status, _ = get("/metrics", token="wrong")
-            check(status == 401, "wrong bearer token is rejected")
-
-            print("metrics")
-            status, body = get("/metrics")
-            check(status == 200, "authorized scrape answers 200")
-            check(
-                sample(body, 'pearl_sidecar_gpu_hashrate_hs{gpu="0"}') == 51.02e12,
-                "last TH/s sample of gpu 0 is exposed in hashes per second",
-            )
-            check(
-                sample(body, 'pearl_sidecar_gpu_hashrate_hs{gpu="1"}') == 12.25e12,
-                "a GPU that stopped writing keeps its last value instead of vanishing",
-            )
-            check(
-                (sample(body, 'pearl_sidecar_gpu_sample_age_seconds{gpu="1"}') or 0) >= stale_age_seconds,
-                "the stale GPU's sample age reports how long it has been quiet",
-            )
-            check(
-                (sample(body, 'pearl_sidecar_gpu_sample_age_seconds{gpu="0"}') or 999) < 60,
-                "the live GPU's sample age is fresh",
-            )
-            check(sample(body, "pearl_sidecar_gpus_reporting") == 2, "two GPUs are reporting")
-            check(
-                sample(body, "pearl_sidecar_gpus_expected") == 3,
-                "expected GPU count comes from the launcher, so a dead process is visible",
-            )
-
-            print("logs")
-            status, body = get("/logs?tail=64")
-            check(status == 200, "log tail answers 200")
-            check("TH/s" in body, "log tail carries the miner's own lines")
-            status, _ = get("/logs", token=None)
-            check(status == 401, "log tail needs the bearer token too")
+            check_bearer_token_is_required()
+            check_hashrate_and_freshness_series()
+            check_log_tail_serves_miner_lines()
         finally:
             process.terminate()
             process.wait(timeout=10)
 
+
+def check_empty_log_dir() -> None:
     with tempfile.TemporaryDirectory() as empty_dir:
         process = start_sidecar(empty_dir, gpu_count="1")
         try:
@@ -144,6 +166,11 @@ def main() -> None:
         finally:
             process.terminate()
             process.wait(timeout=10)
+
+
+def main() -> None:
+    check_live_and_stale_gpus()
+    check_empty_log_dir()
 
     print()
     if failures:

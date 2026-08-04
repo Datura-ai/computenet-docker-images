@@ -30,6 +30,8 @@ import sys
 import time
 import urllib.parse
 
+from dataclasses import dataclass
+
 PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN: str = os.environ.get("METRICS_TOKEN", "")
 LOG_DIR: str = os.environ.get("PEARL_LOG_DIR", "/var/log/pearl")
@@ -39,6 +41,12 @@ LOG_DIR: str = os.environ.get("PEARL_LOG_DIR", "/var/log/pearl")
 EXPECTED_GPUS: int = int(os.environ.get("PEARL_GPU_COUNT", "0"))
 # Enough to hold several minutes of a 5s cadence even if the miner starts printing more per line.
 TAIL_BYTES: int = 65536
+# A GPU counts as reporting only while its log is still moving. The miner prints every ~5s, so a
+# minute of silence is a stopped card, not a slow one. Without this a miner that is alive but has
+# stopped hashing (GPU fell off the bus, engine wedged) keeps its last rate forever and
+# gpus_reporting stays at full — the exact "N of 8 cards mining" alert this port exists to raise
+# would never fire. The stale value itself is still served, next to its age.
+STALE_AFTER_SECONDS: float = 60.0
 LOG_TAIL_DEFAULT_BYTES: int = 262144
 LOG_TAIL_MAX_BYTES: int = 8388608
 
@@ -49,6 +57,14 @@ HASHRATE_LINE = re.compile(r"^Hashrate GPU #\d+ = (?P<rate>[0-9.]+) (?P<unit>[KM
 UNIT_SCALE: dict[str, float] = {
     "": 1.0, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15, "E": 1e18,
 }
+
+
+@dataclass(frozen=True)
+class MetricsSnapshot:
+    """One rendered exposition and how many GPUs were mining when it was taken."""
+
+    body: bytes
+    reporting_gpus: int
 
 
 def _log(message: str) -> None:
@@ -79,17 +95,18 @@ def last_hashrate(text: str) -> float | None:
     return None
 
 
-def collect() -> tuple[bytes, int]:
+def collect() -> MetricsSnapshot:
     """Per-GPU hashrate series plus the reporting/expected counts, and how many GPUs answered.
 
     A GPU whose file stopped growing keeps its last value and grows an age instead of disappearing:
     a vanished series reads as "this card was never here", while a frozen one plus its age says the
-    miner stopped — which is the failure we cannot see today.
+    miner stopped — which is the failure we cannot see today. It stops counting as REPORTING though,
+    so reporting-vs-expected answers "how many cards are mining right now".
     """
     now: float = time.time()
     hashrate_lines: list[str] = []
     age_lines: list[str] = []
-    reporting: int = 0
+    reporting_gpus: int = 0
     try:
         names: list[str] = sorted(os.listdir(LOG_DIR))
     except OSError as error:
@@ -110,7 +127,8 @@ def collect() -> tuple[bytes, int]:
             age = 0.0
         hashrate_lines.append(f'pearl_sidecar_gpu_hashrate_hs{{gpu="{index}"}} {rate:.0f}')
         age_lines.append(f'pearl_sidecar_gpu_sample_age_seconds{{gpu="{index}"}} {age:.1f}')
-        reporting += 1
+        if age <= STALE_AFTER_SECONDS:
+            reporting_gpus += 1
     body: str = "\n".join(
         [
             "# HELP pearl_sidecar_gpu_hashrate_hs Last hashrate the miner printed for this GPU, in hashes per second.",
@@ -119,16 +137,16 @@ def collect() -> tuple[bytes, int]:
             "# HELP pearl_sidecar_gpu_sample_age_seconds Seconds since that GPU's log was last written.",
             "# TYPE pearl_sidecar_gpu_sample_age_seconds gauge",
             *age_lines,
-            "# HELP pearl_sidecar_gpus_reporting GPUs that have printed a hashrate.",
+            "# HELP pearl_sidecar_gpus_reporting GPUs whose hashrate line is younger than the stale cutoff.",
             "# TYPE pearl_sidecar_gpus_reporting gauge",
-            f"pearl_sidecar_gpus_reporting {reporting}",
+            f"pearl_sidecar_gpus_reporting {reporting_gpus}",
             "# HELP pearl_sidecar_gpus_expected Miner processes the entrypoint launched.",
             "# TYPE pearl_sidecar_gpus_expected gauge",
             f"pearl_sidecar_gpus_expected {EXPECTED_GPUS}",
             "",
         ]
     )
-    return body.encode("utf-8"), reporting
+    return MetricsSnapshot(body=body.encode("utf-8"), reporting_gpus=reporting_gpus)
 
 
 def read_log_tail(max_bytes: int) -> bytes:
@@ -180,10 +198,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route == "/logs":
             self._reply(200, read_log_tail(requested_tail_bytes(query)), "text/plain")
             return
-        body, reporting = collect()
-        # 503 when no GPU answered at all: an empty 200 reads as "this node mines zero", a different
-        # alert from "the container is not running miners". The counts are in the body either way.
-        self._reply(200 if reporting else 503, body, "text/plain; version=0.0.4")
+        snapshot = collect()
+        # 503 when no GPU is mining: an empty 200 reads as "this node mines zero", a different alert
+        # from "the container is not running miners". The counts are in the body either way.
+        self._reply(200 if snapshot.reporting_gpus else 503, snapshot.body, "text/plain; version=0.0.4")
 
 
 def main() -> None:
