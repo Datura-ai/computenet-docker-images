@@ -28,6 +28,11 @@ fi
 
 LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
 mkdir -p "${LOG_DIR}"
+# The rate files carry FRESHNESS, so they must not survive a restart: a container that comes back in
+# under a minute would otherwise show the pre-restart rates as current and credit this node with
+# hashrate it is not producing while the GPUs are still initialising. The full logs stay appended —
+# they are diagnostics, and history across a restart is exactly what makes them useful.
+rm -f "${LOG_DIR}"/rate-*.log
 
 # One process per GPU: pearl-miner's multi-GPU behavior is undocumented, per-GPU processes with
 # CUDA_VISIBLE_DEVICES pinning work the same on 1-GPU and 8-GPU nodes. Worker names get a -g<i>
