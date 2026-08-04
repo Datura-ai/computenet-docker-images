@@ -77,19 +77,20 @@ STALE_AGE_SECONDS: int = 600
 
 
 def write_gpu_logs(log_dir: str) -> None:
-    """One GPU still printing, one that went quiet ten minutes ago."""
-    fresh = pathlib.Path(log_dir) / "gpu-0.log"
-    fresh.write_text(
-        "GPU #0 (sm: 86) initialized\n"
-        "Hashrate GPU #0 = 47.50 TH/s\n"
-        "Hashrate Total = 47.50 TH/s\n"
-        "Hashrate GPU #0 = 51.02 TH/s\n"
-        "Hashrate Total = 51.02 TH/s\n"
+    """One GPU still hashing, one that went quiet ten minutes ago while its miner kept talking."""
+    directory = pathlib.Path(log_dir)
+    (directory / "gpu-0.log").write_text(
+        "GPU #0 (sm: 86) initialized\nHashrate GPU #0 = 51.02 TH/s\nHashrate Total = 51.02 TH/s\n"
     )
-    stale = pathlib.Path(log_dir) / "gpu-1.log"
-    stale.write_text("Hashrate GPU #0 = 12.25 TH/s\n")
+    (directory / "rate-0.log").write_text("Hashrate GPU #0 = 47.50 TH/s\nHashrate GPU #0 = 51.02 TH/s\n")
+
+    # GPU 1 stopped hashing ten minutes ago but its miner keeps printing pool chatter, so the full
+    # log looks fresh and only the rate file tells the truth.
     stale_mtime: float = time.time() - STALE_AGE_SECONDS
-    os.utime(stale, (stale_mtime, stale_mtime))
+    (directory / "gpu-1.log").write_text("Hashrate GPU #0 = 12.25 TH/s\nReceived new job: 7\n")
+    stale_rate = directory / "rate-1.log"
+    stale_rate.write_text("Hashrate GPU #0 = 12.25 TH/s\n")
+    os.utime(stale_rate, (stale_mtime, stale_mtime))
 
 
 def check_bearer_token_is_required() -> None:

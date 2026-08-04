@@ -33,10 +33,14 @@ mkdir -p "${LOG_DIR}"
 # CUDA_VISIBLE_DEVICES pinning work the same on 1-GPU and 8-GPU nodes. Worker names get a -g<i>
 # suffix on multi-GPU nodes so the pool shows each GPU separately.
 #
-# Each process is tee'd into its own log file as well as the container's stdout: the sidecar reads
-# per-GPU hashrate off those files, and on a miner's host we can reach neither `docker logs` nor the
+# Each process is tee'd into its own log file as well as the container's stdout: the sidecar serves
+# those files on /logs, because on a miner's host we can reach neither `docker logs` nor the
 # container filesystem. Process substitution rather than a `| tee` pipeline so $! stays the MINER's
 # pid — through a pipe it would be tee's, and every miner crash would report tee's exit code 0.
+#
+# The hashrate lines ALSO go to a file of their own, and that is what the sidecar measures freshness
+# by: the miner keeps printing job and pool lines after a card stops hashing, so the full log's
+# mtime would call a dead card fresh. A file only hashrate lines can touch cannot lie about it.
 pids=()
 for ((i = 0; i < GPU_COUNT; i++)); do
     name="${WORKER}"
@@ -45,7 +49,8 @@ for ((i = 0; i < GPU_COUNT; i++)); do
     fi
     CUDA_VISIBLE_DEVICES="${i}" /usr/local/bin/pearl-miner \
         --host "${POOL}" --user "${PEARL_POOL_WALLET}" --worker "${name}" \
-        > >(tee -a "${LOG_DIR}/gpu-${i}.log") 2>&1 &
+        > >(tee -a "${LOG_DIR}/gpu-${i}.log" \
+             | grep --line-buffered -E "^Hashrate GPU" >> "${LOG_DIR}/rate-${i}.log") 2>&1 &
     pids+=($!)
 done
 

@@ -6,10 +6,10 @@ output is stdout, one line per GPU every ~5s:
 
     Hashrate GPU #0 = 51.02 TH/s
 
-The entrypoint tees each per-GPU process into PEARL_LOG_DIR/gpu-<i>.log, and this reads the tail of
-each file. Hashrate is the ONLY signal the miner emits — it prints no accepted/rejected shares — so
-downstream revenue attribution is a hashrate-weighted split of the wallet payout, never measured
-accepted work.
+The entrypoint tees each per-GPU process into PEARL_LOG_DIR/gpu-<i>.log and its hashrate lines alone
+into PEARL_LOG_DIR/rate-<i>.log, which is what this reads. Hashrate is the ONLY signal the miner
+emits — it prints no accepted/rejected shares — so downstream revenue attribution is a
+hashrate-weighted split of the wallet payout, never measured accepted work.
 
   PEARL_LOG_DIR=/var/log/pearl PEARL_GPU_COUNT=8 METRICS_TOKEN=… python3 metrics_sidecar.py
 
@@ -41,7 +41,7 @@ LOG_DIR: str = os.environ.get("PEARL_LOG_DIR", "/var/log/pearl")
 EXPECTED_GPUS: int = int(os.environ.get("PEARL_GPU_COUNT", "0"))
 # Enough to hold several minutes of a 5s cadence even if the miner starts printing more per line.
 TAIL_BYTES: int = 65536
-# A GPU counts as reporting only while its log is still moving. The miner prints every ~5s, so a
+# A GPU counts as reporting only while its rate file is still growing. The miner prints every ~5s, so a
 # minute of silence is a stopped card, not a slow one. Without this a miner that is alive but has
 # stopped hashing (GPU fell off the bus, engine wedged) keeps its last rate forever and
 # gpus_reporting stays at full — the exact "N of 8 cards mining" alert this port exists to raise
@@ -50,6 +50,10 @@ STALE_AFTER_SECONDS: float = 60.0
 LOG_TAIL_DEFAULT_BYTES: int = 262144
 LOG_TAIL_MAX_BYTES: int = 8388608
 
+# Freshness comes from the rate file's mtime, so it must be a file ONLY hashrate lines can touch:
+# the miner keeps printing pool and job lines after a card stops hashing, and the full log's mtime
+# would report a dead card as fresh.
+RATE_NAME = re.compile(r"^rate-(?P<index>\d+)\.log$")
 LOG_NAME = re.compile(r"^gpu-(?P<index>\d+)\.log$")
 # The miner's own index is always 0 (one process per GPU, pinned with CUDA_VISIBLE_DEVICES), so the
 # label comes from the FILE name; only the rate is read off the line.
@@ -113,7 +117,7 @@ def collect() -> MetricsSnapshot:
         _log(f"cannot list {LOG_DIR}: {error!r}")
         names = []
     for name in names:
-        match = LOG_NAME.match(name)
+        match = RATE_NAME.match(name)
         if match is None:
             continue
         path: str = os.path.join(LOG_DIR, name)
