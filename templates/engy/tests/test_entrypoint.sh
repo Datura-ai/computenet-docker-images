@@ -63,8 +63,8 @@ start_entrypoint() {
 }
 
 # The distinct worker ids the miners were started with, one per line.
-worker_ids() {
-    grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_ID=[0-9a-f][0-9a-f]*" | sort -u
+worker_names() {
+    grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -o "ENGY_WORKER_NAME=[^ ][^ ]*" | sort -u
 }
 
 run_entrypoint() {
@@ -127,26 +127,19 @@ else
     pass "every miner declares MAX_INFLIGHT=8, not the node sum"
 fi
 
-echo "== worker ids are stable and unique per card =="
-# The id is what engy's control plane keys a worker on, and a fresh one per restart sends the worker
-# back to the end of an hours-long onboarding queue.
-distinct_worker_ids="$(worker_ids | wc -l | tr -d " ")"
-[[ "${distinct_worker_ids}" -eq 2 ]] && pass "each card gets its own worker id" || fail "expected 2 distinct worker ids, got ${distinct_worker_ids}"
-first_run_ids="$(worker_ids)"
-rm -rf "${SANDBOX}"
-new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_WORKER_NAME=lium-fixed
-second_ids="$(worker_ids)"
-rm -rf "${SANDBOX}"
-new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_WORKER_NAME=lium-fixed
-if [[ "${second_ids}" == "$(worker_ids)" ]]; then
-    pass "a restart re-uses the same worker ids"
+echo "== no worker id is pinned, and each card gets its own name =="
+# Pinning the id made a restart a re-dial, but engy records a worker's declared max inflight at the
+# record it creates on FIRST onboarding and never refreshes it — so a pinned id also pinned the
+# capacity and every later config change was a silent no-op. Onboarding is quick now, so we let the
+# miner mint a fresh id per process and re-register.
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -q "ENGY_WORKER_ID=[^ ]"; then
+    fail "the entrypoint still pins ENGY_WORKER_ID"
 else
-    fail "worker ids changed across a restart"
+    pass "no ENGY_WORKER_ID is passed, so the miner registers fresh on every start"
 fi
-[[ "${first_run_ids}" != "${second_ids}" ]] && pass "a different worker name yields different ids" \
-    || fail "worker ids ignore ENGY_WORKER_NAME"
+distinct_names="$(worker_names | wc -l | tr -d " ")"
+[[ "${distinct_names}" -eq 2 ]] && pass "each card gets its own worker name" \
+    || fail "expected 2 distinct worker names, got ${distinct_names}"
 rm -rf "${SANDBOX}"
 
 echo "== the default declared concurrency is the onboarding floor, not lower =="
@@ -214,7 +207,7 @@ echo "== a refreshed upstream missing WORKER_NAME is discarded =="
 new_sandbox 1
 echo "${BAKED_IN_MARKER:-MARKER_BAKED_IN_COPY}" >"${SANDBOX}/miner/engy_miner.py"
 { echo '#!/usr/bin/env bash'
-  echo 'for a in "$@"; do [[ "$prev" == "-o" ]] && printf "WORKER_ID = 1\nasync def _serve_all(): pass\ndef main(): pass\n_JOBS = {}\n" > "$a"; prev="$a"; done; exit 0'
+  echo 'for a in "$@"; do [[ "$prev" == "-o" ]] && printf "def _worker_name(): return \\"w\\"\nasync def _serve_all(): pass\ndef main(): pass\n_JOBS = {}\n" > "$a"; prev="$a"; done; exit 0'
 } >"${SANDBOX}/bin/curl"
 chmod +x "${SANDBOX}/bin/curl"
 run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
@@ -326,7 +319,7 @@ grep -q "discarding the fetched miner" "${SANDBOX}/out.log" \
     && pass "and the log says why" || fail "discarded silently"
 rm -rf "${SANDBOX}"
 
-PAYLOAD='WORKER_ID = 1
+PAYLOAD='def _worker_name(): return "w"
 WORKER_NAME = "w"
 async def _serve_all(): pass
 def main(): pass

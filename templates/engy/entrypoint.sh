@@ -293,10 +293,8 @@ start_miners_as_engines_become_ready() {
     done
 }
 
-# One name per miner, and one id derived from it. The id is what engy's control plane keys a worker
-# on, and the stock miner mints a fresh uuid4 per PROCESS — so every restart used to register a
-# brand-new worker and throw away hours of onboarding progress. Deriving it from the name makes a
-# restart a re-dial instead. See ARCHITECTURE.md, "Why worker ids are derived, not random".
+# One name per miner. The worker ID is deliberately NOT pinned to it — see ARCHITECTURE.md,
+# "Why worker ids are random again".
 miner_worker_name() {
     local index="$1"
     echo "${ENGY_WORKER_NAME:-$(hostname)}-g${index}"
@@ -311,11 +309,6 @@ one_gpu_name() {
     echo "${name:-GPU}"
 }
 
-miner_worker_id() {
-    local name="$1"
-    printf '%s' "${name}" | sha256sum | cut -c1-32
-}
-
 start_miner() {
     local index="$1" port="${engine_ports[$1]}" name
     name="$(miner_worker_name "${index}")"
@@ -324,7 +317,6 @@ start_miner() {
     MAX_INFLIGHT="${PER_ENGINE_REQUESTS}" \
     HW_GPUS="1x $(one_gpu_name)" \
     ENGY_WORKER_NAME="${name}" \
-    ENGY_WORKER_ID="$(miner_worker_id "${name}")" \
     ENGY_PROBE_DIR="${PROBE_DIR}" \
         python3 "${ENGY_MINER_DIR}/engy_launch.py" \
         --checkpoint "${CKPT_DIR}" \
@@ -341,8 +333,8 @@ start_miner() {
 # the baked-in copy stays.
 # The hooks engy_launch.py assigns after import. Kept next to the validator on purpose: adding a
 # modification there means adding its hook here, or a refresh can hand us an upstream we cannot
-# modify and every miner runs with a random worker id and no probe — working, earning less, silent.
-REQUIRED_MINER_HOOKS=("^WORKER_ID" "^WORKER_NAME" "^async def _serve_all" "^def main" "^_JOBS" "^HW")
+# modify and every miner runs with no per-worker lock and no probe — seven of eight cards unmined.
+REQUIRED_MINER_HOOKS=("^def _worker_name" "^WORKER_NAME" "^async def _serve_all" "^def main" "^_JOBS" "^HW")
 
 # Empty when the staged file is usable; otherwise the reason it is not.
 why_staged_miner_is_unusable() {
