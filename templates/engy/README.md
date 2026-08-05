@@ -23,8 +23,8 @@ gateway (wss://api.engy.ai/gw)
 | 2 engines, `--tp-size 1` | **564** | **8.7s** | 0 |
 
 1.72x, and latency improves rather than degrades. Every miner shares the node's single SN53 hotkey
-and is told apart by a worker name derived from the machine and the card, so its worker id survives
-a restart. Each declares only its own engine's capacity, and each is restarted on its own by the
+and is told apart by a worker name derived from the machine and the card. Its worker id is fresh on
+every start, so a restart re-onboards and picks up the current config. Each declares only its own engine's capacity, and each is restarted on its own by the
 supervisor: one dead card costs one card, not the node. See ARCHITECTURE.md.
 
 ## Environment

@@ -52,17 +52,17 @@ def check_vendored_miner_is_unpatched_upstream() -> None:
 def check_launcher_applies_every_modification() -> None:
     stub_heavy_dependencies()
     # In the image both files sit in ENGY_MINER_DIR; in the repo the miner is under vendor/.
-    os.environ.update(ENGY_MINER_DIR=str(TEMPLATE_DIR / "vendor"), ENGY_WORKER_ID="testworkerid00",
+    os.environ.update(ENGY_MINER_DIR=str(TEMPLATE_DIR / "vendor"), ENGY_WORKER_NAME="lium-test-g3",
                       GW="wss://x/gw")
     os.environ.pop("ENGY_PROBE_DIR", None)
     import engy_launch
     import engy_miner
 
     print("== the launcher applies every modification from outside ==")
-    check(engy_launch.apply_stable_worker_id() == "testworkerid00",
-          "WORKER_ID comes from the environment, so a restart is a re-dial not a new worker")
-    engy_launch.take_worker_singleton("testworkerid00")
-    check(os.path.exists("/tmp/engy_miner.singleton.testworkerid00"),
+    check(engy_miner._worker_name() == "lium-test-g3",
+          "the lock is keyed on the same name upstream will register under")
+    engy_launch.take_worker_singleton("lium-test-g3")
+    check(os.path.exists("/tmp/engy_miner.singleton.lium-test-g3"),
           "the singleton lock is per worker, so N miners can share one container")
 
     original_serve_all = engy_miner._serve_all
@@ -71,23 +71,22 @@ def check_launcher_applies_every_modification() -> None:
           "the loop probe is installed by wrapping _serve_all")
 
 
-def check_unset_worker_id_leaves_upstream_alone() -> None:
-    import engy_launch
+def check_worker_id_is_left_random() -> None:
     import engy_miner
-    print("== an unset ENGY_WORKER_ID leaves upstream's behaviour alone ==")
-    os.environ.pop("ENGY_WORKER_ID")
-    engy_miner.WORKER_ID = "upstream-generated"
-    check(engy_launch.apply_stable_worker_id() == "upstream-generated",
-          "no override -> upstream's per-process id, unchanged")
+    print("== the worker id stays upstream's per-process uuid4 ==")
+    # Pinning it also pins the capacity engy recorded at first onboarding, so every later config
+    # change becomes a silent no-op. A fresh id per restart is what makes a config change land.
+    check(len(engy_miner.WORKER_ID) == 32 and engy_miner.WORKER_ID != engy_miner.WORKER_NAME,
+          "nothing in the launcher overrides WORKER_ID")
 
 
 def check_a_renamed_hook_refuses_to_start() -> None:
     import engy_launch
     import engy_miner
     print("== a renamed hook refuses to start instead of running unmodified ==")
-    # The whole point of the refresh being safe. Running with a random worker id and no probe would
-    # look healthy and quietly cost re-onboarding on every restart.
-    for hook in ("_serve_all", "WORKER_ID", "main", "HW"):
+    # The whole point of the refresh being safe. Running with no lock and no probe would look
+    # healthy and quietly leave seven of eight cards unmined.
+    for hook in ("_serve_all", "_worker_name", "main", "HW"):
         original_hook = getattr(engy_miner, hook)
         delattr(engy_miner, hook)
         try:
@@ -102,7 +101,7 @@ def check_a_renamed_hook_refuses_to_start() -> None:
 def main() -> int:
     check_vendored_miner_is_unpatched_upstream()
     check_launcher_applies_every_modification()
-    check_unset_worker_id_leaves_upstream_alone()
+    check_worker_id_is_left_random()
     check_a_renamed_hook_refuses_to_start()
     print()
     if failures:

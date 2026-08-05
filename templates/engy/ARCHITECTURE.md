@@ -66,27 +66,29 @@ gateway sends what it wants to send. Prod, meanwhile, sat at 2 concurrent across
 over a 7-minute sample. 481 of the network's 635 workers declare 8; only 7 declare 64, and until
 this change we were one of them.
 
-## Why worker ids are derived, not random
+## Why worker ids are random again
 
 `engy_miner.py` mints `WORKER_ID = uuid4().hex` per PROCESS, and engy's control plane keys a worker
-on that id. So every restart registered a **brand-new worker**, which enters `pending` at the back of
-an onboarding queue that takes hours, and any qualification progress is thrown away.
+on that id. So every restart registers a **brand-new worker**, which enters `pending` and has to be
+onboarded again; a stable `ENGY_WORKER_NAME` does not change that — the id is what counts, despite
+the upstream comment claiming a repeat HELLO with the same (key, name) supersedes.
 
-Measured on prod: the same `ENGY_WORKER_NAME` `lium-1c36fd23…` came back as worker `a103ec01…` before
-a restart and `0b7d4fe0…` after. A stable `ENGY_WORKER_NAME` does not help — the id is what counts,
-despite the upstream comment claiming a repeat HELLO with the same (key, name) supersedes.
+DAH-2531 therefore pinned the id: the entrypoint derived it from the worker name
+(`sha256(name)[:32]`) and the vendored miner honoured `ENGY_WORKER_ID`, which made a restart a
+re-dial. Verified live on 2026-07-30 — worker `04955ec4…` was restarted mid-`active` and came back as
+the same worker, request history intact.
 
-This is the single most expensive property of running engy on preemptible nodes, because we restart
-often and for reasons that have nothing to do with engy. So the entrypoint derives the id from the
-worker name (`sha256(name)[:32]`) and the vendored miner honours `ENGY_WORKER_ID`
-(one-line LIUM PATCH, DAH-2531). A restart is then a re-dial, not a new worker.
+**Reverted on 2026-08-04, because a pinned id also pins the CAPACITY.** engy records a worker's
+declared max inflight at the record it creates on first onboarding and never refreshes it on
+reconnect. With a pinned id the node reconnected into its record from 2026-08-03 forever, so raising
+`ENGY_MAX_RUNNING_REQUESTS` was a silent no-op: the container booted with the new number, the miner
+sent it on every hello, and the dashboard kept showing the old one — which is also the number the
+gateway routes against. Onboarding is quick now, so re-onboarding on restart is the cheaper half of
+the trade, and it is the only way a config change ever lands.
 
-Verified live on 2026-07-30: worker `04955ec4…` was restarted mid-`active` and came back as the SAME
-worker — no new `pending`, no re-onboarding, the request history intact. A restart really is a
-re-dial. (The portal's worker page shows the reconnect as a new "this leg connected" timestamp on
-the same worker, with the event log unchanged.)
+The lock below is unaffected: it is keyed on the worker NAME, which is still stable per card.
 
-The same patch also scopes the miner's singleton lock to the worker. Upstream locks
+`engy_launch.py` also scopes the miner's singleton lock to the worker. Upstream locks
 `/tmp/engy_miner.singleton` node-wide, which is right for one miner per box and silently fatal for
 one per card: the first miner takes the lock and every other prints "another instance is running"
 and exits, leaving all but one GPU unmined with nothing in the log that looks like a failure.
@@ -171,8 +173,8 @@ these on vLLM lasting 1.6 to 23.5 hours, invisible to every other check. The onl
 the engine's own token counter going flat while requests are still running.
 
 The old shape ended the whole container on any unhealthy engine and let the platform recreate it.
-That is the wrong tool: recreation costs a cold start, and with per-process worker ids it also cost
-every other card's qualification. The supervisor now kills the wedged engine (SIGKILL — a process
+That is the wrong tool: recreation costs a cold start, and since worker ids are per-process it also
+costs every other card's onboarding. The supervisor now kills the wedged engine (SIGKILL — a process
 stuck in a kernel ignores TERM) along with its own miner, and starts both again on the next pass.
 One dead card costs one card.
 

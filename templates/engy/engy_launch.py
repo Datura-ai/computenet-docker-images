@@ -8,7 +8,8 @@ nothing in the log that reads as a failure.
 Everything we need can be done without touching it, because all three hooks are module globals that
 upstream reads at CALL time:
 
-  WORKER_ID   read inside `_run` when it sends HELLO, so assigning it after import is enough.
+  _worker_name  upstream's own name resolver, called to key our lock on the same name it will
+                register under.
   the lock    lives in upstream's `if __name__ == "__main__"` block, which never runs on import —
               so importing rather than executing removes it for free, and we take our own.
   _serve_all  looked up as a global by `main()`, so wrapping it injects the loop probe.
@@ -33,7 +34,7 @@ sys.path.insert(0, os.environ.get("ENGY_MINER_DIR", "/opt/engy-miner"))
 import engy_miner  # noqa: E402
 import loop_probe  # noqa: E402
 
-SINGLETON_PATH_TEMPLATE: str = "/tmp/engy_miner.singleton.{worker_id}"
+SINGLETON_PATH_TEMPLATE: str = "/tmp/engy_miner.singleton.{worker_name}"
 
 # Held open for the life of the process — closing it would release the lock.
 _singleton_file: IO[str] | None = None
@@ -53,31 +54,25 @@ def require(attribute: str) -> Any:
     return getattr(engy_miner, attribute)
 
 
-def take_worker_singleton(worker_id: str) -> None:
+def take_worker_singleton(worker_name: str) -> None:
     """One miner per WORKER, not per node.
 
     Upstream locks a single node-wide path, which is right for one miner per box and wrong for us:
     we run one miner per GPU inside one container, and a node-wide lock would admit the first and
     make the other seven exit with 'another instance is running'.
+
+    Keyed on the worker NAME, which is stable per card. The worker id is not: it is a fresh uuid4
+    per process (see `main`), so locking on it would give every process its own path and never
+    collide — a lock that can't fail is not a lock.
     """
     global _singleton_file
-    lock_file: IO[str] = open(SINGLETON_PATH_TEMPLATE.format(worker_id=worker_id), "w")
+    lock_file: IO[str] = open(SINGLETON_PATH_TEMPLATE.format(worker_name=worker_name), "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print(f"[engy-launch] worker {worker_id} already running here; exiting", flush=True)
+        print(f"[engy-launch] worker {worker_name} already running here; exiting", flush=True)
         raise SystemExit(0)
     _singleton_file = lock_file
-
-
-def apply_stable_worker_id() -> str:
-    """Upstream mints `uuid4().hex` per PROCESS and engy's control plane keys a worker on that id,
-    so every restart used to register a brand-new worker and throw away hours of onboarding."""
-    require("WORKER_ID")
-    worker_id: str = os.environ.get("ENGY_WORKER_ID", "")
-    if worker_id:
-        engy_miner.WORKER_ID = worker_id
-    return engy_miner.WORKER_ID
 
 
 def announce_only_this_workers_card() -> None:
@@ -119,11 +114,19 @@ def install_loop_probe() -> None:
 
 
 def main() -> None:
-    worker_id: str = apply_stable_worker_id()
-    take_worker_singleton(worker_id)
+    # The worker id stays upstream's per-process uuid4 ON PURPOSE. Pinning it (DAH-2531) made a
+    # restart a re-dial, but engy's control plane records a worker's declared max inflight at the
+    # record it creates on FIRST onboarding and never refreshes it on reconnect — so a pinned id
+    # also pinned the capacity, and every later config change was a silent no-op. Onboarding is
+    # quick now, so a new worker per restart is the cheaper side of that trade.
+    #
+    # Resolved through upstream's own function rather than its WORKER_NAME global, which is still
+    # None until upstream's main() runs — after we need the lock.
+    worker_name: str = require("_worker_name")()
+    take_worker_singleton(worker_name)
     announce_only_this_workers_card()
     install_loop_probe()
-    print(f"[engy-launch] upstream miner with Lium modifications, worker_id={worker_id}", flush=True)
+    print(f"[engy-launch] upstream miner with Lium modifications, worker={worker_name}", flush=True)
     require("main")()
 
 
