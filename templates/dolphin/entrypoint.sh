@@ -49,6 +49,13 @@ LIVENESS_INTERVAL=30
 # Delay between initial worker spawns, AFTER the shared cache is seeded.
 SPLIT_STAGGER_SECONDS="${DOLPHIN_SPLIT_STAGGER_SECONDS:-30}"
 
+# DAH-2551: how long a SIGTERMed worker may take to exit before it is killed. A customer rent
+# waits out this window, and the validator gives a filler container a 15 s docker-stop grace,
+# so this must stay comfortably under it. 5 s measured on 8xB200: docker stop 12.4 s -> 6.8 s,
+# every card still released cleanly (0 MiB, no compute apps, exit 0 rather than SIGKILL).
+TERM_TIMEOUT_SECONDS="${DOLPHIN_TERM_TIMEOUT_SECONDS:-5}"
+TERM_POLL_SECONDS="${DOLPHIN_TERM_POLL_SECONDS:-0.2}"
+
 # On a cold node the siblings wait for the FIRST instance to finish seeding the shared cache
 # instead of merely pausing a few seconds. Measured 2026-07-23: with a 30 s stagger both workers
 # downloaded the ~12 GB runtime into their own staging directories side by side, doubling the
@@ -422,11 +429,36 @@ spawn_instance() {
     WORKER_PIDS[idx]=$!
 }
 
+# DAH-2551: the wait is BOUNDED. A customer rent blocks on this teardown, and the old
+# unbounded `wait` made the container exit only after the slowest worker — 8 vLLM engines
+# holding 11-13 GB each take ~12s to release their CUDA memory (measured on 8xB200), so the
+# renter paid for every one of those seconds. Past the bound the stragglers are killed: the
+# container is force-removed right after anyway, so there is nothing left to flush.
 terminate_workers() {
-    local pid
+    local pid deadline any_alive
     for pid in ${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}; do
         [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
     done
+
+    deadline=$(( SECONDS + TERM_TIMEOUT_SECONDS ))
+    while (( SECONDS < deadline )); do
+        any_alive=0
+        for pid in ${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}; do
+            [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null && any_alive=1
+        done
+        (( any_alive )) || break
+        sleep "${TERM_POLL_SECONDS}"
+    done
+
+    # Children first: a worker killed before its engine leaves the engine reparented to PID 1,
+    # which is what the `wait` below would then hang on.
+    for pid in ${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}; do
+        [[ -n "${pid}" ]] || continue
+        kill -0 "${pid}" 2>/dev/null || continue
+        pkill -KILL -P "${pid}" 2>/dev/null || true
+        kill -KILL "${pid}" 2>/dev/null || true
+    done
+
     for pid in ${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}; do
         [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
     done

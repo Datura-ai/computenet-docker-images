@@ -409,6 +409,32 @@ EOF
         "$(ls "${DOLPHIN_WATCHDOG_STATE_DIR}"/dolphin_watchdog_state_gpu7.json 2>/dev/null)"
 }
 
+# ---------------------------------------------------------------- terminate_workers bound
+# DAH-2551: a worker that ignores SIGTERM must not hold the container past the bound — a
+# customer rent is blocked on exactly this window.
+test_terminate_workers_is_bounded() {
+    make_sandbox
+    load_entrypoint
+
+    # Deaf worker: traps TERM and keeps running, like a vLLM engine still freeing its memory.
+    bash -c 'trap "" TERM; sleep 300' &
+    local deaf_pid=$!
+    WORKER_PIDS=("${deaf_pid}")
+
+    local started elapsed
+    started="${SECONDS}"
+    TERM_TIMEOUT_SECONDS=1 TERM_POLL_SECONDS=0.1 terminate_workers
+    elapsed=$(( SECONDS - started ))
+
+    if (( elapsed <= 3 )); then
+        echo "ok   deaf worker killed within the bound (${elapsed}s)"
+    else
+        echo "FAIL deaf worker held the container for ${elapsed}s"
+        FAILURES=$((FAILURES + 1))
+    fi
+    assert_eq "deaf worker is gone" "" "$(ps -o pid= -p "${deaf_pid}" 2>/dev/null | tr -d ' ')"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -417,6 +443,7 @@ test_per_engine_watchdog_in_split_mode
 test_single_engine_watchdog
 test_split_sidecar_and_watchdog_wiring
 test_spawn_smoke
+test_terminate_workers_is_bounded
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"
