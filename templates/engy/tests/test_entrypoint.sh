@@ -180,13 +180,47 @@ assert_engine_pinned_to_gpu 8000 0
 assert_engine_pinned_to_gpu 8001 0
 assert_engine_pinned_to_gpu 8002 1
 assert_engine_pinned_to_gpu 8003 1
-# sglang sizes its static pool against the WHOLE card, so two engines at 0.85 would have the second
-# asking for memory the first already holds.
-if grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -qv -- "--mem-fraction-static 0.42"; then
-    fail "an engine did not halve its share of the card: $(grep -o -- '--mem-fraction-static [0-9.]*' "${SANDBOX}/calls.log" | sort -u | tr '\n' ' ')"
-else
-    pass "each engine reserves 0.42 of the card"
-fi
+# sglang keeps a reserve proportional to what the engine finds FREE at its own start, not to the
+# whole card, so the second engine on a card needs a BIGGER fraction to end up with the same pool.
+# Measured live on an H200: two engines at 0.42 each left the second with a negative pool and it
+# died with "Not enough memory".
+assert_engine_mem_fraction() {
+    local port="$1" fraction="$2"
+    grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -- "--port ${port} " | grep -q -- "--mem-fraction-static ${fraction} " \
+        && pass "the engine on ${port} reserves ${fraction}" \
+        || fail "the engine on ${port} is not at ${fraction}: $(grep -- "--port ${port} " "${SANDBOX}/calls.log" | grep -o -- '--mem-fraction-static [0-9.]*')"
+}
+assert_engine_mem_fraction 8000 0.425
+assert_engine_mem_fraction 8001 0.7391
+assert_engine_mem_fraction 8002 0.425
+assert_engine_mem_fraction 8003 0.7391
+rm -rf "${SANDBOX}"
+
+echo "== the second engine on a card waits for the first to load =="
+# Both measure the memory they find free, so starting them together makes both plan for an empty
+# card and the second ends up with no pool at all.
+new_sandbox 1
+# Nothing ever becomes ready, so slot 0 never finishes loading and slot 1 must stay unstarted.
+{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *health_generate*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
+chmod +x "${SANDBOX}/bin/curl"
+CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
+    ENGY_MINER_DIR="${SANDBOX}/miner" \
+    env MINER_KEY=mk-test ENGY_ENGINES_PER_GPU=2 ENGY_CACHE_SEED_WAIT_SECONDS=2 \
+        ENGY_ENGINE_READY_TIMEOUT_SECONDS=15 bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
+ENTRYPOINT_PID=$!
+sleep 8
+engines_early="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines_early}" -eq 1 ]] && pass "slot 1 is held while slot 0 is still loading" \
+    || fail "expected 1 engine while slot 0 loads, got ${engines_early}"
+# The seed wait and the slot wait both poll on a 10s tick, so the release lands ~30s in, not at the
+# raw timeout value.
+sleep 35
+engines_late="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines_late}" -eq 2 ]] && pass "and starts anyway once the wait is spent" \
+    || fail "expected 2 engines after the wait, got ${engines_late}"
+grep -q "slot 0 did not finish loading" "${SANDBOX}/out.log" \
+    && pass "a slot that never loads is reported, not fatal" || fail "silent about the stuck slot"
+kill -TERM "${ENTRYPOINT_PID}" 2>/dev/null; wait "${ENTRYPOINT_PID}" 2>/dev/null
 rm -rf "${SANDBOX}"
 
 echo "== a card too small for the split runs fewer engines instead of OOM-looping =="
@@ -523,6 +557,8 @@ echo "== a refusal to start is logged, not just printed =="
 new_sandbox 1
 PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" CALLS_LOG="${SANDBOX}/calls.log" \
     bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
+sleep 1                       # same flush wait the first refusal case takes: tee writes the log
+                              # through a process substitution, which outlives the exit on a busy box
 grep -q "MINER_KEY is required" "${SANDBOX}/home/logs/miner.log" 2>/dev/null \
     && pass "the missing-key refusal reaches the log file" \
     || fail "refusal never reached the log: $(ls "${SANDBOX}/home/logs" 2>&1)"

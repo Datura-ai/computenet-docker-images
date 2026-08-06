@@ -55,8 +55,18 @@ already paying for. The model needs ~48GB to serve and the class we run engy on 
 
 Three things follow from engines sharing a card:
 
-- **The static pool is split.** sglang's `--mem-fraction-static` is a fraction of the WHOLE card, so
-  N engines get `0.85 / N` each. At 1 that is the 0.85 this image has always used, byte for byte.
+- **The static pool is split, but NOT by dividing the fraction.** sglang's `--mem-fraction-static`
+  is not a share of the card: its budget is
+  `free_after_weights - free_before_weights * (1 - fraction)` (`model_runner_kv_cache_mixin.py`), so
+  the reserve is a fraction of what THAT engine found free at its own start. Giving each engine
+  `0.85/N` starves the later ones — measured on an H200 (2026-08-06): engine 0 took its 0.42, engine 1
+  computed a negative pool and died with *"Not enough memory. Please try to increase
+  --mem-fraction-static"*. Solving for an equal share gives `fraction = s / (1 - slot * s)` with
+  `s = 0.85/N`: 0.425 then 0.7391 for two engines on an H200, ~61GB each. At N=1 it is the plain 0.85
+  this image has always used.
+- **Engines sharing a card start in slot order.** Each one measures the memory it finds free, so slot
+  s+1 must not start until slot s has loaded — otherwise both plan against the same empty card. The
+  wait is capped and never fatal (`wait_for_slot_to_load`).
 - **The knob is clamped by the hardware, not trusted.** It arrives from platform config, each engine
   holds its own 35GB copy of the checkpoint, and a value the card cannot hold buys a crash-loop of
   35GB loads rather than a clean failure. `size_engines_to_the_card` reads the smallest card and caps
@@ -82,6 +92,10 @@ Watch the KV cache when you turn it up: `ENGY_MAX_RUNNING_REQUESTS` does NOT spl
 at 2 engines on an H200 each one serves 16 concurrent requests out of ~25GB of KV instead of ~87GB.
 Preemption and prefill recompute would show up as tokens/GPU-h below the baseline rather than as an
 error.
+
+Verified live on a rented H200 (2026-08-06, `ENGY_ENGINES_PER_GPU=2`): two engines at 62886 MiB and
+60384 MiB — 86% of the card — two workers `…-g0e0` and `…-g0e1`, each dialing **8 of 8 gateway legs**
+and serving. So the shape onboards; what it earns is the open question.
 
 Unmeasured, and the reason to roll it out on one node first: whether the gateway's routing actually
 follows worker count. If it routes by hotkey and splits the same work over more workers, two engines

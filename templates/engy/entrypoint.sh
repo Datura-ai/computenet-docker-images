@@ -49,8 +49,6 @@ fi
 # What one engine must be able to hold: ~35GB of FP8 weights plus enough KV cache to serve. Engines
 # sharing a card split its VRAM, so this is also the ceiling on how many fit — see size_engines_to_the_card.
 MIN_ENGINE_VRAM_MB=49152
-# The share of the card each engine reserves, set by size_engines_to_the_card once the cards are known.
-MEM_FRACTION_STATIC=""
 FIRST_PORT="${ENGY_FIRST_PORT:-8000}"
 # The gateway's own model spec forces this; sglang refuses a shorter context for it.
 CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
@@ -229,7 +227,8 @@ start_engine() {
     CUDA_VISIBLE_DEVICES="${engine_gpus[$index]}" python3 -m sglang.launch_server \
         --model-path "${CKPT_DIR}" \
         --served-model-name Qwen3.6 --tp-size 1 --trust-remote-code \
-        --kv-cache-dtype fp8_e4m3 --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+        --kv-cache-dtype fp8_e4m3 \
+        --mem-fraction-static "$(engine_mem_fraction "$(( index % ENGINES_PER_GPU ))")" \
         --chunked-prefill-size 8192 --max-running-requests "${PER_ENGINE_REQUESTS}" \
         --context-length "${CONTEXT_LENGTH}" --enable-return-hidden-states --enable-cache-report \
         --enable-metrics \
@@ -265,9 +264,21 @@ size_engines_to_the_card() {
     else
         echo "[engy] could not read card size; keeping ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} as given" >&2
     fi
-    # sglang sizes its static pool as a fraction of the WHOLE card, so engines sharing one must split
-    # it or the second reserves memory the first already took. At 1 this is the image's usual 0.85.
-    MEM_FRACTION_STATIC="$(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.2f", 0.85 / engines }')"
+}
+
+# What ONE engine passes to --mem-fraction-static, given its slot on the card it shares.
+#
+# sglang does NOT read this as a share of the whole card. Its budget is
+# `free_after_loading_weights - free_before_loading_weights * (1 - fraction)` (model_runner's
+# rest_memory), so the reserve it keeps is a fraction of what THIS engine found free at its own
+# start — which shrinks with every sibling already resident. Giving each engine 0.85/N therefore
+# starves the later ones: measured live on an H200 (2026-08-06), engine 0 took its 0.42 and engine 1
+# then computed a NEGATIVE pool and died with "Not enough memory. Please try to increase
+# --mem-fraction-static". Solving for an equal share per engine gives fraction = s/(1 - slot*s)
+# where s = 0.85/N; at N=1 that is the plain 0.85 this image has always used.
+engine_mem_fraction() {
+    awk -v slot="$1" -v engines="${ENGINES_PER_GPU}" \
+        'BEGIN { share = 0.85 / engines; printf "%.4g", share / (1 - slot * share) }'
 }
 
 # Engines sharing a card get adjacent indexes, and card 0 keeps engine 0 — the one that seeds the
@@ -291,28 +302,65 @@ assign_engines_to_ports_and_cards() {
 # The wait is capped and never fatal: an engine that dies during seeding must not hold the node
 # hostage, so when the budget runs out the siblings start anyway and pay their own compile.
 start_engines_seeding_the_kernel_cache_first() {
-    local index waited=0
-    for index in "${!engine_ports[@]}"; do
-        start_engine "${index}"
-        if (( index == 0 && ${#engine_ports[@]} > 1 )); then
-            echo "[engy] engine on port ${engine_ports[0]} is seeding the shared kernel cache; the other $(( ${#engine_ports[@]} - 1 )) wait up to ${CACHE_SEED_WAIT_SECONDS}s"
-            while (( waited < CACHE_SEED_WAIT_SECONDS )) && ! engine_is_generating "${engine_ports[0]}"; do
-                # A dead seed will never warm anything, and holding the other cards for the rest of
-                # the budget is pure lost mining. The supervisor restarts it either way.
-                if ! kill -0 "${engine_pids[0]}" 2>/dev/null; then
-                    echo "[engy] the seeding engine exited after ${waited}s; starting the rest now" >&2
-                    break
-                fi
-                interruptible_sleep 10
-                waited=$((waited + 10))
-            done
-            if engine_is_generating "${engine_ports[0]}"; then
-                echo "[engy] kernel cache seeded after ${waited}s; starting the remaining engines warm"
-            elif kill -0 "${engine_pids[0]}" 2>/dev/null; then
-                echo "[engy] cache not seeded after ${waited}s; starting the remaining engines anyway" >&2
+    local slot index
+    for slot in $(seq 0 $((ENGINES_PER_GPU - 1))); do
+        for index in "${!engine_ports[@]}"; do
+            (( index % ENGINES_PER_GPU == slot )) || continue
+            start_engine "${index}"
+            # `if`, never `(( … )) && …`: a false arithmetic test is the LAST status the loop (and
+            # then this function) returns, and under `set -e` that kills the container silently
+            # right after the engines start. Measured on the H200 test node.
+            if (( index == 0 )); then
+                seed_the_kernel_cache_with_the_first_engine
             fi
+        done
+        # Engines sharing a card size their KV pool against the memory they find FREE (see
+        # engine_mem_fraction), so the next slot must not start until this one has finished loading —
+        # otherwise both measure the same empty card and the second gets no pool at all.
+        if (( slot + 1 < ENGINES_PER_GPU )); then
+            wait_for_slot_to_load "${slot}"
         fi
     done
+}
+
+# Hold every card's slot-0 engine while the first one JIT-compiles the shared kernel cache.
+seed_the_kernel_cache_with_the_first_engine() {
+    local waited=0
+    (( ${#engine_ports[@]} > 1 )) || return 0
+    echo "[engy] engine on port ${engine_ports[0]} is seeding the shared kernel cache; the other $(( ${#engine_ports[@]} - 1 )) wait up to ${CACHE_SEED_WAIT_SECONDS}s"
+    while (( waited < CACHE_SEED_WAIT_SECONDS )) && ! engine_is_generating "${engine_ports[0]}"; do
+        # A dead seed will never warm anything, and holding the other cards for the rest of
+        # the budget is pure lost mining. The supervisor restarts it either way.
+        if ! kill -0 "${engine_pids[0]}" 2>/dev/null; then
+            echo "[engy] the seeding engine exited after ${waited}s; starting the rest now" >&2
+            return 0
+        fi
+        interruptible_sleep 10
+        waited=$((waited + 10))
+    done
+    if engine_is_generating "${engine_ports[0]}"; then
+        echo "[engy] kernel cache seeded after ${waited}s; starting the remaining engines warm"
+    else
+        echo "[engy] cache not seeded after ${waited}s; starting the remaining engines anyway" >&2
+    fi
+}
+
+# Hold the next slot until every engine of this one has taken its memory. Capped and never fatal:
+# a card whose engine never comes up must not stop its siblings from starting at all.
+wait_for_slot_to_load() {
+    local slot="$1" waited=0 index pending
+    while (( waited < ENGINE_READY_TIMEOUT_SECONDS )); do
+        pending=0
+        for index in "${!engine_ports[@]}"; do
+            (( index % ENGINES_PER_GPU == slot )) || continue
+            kill -0 "${engine_pids[$index]}" 2>/dev/null || continue   # dead: nothing left to wait for
+            engine_is_generating "${engine_ports[$index]}" || pending=$((pending + 1))
+        done
+        (( pending == 0 )) && return 0
+        interruptible_sleep 10
+        waited=$((waited + 10))
+    done
+    echo "[engy] slot ${slot} did not finish loading in ${waited}s; starting slot $((slot + 1)) anyway" >&2
 }
 
 # /health_generate, not /health: it answers only once the engine can actually GENERATE. A miner
@@ -657,7 +705,8 @@ main() {
     assign_engines_to_ports_and_cards
     read_gpu_name_once
     echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) x" \
-         "${PER_ENGINE_REQUESTS} requests at ${MEM_FRACTION_STATIC} of a card each, one miner per engine"
+         "${PER_ENGINE_REQUESTS} requests at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
+         "of a card each, one miner per engine"
 
     export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
     export HF_HOME="${ENGY_HOME}/hf"
