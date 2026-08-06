@@ -48,7 +48,7 @@ if [[ ! "${ENGINES_PER_GPU}" =~ ^[0-9]+$ ]] || (( ENGINES_PER_GPU < 1 )); then
 fi
 # What one engine must be able to hold: ~35GB of FP8 weights plus enough KV cache to serve. Engines
 # sharing a card split its VRAM, so this is also the ceiling on how many fit — see size_engines_to_the_card.
-MIN_ENGINE_VRAM_MB="${ENGY_MIN_ENGINE_VRAM_MB:-49152}"
+MIN_ENGINE_VRAM_MB=49152
 # The share of the card each engine reserves, set by size_engines_to_the_card once the cards are known.
 MEM_FRACTION_STATIC=""
 FIRST_PORT="${ENGY_FIRST_PORT:-8000}"
@@ -98,8 +98,8 @@ trim_log_pid=""
 sidecar_pid=""
 log_pipe_pid=""
 gpu_count=0
-engine_count=0
 mining_engines=0
+GPU_NAME=""
 
 # Everything after this lands in the log: the engines, the miners and this script. Redirect BEFORE
 # the first check — a container that refuses to start is exactly the one whose reason we cannot
@@ -241,25 +241,26 @@ start_engine() {
     engine_started_at[index]="${SECONDS}"
 }
 
-# How many engines a card can actually hold, and what share of it each one reserves.
-#
 # Two engines on one card means two copies of the 35GB checkpoint in VRAM, so the knob is capped by
 # the hardware rather than trusted: the value comes from platform config and a wrong one costs a
 # crash-loop of 35GB loads, not a clean refusal. A card whose size nvidia-smi will not report is
 # taken at the operator's word — an unreadable card must not silently halve a healthy node.
 size_engines_to_the_card() {
-    local smallest_card_mb capacity
+    local smallest_card_mb engines_that_fit
     # `|| true` for the same reason as the GPU count below: grep exits 1 when nothing matches, and
     # under `set -e` + pipefail that would kill the script at this assignment, with nothing logged.
     smallest_card_mb="$( { nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null |
         tr -d ' ' | grep -E '^[0-9]+$' | sort -n | head -1; } || true)"
     if [[ -n "${smallest_card_mb}" ]]; then
-        capacity=$(( smallest_card_mb / MIN_ENGINE_VRAM_MB ))
-        (( capacity < 1 )) && capacity=1
-        if (( ENGINES_PER_GPU > capacity )); then
+        # Against the 85% the engines actually get, not the whole card: sizing the count on total
+        # VRAM and the allocation on 0.85/N lets a card pass the clamp and still hand each engine
+        # less than one needs — the crash-loop this clamp exists to prevent.
+        engines_that_fit=$(( smallest_card_mb * 85 / 100 / MIN_ENGINE_VRAM_MB ))
+        (( engines_that_fit < 1 )) && engines_that_fit=1
+        if (( ENGINES_PER_GPU > engines_that_fit )); then
             echo "[engy] ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} does not fit a ${smallest_card_mb}MB card at" \
-                 "${MIN_ENGINE_VRAM_MB}MB per engine; using ${capacity}." >&2
-            ENGINES_PER_GPU="${capacity}"
+                 "${MIN_ENGINE_VRAM_MB}MB usable per engine; using ${engines_that_fit}." >&2
+            ENGINES_PER_GPU="${engines_that_fit}"
         fi
     else
         echo "[engy] could not read card size; keeping ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} as given" >&2
@@ -269,12 +270,11 @@ size_engines_to_the_card() {
     MEM_FRACTION_STATIC="$(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.2f", 0.85 / engines }')"
 }
 
-# Engine i runs on card i / ENGINES_PER_GPU, so the engines sharing a card are adjacent and card 0
-# still owns engine 0 — the one that seeds the kernel cache.
-plan_engines() {
+# Engines sharing a card get adjacent indexes, and card 0 keeps engine 0 — the one that seeds the
+# kernel cache.
+assign_engines_to_ports_and_cards() {
     local index
-    engine_count=$(( gpu_count * ENGINES_PER_GPU ))
-    for index in $(seq 0 $((engine_count - 1))); do
+    for index in $(seq 0 $(( gpu_count * ENGINES_PER_GPU - 1 ))); do
         engine_ports[index]=$((FIRST_PORT + index))
         engine_gpus[index]=$((index / ENGINES_PER_GPU))
     done
@@ -292,10 +292,10 @@ plan_engines() {
 # hostage, so when the budget runs out the siblings start anyway and pay their own compile.
 start_engines_seeding_the_kernel_cache_first() {
     local index waited=0
-    for index in $(seq 0 $((engine_count - 1))); do
+    for index in "${!engine_ports[@]}"; do
         start_engine "${index}"
-        if (( index == 0 && engine_count > 1 )); then
-            echo "[engy] engine on port ${engine_ports[0]} is seeding the shared kernel cache; the other $((engine_count - 1)) wait up to ${CACHE_SEED_WAIT_SECONDS}s"
+        if (( index == 0 && ${#engine_ports[@]} > 1 )); then
+            echo "[engy] engine on port ${engine_ports[0]} is seeding the shared kernel cache; the other $(( ${#engine_ports[@]} - 1 )) wait up to ${CACHE_SEED_WAIT_SECONDS}s"
             while (( waited < CACHE_SEED_WAIT_SECONDS )) && ! engine_is_generating "${engine_ports[0]}"; do
                 # A dead seed will never warm anything, and holding the other cards for the rest of
                 # the budget is pure lost mining. The supervisor restarts it either way.
@@ -352,10 +352,18 @@ start_miners_as_engines_become_ready() {
 
 # One name per miner. The worker ID is deliberately NOT pinned to it — see ARCHITECTURE.md,
 # "Why worker ids are random again".
-# The suffix is the ENGINE index, which is also the card index in the default one-per-card shape.
+#
+# The name is the only handle on a worker in the engy dashboard, in the probe filenames and in the
+# `engy_worker` metric label, so it has to say which CARD went quiet. One engine per card keeps the
+# plain `-g<card>` every existing worker is already known by; engines sharing a card add the slot,
+# because `-g<engine>` alone would leave the card unknowable from any metric.
 miner_worker_name() {
-    local index="$1"
-    echo "${ENGY_WORKER_NAME:-$(hostname)}-g${index}"
+    local index="$1" prefix="${ENGY_WORKER_NAME:-$(hostname)}"
+    if (( ENGINES_PER_GPU == 1 )); then
+        echo "${prefix}-g${index}"
+    else
+        echo "${prefix}-g${engine_gpus[$index]}e$(( index % ENGINES_PER_GPU ))"
+    fi
 }
 
 # The hardware summary a miner sends the gateway comes from `nvidia-smi`, which lists the whole node
@@ -369,13 +377,19 @@ one_gpu_name() {
     echo "${name:-GPU}"
 }
 
+# Read once at startup rather than per miner: the value is a constant, and every read is an
+# nvidia-smi driver round trip issued while N engines are loading 35GB apiece.
+read_gpu_name_once() {
+    GPU_NAME="$(one_gpu_name)"
+}
+
 start_miner() {
     local index="$1" port="${engine_ports[$1]}" name
     name="$(miner_worker_name "${index}")"
     miner_names[index]="${name}"
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
     MAX_INFLIGHT="${PER_ENGINE_REQUESTS}" \
-    HW_GPUS="1x $(one_gpu_name)" \
+    HW_GPUS="1x ${GPU_NAME}" \
     ENGY_WORKER_NAME="${name}" \
     ENGY_PROBE_DIR="${PROBE_DIR}" \
         python3 "${ENGY_MINER_DIR}/engy_launch.py" \
@@ -640,8 +654,9 @@ main() {
         refuse_to_start "no GPUs visible to the container."
     fi
     size_engines_to_the_card
-    plan_engines
-    echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${engine_count} engine(s) x" \
+    assign_engines_to_ports_and_cards
+    read_gpu_name_once
+    echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) x" \
          "${PER_ENGINE_REQUESTS} requests at ${MEM_FRACTION_STATIC} of a card each, one miner per engine"
 
     export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
@@ -674,7 +689,7 @@ main() {
     if (( mining_engines == 0 )); then
         refuse_to_start "no engine became ready on any of the ${gpu_count} GPU(s)."
     fi
-    echo "[engy] ${mining_engines} of ${engine_count} engine(s) mining"
+    echo "[engy] ${mining_engines} of ${#engine_ports[@]} engine(s) mining"
 
     start_supervised_loop trim_log_forever
     trim_log_pid="${started_loop_pid}"

@@ -60,16 +60,28 @@ Three things follow from engines sharing a card:
 - **The knob is clamped by the hardware, not trusted.** It arrives from platform config, each engine
   holds its own 35GB copy of the checkpoint, and a value the card cannot hold buys a crash-loop of
   35GB loads rather than a clean failure. `size_engines_to_the_card` reads the smallest card and caps
-  the count at 48GB per engine — so an H200 tops out at 2 and a B200 at 3. A card whose size
-  `nvidia-smi` will not report is taken at the operator's word: an unreadable card must not silently
-  halve a healthy node.
-- **Engine index stopped being card index.** Engine *i* runs on card *i / N* (`plan_engines`), which
+  the count at 48GB per engine **of the 0.85 the engines actually get** — so an H200 tops out at 2
+  and a B200 at 3. Sizing the count on the whole card while allocating 0.85 of it would let a card
+  pass the clamp and still hand each engine less than one needs. A card whose size `nvidia-smi` will
+  not report is taken at the operator's word: an unreadable card must not silently halve a healthy
+  node.
+- **The worker name says which card.** `-g<card>` while one engine owns a card, `-g<card>e<slot>`
+  once they share one — the name is the only handle on a worker in the engy dashboard, the probe
+  filenames and the `engy_worker` metric label, so an engine-only index would make "which card went
+  quiet" unanswerable from any metric.
+- **Engine index stopped being card index.** Engine *i* runs on card *i / N*
+  (`assign_engines_to_ports_and_cards`), which
   keeps engines sharing a card adjacent and leaves engine 0 on card 0, where the kernel-cache seed
   runs. Everything else in the supervisor was already keyed on the engine.
 
 What it costs: acceptance is scored per **hotkey**, so twice the workers is twice the surface for one
 bad capacity probe to drag the key's day. Each worker also needs its own 8 clean gateway legs. Both
 are why this ships defaulting to 1 and is turned up per environment.
+
+Watch the KV cache when you turn it up: `ENGY_MAX_RUNNING_REQUESTS` does NOT split with the pool, so
+at 2 engines on an H200 each one serves 16 concurrent requests out of ~25GB of KV instead of ~87GB.
+Preemption and prefill recompute would show up as tokens/GPU-h below the baseline rather than as an
+error.
 
 Unmeasured, and the reason to roll it out on one node first: whether the gateway's routing actually
 follows worker count. If it routes by hotkey and splits the same work over more workers, two engines

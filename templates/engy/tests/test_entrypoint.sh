@@ -159,8 +159,15 @@ engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
 [[ "${engines}" -eq 4 ]] && pass "2 GPUs x 2 -> 4 engines" || fail "2 GPUs x 2 -> ${engines} engines"
 miners="$(grep -c "engy_launch.py" "${SANDBOX}/calls.log")"
 [[ "${miners}" -eq 4 ]] && pass "every engine still gets its own miner" || fail "expected 4 miners, got ${miners}"
+# The name is the only handle on a worker in the engy dashboard and the metric labels, so with
+# engines sharing a card it has to say which CARD, not just which engine.
 distinct_names="$(worker_names | wc -l | tr -d " ")"
 [[ "${distinct_names}" -eq 4 ]] && pass "and its own worker name" || fail "expected 4 distinct worker names, got ${distinct_names}"
+if worker_names | grep -q -- "-g1e1"; then
+    pass "worker names name the card and the slot on it"
+else
+    fail "worker names do not identify the card: $(worker_names | tr '\n' ' ')"
+fi
 # Engines 0-1 belong to card 0 and 2-3 to card 1. Getting this wrong piles every engine onto GPU 0,
 # which fits in VRAM and looks healthy — the second card just silently earns nothing.
 assert_engine_pinned_to_gpu() {
@@ -173,10 +180,6 @@ assert_engine_pinned_to_gpu 8000 0
 assert_engine_pinned_to_gpu 8001 0
 assert_engine_pinned_to_gpu 8002 1
 assert_engine_pinned_to_gpu 8003 1
-for port in 8000 8001 8002 8003; do
-    grep -q -- "--port ${port}" "${SANDBOX}/calls.log" || fail "no engine on port ${port}"
-done
-pass "each engine has its own port"
 # sglang sizes its static pool against the WHOLE card, so two engines at 0.85 would have the second
 # asking for memory the first already holds.
 if grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -qv -- "--mem-fraction-static 0.42"; then
@@ -213,6 +216,8 @@ new_sandbox 1
 run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_ENGINES_PER_GPU=abc
 engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
 [[ "${engines}" -eq 1 ]] && pass "a non-numeric value runs the default shape" || fail "started ${engines} engines"
+grep -q "is not a positive number" "${SANDBOX}/out.log" \
+    && pass "and the fallback is logged" || fail "fell back silently"
 rm -rf "${SANDBOX}"
 
 echo "== the default declared concurrency is the onboarding floor, not lower =="
@@ -497,7 +502,7 @@ else
 fi
 # The entrypoint's own lines matter as much as the miner's: "engine never became ready" is the whole
 # answer when an engine dies, and it is printed by this script, not by the miner.
-grep -q "GPU(s)" "${miner_log}" 2>/dev/null \
+grep -q "GPU(s) x .* engine(s)" "${miner_log}" 2>/dev/null \
     && pass "the entrypoint's own output is captured too" \
     || fail "entrypoint output missing from the log"
 # Every line carries a timestamp, or reading this against engy's per-second dashboard is guesswork.
