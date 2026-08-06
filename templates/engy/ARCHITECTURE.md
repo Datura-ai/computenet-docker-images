@@ -14,7 +14,7 @@ container at any minute, and everything below is about making that cheap instead
 container
 ├── sglang engine  :8000  (GPU 0, --tp-size 1)  ←  engy_miner  worker <name>-g0
 ├── sglang engine  :8001  (GPU 1)               ←  engy_miner  worker <name>-g1
-│   …one engine and one miner per card…
+│   …one engine and one miner per card, or ENGY_ENGINES_PER_GPU of them sharing each card…
 ├── metrics sidecar :9101   /metrics + /logs, bearer token
 └── supervisor (this script, PID 1)
 ```
@@ -41,6 +41,40 @@ cards; with one worker per card it costs one, and the other seven keep earning t
 
 It is NOT about the GIL. That was the working theory for a day and it is disproven — see "What the
 GIL turned out not to explain" below.
+
+## Why more than one engine per card (`ENGY_ENGINES_PER_GPU`, DAH-2601)
+
+The card is not what limits this workload. Prod sat at **2 concurrent requests across all eight
+engines** over a 7-minute sample, and declaring 64 inflight drew the same burst of 8 as declaring 8:
+the gateway sends what it decides to send. So the lever is not throughput per card, it is how much
+of the gateway's routing we are in front of — and the gateway routes to **workers**.
+
+A second engine on the same card is a second worker under the same hotkey, on hardware we are
+already paying for. The model needs ~48GB to serve and the class we run engy on is 143GB (H200) or
+180GB (B200), so two fit with KV cache to spare.
+
+Three things follow from engines sharing a card:
+
+- **The static pool is split.** sglang's `--mem-fraction-static` is a fraction of the WHOLE card, so
+  N engines get `0.85 / N` each. At 1 that is the 0.85 this image has always used, byte for byte.
+- **The knob is clamped by the hardware, not trusted.** It arrives from platform config, each engine
+  holds its own 35GB copy of the checkpoint, and a value the card cannot hold buys a crash-loop of
+  35GB loads rather than a clean failure. `size_engines_to_the_card` reads the smallest card and caps
+  the count at 48GB per engine — so an H200 tops out at 2 and a B200 at 3. A card whose size
+  `nvidia-smi` will not report is taken at the operator's word: an unreadable card must not silently
+  halve a healthy node.
+- **Engine index stopped being card index.** Engine *i* runs on card *i / N* (`plan_engines`), which
+  keeps engines sharing a card adjacent and leaves engine 0 on card 0, where the kernel-cache seed
+  runs. Everything else in the supervisor was already keyed on the engine.
+
+What it costs: acceptance is scored per **hotkey**, so twice the workers is twice the surface for one
+bad capacity probe to drag the key's day. Each worker also needs its own 8 clean gateway legs. Both
+are why this ships defaulting to 1 and is turned up per environment.
+
+Unmeasured, and the reason to roll it out on one node first: whether the gateway's routing actually
+follows worker count. If it routes by hotkey and splits the same work over more workers, two engines
+per card is the same tokens at twice the acceptance surface — a loss. The baseline to beat is
+118,540 tokens/GPU-h.
 
 ## Why every miner declares exactly 8
 
