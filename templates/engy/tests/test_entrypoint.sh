@@ -27,13 +27,16 @@ new_sandbox() {
       echo "case \"\$*\" in *memory.total*) for _ in \$(seq 1 ${gpu_count}); do echo ${card_mb}; done ;;"
       echo "                *) seq 0 $((gpu_count - 1)) ;; esac"
     } >"${SANDBOX}/bin/nvidia-smi"
-    # Every engine reports ready immediately; the supervisor loop then sees them healthy.
-    { echo '#!/usr/bin/env bash'; echo 'exit 0'; } >"${SANDBOX}/bin/curl"
+    # Every engine reports ready immediately; the supervisor loop then sees them healthy, and
+    # the gateway's /meta answers with its worker count like the real one.
+    { echo '#!/usr/bin/env bash'
+      echo 'case "$*" in *"/meta"*) echo "{\"workers\":8,\"instance\":\"test\"}" ;; esac; exit 0'
+    } >"${SANDBOX}/bin/curl"
     { echo '#!/usr/bin/env bash'; echo 'exit 0'; } >"${SANDBOX}/bin/hf"
     # python3 records how it was invoked and, for the miner, blocks so the loop does not spin.
     cat >"${SANDBOX}/bin/python3" <<'STUB'
 #!/usr/bin/env bash
-echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
+echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_GW_WORKERS=${ENGY_GW_WORKERS:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
 case "$*" in
     *engy_launch.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
     # Faithful to the image: PYTHONPATH points at sitecustomize.py, which prints an "armed" banner
@@ -57,13 +60,15 @@ start_entrypoint() {
     ENTRYPOINT_PID=$!
     # Loud on timeout, never silent: a readiness wait that expires and lets the assertions run anyway
     # reports "0 engines" on a busy machine and reads like a real regression.
+    # 60s, not 30: the suite runs a dozen sandboxes on one laptop and a cold start now also waits
+    # on the gateway leg-count resolve. A harness timeout that expires reads like a real regression.
     local waited=0
-    while (( waited < 150 )); do
+    while (( waited < 300 )); do
         grep -q "engy_launch.py" "${SANDBOX}/calls.log" 2>/dev/null && return 0
         sleep 0.2
         waited=$((waited + 1))
     done
-    fail "the miner never started within 30s; entrypoint said: $(tail -2 "${SANDBOX}/out.log" 2>&1)"
+    fail "the miner never started within 60s; entrypoint said: $(tail -2 "${SANDBOX}/out.log" 2>&1)"
 }
 
 # The distinct worker ids the miners were started with, one per line.
@@ -243,6 +248,31 @@ run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_ENGINES
 engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
 [[ "${engines}" -eq 2 ]] && pass "the requested split still runs" || fail "expected 2 engines, got ${engines}"
 grep -q "could not read card size" "${SANDBOX}/out.log" && pass "and says so" || fail "silent about the unreadable card"
+rm -rf "${SANDBOX}"
+
+echo "== every miner is told how many gateway legs to open =="
+# The stock miner asks GW/meta itself with a 5s timeout and falls back to ONE leg on any error —
+# and a worker offering 1 of the required 8 legs is refused onboarding and never earns. Resolving it
+# once per container turns N chances to hit that blip into one.
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "ENGY_GW_WORKERS=8"; then
+    fail "a miner was left to ask for itself: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "every miner gets the gateway's own count"
+fi
+rm -rf "${SANDBOX}"
+
+echo "== an unreachable gateway does not leave miners on one leg =="
+new_sandbox 1
+# /meta never answers; upstream would assume 1 leg, which cannot pass the probe.
+{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *"/meta"*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
+chmod +x "${SANDBOX}/bin/curl"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -q "ENGY_GW_WORKERS=8" \
+    && pass "it falls back to the gateway's known 8, not upstream's 1" \
+    || fail "fallback is not 8: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+grep -q "could not read .*meta" "${SANDBOX}/out.log" && pass "and says the count was unreadable" || fail "silent fallback"
 rm -rf "${SANDBOX}"
 
 echo "== a nonsense engines-per-GPU falls back to one =="

@@ -98,6 +98,7 @@ log_pipe_pid=""
 gpu_count=0
 mining_engines=0
 GPU_NAME=""
+GATEWAY_WORKERS=""
 
 # Everything after this lands in the log: the engines, the miners and this script. Redirect BEFORE
 # the first check — a container that refuses to start is exactly the one whose reason we cannot
@@ -431,12 +432,46 @@ read_gpu_name_once() {
     GPU_NAME="$(one_gpu_name)"
 }
 
+# How many legs every miner must open, resolved ONCE for the whole container.
+#
+# The gateway admits a worker only if it dials every one of the gateway's workers — "Qualification
+# and sampling only target workers with all 8 legs live". The stock miner asks GW/meta for that
+# count itself, with a 5s timeout and `except: return 1`, so a single blip makes it open ONE leg and
+# the prober refuses it: "offered 1 distinct clean legs, below the required 8", after which the
+# worker earns nothing until someone re-onboards it. Seen live on 2026-08-06, on the second miner of
+# a split card while the first was fine — and with N miners per container the blip gets N chances.
+# So: ask once, retry, and hand every miner the answer through upstream's own ENGY_GW_WORKERS
+# override. The fallback is the gateway's known count, never upstream's 1, which cannot onboard.
+GATEWAY_WORKERS_WHEN_UNREACHABLE=8
+resolve_gateway_worker_count() {
+    local meta_url count attempt
+    meta_url="${GW/#wss:/https:}"
+    meta_url="${meta_url/#ws:/http:}/meta"
+    for attempt in 1 2 3; do
+        # `|| true` again: an unreachable gateway makes curl exit non-zero, pipefail hands that to
+        # the assignment, and `set -e` would kill the container on the very failure this retry loop
+        # exists to survive.
+        count="$( { curl -sf -m 10 "${meta_url}" 2>/dev/null |
+            sed -n 's/.*"workers"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1; } || true)"
+        if [[ "${count}" =~ ^[0-9]+$ ]] && (( count >= 1 )); then
+            GATEWAY_WORKERS="${count}"
+            echo "[engy] ${meta_url} reports ${GATEWAY_WORKERS} gateway worker(s); every miner dials that many legs"
+            return 0
+        fi
+        interruptible_sleep 2
+    done
+    GATEWAY_WORKERS="${GATEWAY_WORKERS_WHEN_UNREACHABLE}"
+    echo "[engy] could not read ${meta_url} in 3 tries; assuming ${GATEWAY_WORKERS} gateway worker(s)" \
+         "— the stock miner would have assumed 1 and been refused onboarding" >&2
+}
+
 start_miner() {
     local index="$1" port="${engine_ports[$1]}" name
     name="$(miner_worker_name "${index}")"
     miner_names[index]="${name}"
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
     MAX_INFLIGHT="${PER_ENGINE_REQUESTS}" \
+    ENGY_GW_WORKERS="${GATEWAY_WORKERS}" \
     HW_GPUS="1x ${GPU_NAME}" \
     ENGY_WORKER_NAME="${name}" \
     ENGY_PROBE_DIR="${PROBE_DIR}" \
@@ -727,8 +762,10 @@ main() {
 
     start_metrics_sidecar
     # After the engines are spawned, not before: the miner is not needed until they are ready, and a
-    # slow GitHub would otherwise add a minute of dead time to every cold start.
+    # slow GitHub would otherwise add a minute of dead time to every cold start. The gateway's leg
+    # count is a miner prerequisite too, and its retries ride the same free window.
     refresh_vendored_miner
+    resolve_gateway_worker_count
 
     # One card that never comes up costs one card. This used to end the container, which was right
     # when a single miner fronted every engine — losing one engine lost the worker anyway. With a
