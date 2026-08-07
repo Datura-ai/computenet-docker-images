@@ -26,9 +26,29 @@ if [[ "${GPU_COUNT}" -eq 0 ]]; then
     exit 1
 fi
 
+LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
+mkdir -p "${LOG_DIR}"
+# The rate files carry FRESHNESS, so they must not survive a restart: a container that comes back in
+# under a minute would otherwise show the pre-restart rates as current and credit this node with
+# hashrate it is not producing while the GPUs are still initialising. The full logs stay appended —
+# they are diagnostics, and history across a restart is exactly what makes them useful.
+rm -f "${LOG_DIR}"/rate-*.log
+
 # One process per GPU: pearl-miner's multi-GPU behavior is undocumented, per-GPU processes with
 # CUDA_VISIBLE_DEVICES pinning work the same on 1-GPU and 8-GPU nodes. Worker names get a -g<i>
 # suffix on multi-GPU nodes so the pool shows each GPU separately.
+#
+# Each process is tee'd into its own log file as well as the container's stdout: the sidecar serves
+# those files on /logs, because on a miner's host we can reach neither `docker logs` nor the
+# container filesystem. Process substitution rather than a `| tee` pipeline so $! stays the MINER's
+# pid — through a pipe it would be tee's, and every miner crash would report tee's exit code 0.
+#
+# The hashrate lines ALSO go to a file of their own, and that is what the sidecar measures freshness
+# by: the miner keeps printing job and pool lines after a card stops hashing, so the full log's
+# mtime would call a dead card fresh. A file only hashrate lines can touch cannot lie about it.
+# grep hangs off a SECOND tee sink rather than a pipe after it: piping tee into grep would make
+# grep the only consumer of tee's stdout, and the miner's output would vanish from the container's
+# own stdout — the one place the platform's failure diagnostics can still read it.
 pids=()
 for ((i = 0; i < GPU_COUNT; i++)); do
     name="${WORKER}"
@@ -36,9 +56,26 @@ for ((i = 0; i < GPU_COUNT; i++)); do
         name="${WORKER}-g${i}"
     fi
     CUDA_VISIBLE_DEVICES="${i}" /usr/local/bin/pearl-miner \
-        --host "${POOL}" --user "${PEARL_POOL_WALLET}" --worker "${name}" &
+        --host "${POOL}" --user "${PEARL_POOL_WALLET}" --worker "${name}" \
+        > >(tee -a "${LOG_DIR}/gpu-${i}.log" \
+             >(grep --line-buffered -E "^Hashrate GPU" >> "${LOG_DIR}/rate-${i}.log")) 2>&1 &
     pids+=($!)
 done
+
+# The metrics sidecar, only when the platform gave us a token — it refuses to start without one, and
+# an unguarded restart loop would spin forever on nodes that never enable metrics. Wrapped in a
+# forever-loop so it never exits: `wait -n` below has no way to tell WHICH child died, so a sidecar
+# that could exit would look exactly like a dead miner and take the whole container down with it.
+if [[ -n "${METRICS_TOKEN:-}" ]]; then
+    (
+        while true; do
+            PEARL_LOG_DIR="${LOG_DIR}" PEARL_GPU_COUNT="${GPU_COUNT}" \
+                python3 /usr/local/bin/metrics_sidecar.py || true
+            echo "metrics sidecar exited, restarting in 5s" >&2
+            sleep 5
+        done
+    ) &
+fi
 
 # Exit (and let the platform restart the container) as soon as any miner dies. `wait -n` is called
 # WITHOUT pids (bash 5.1 returns a bogus 0 for an explicit pid that already exited) and with an
