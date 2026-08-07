@@ -2,7 +2,8 @@
 #
 # Boot engy (Bittensor SN53) workers inside a Lium filler container.
 #
-# Shape: ONE sglang engine PER GPU (each --tp-size 1, its own port) and ONE engy_miner PER ENGINE.
+# Shape: ENGY_ENGINES_PER_GPU sglang engines PER GPU (each --tp-size 1, its own port) and ONE
+# engy_miner PER ENGINE. The default of one engine per card is the shape this image has always run.
 # The reasoning behind every decision here, with the measurements, is in ARCHITECTURE.md next to
 # this file — read that before changing anything below.
 set -euo pipefail
@@ -36,6 +37,18 @@ if (( PER_ENGINE_REQUESTS < GATEWAY_REQUIRED_INFLIGHT )); then
          "using ${GATEWAY_REQUIRED_INFLIGHT} instead — a lower value earns nothing at all." >&2
     PER_ENGINE_REQUESTS="${GATEWAY_REQUIRED_INFLIGHT}"
 fi
+# How many engines share ONE card, each with its own miner and therefore its own gateway worker.
+# The card is not the constraint on an H200/B200 — prod measured 2 concurrent requests across eight
+# engines — so this exists to buy routing share, which the gateway hands out per WORKER.
+# See ARCHITECTURE.md, "Why more than one engine per card".
+ENGINES_PER_GPU="${ENGY_ENGINES_PER_GPU:-1}"
+if [[ ! "${ENGINES_PER_GPU}" =~ ^[0-9]+$ ]] || (( ENGINES_PER_GPU < 1 )); then
+    echo "[engy] ENGY_ENGINES_PER_GPU='${ENGINES_PER_GPU}' is not a positive number; using 1." >&2
+    ENGINES_PER_GPU=1
+fi
+# What one engine must be able to hold: ~35GB of FP8 weights plus enough KV cache to serve. Engines
+# sharing a card split its VRAM, so this is also the ceiling on how many fit — see size_engines_to_the_card.
+MIN_ENGINE_VRAM_MB=49152
 FIRST_PORT="${ENGY_FIRST_PORT:-8000}"
 # The gateway's own model spec forces this; sglang refuses a shorter context for it.
 CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
@@ -76,6 +89,7 @@ if (( LOG_MAX_BYTES < 8192 )); then LOG_MAX_BYTES=8192; fi
 
 engine_pids=()
 engine_ports=()
+engine_gpus=()
 miner_pids=()
 miner_names=()
 trim_log_pid=""
@@ -83,6 +97,8 @@ sidecar_pid=""
 log_pipe_pid=""
 gpu_count=0
 mining_engines=0
+GPU_NAME=""
+GATEWAY_WORKERS=""
 
 # Everything after this lands in the log: the engines, the miners and this script. Redirect BEFORE
 # the first check — a container that refuses to start is exactly the one whose reason we cannot
@@ -205,21 +221,75 @@ interruptible_sleep() {
     wait $! || true
 }
 
+# Indexed by ENGINE, not by card: with several engines per card the two stopped being the same
+# number, and restart_engine used to hand its engine index straight to CUDA_VISIBLE_DEVICES.
 start_engine() {
-    local gpu_index="$1" port="$2"
-    CUDA_VISIBLE_DEVICES="${gpu_index}" python3 -m sglang.launch_server \
+    local index="$1" port="${engine_ports[$1]}"
+    CUDA_VISIBLE_DEVICES="${engine_gpus[$index]}" python3 -m sglang.launch_server \
         --model-path "${CKPT_DIR}" \
         --served-model-name Qwen3.6 --tp-size 1 --trust-remote-code \
-        --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 \
+        --kv-cache-dtype fp8_e4m3 \
+        --mem-fraction-static "$(engine_mem_fraction "$(( index % ENGINES_PER_GPU ))")" \
         --chunked-prefill-size 8192 --max-running-requests "${PER_ENGINE_REQUESTS}" \
         --context-length "${CONTEXT_LENGTH}" --enable-return-hidden-states --enable-cache-report \
         --enable-metrics \
         --host 127.0.0.1 --port "${port}" &
-    engine_pids[gpu_index]=$!
+    engine_pids[index]=$!
     # Every start earns the reload grace, first one included: a cold start JITs ~16k FP8 kernels and
     # is the longest window in which a healthy engine looks wedged.
-    engine_kill_allowed_at[gpu_index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
-    engine_started_at[gpu_index]="${SECONDS}"
+    engine_kill_allowed_at[index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
+    engine_started_at[index]="${SECONDS}"
+}
+
+# Two engines on one card means two copies of the 35GB checkpoint in VRAM, so the knob is capped by
+# the hardware rather than trusted: the value comes from platform config and a wrong one costs a
+# crash-loop of 35GB loads, not a clean refusal. A card whose size nvidia-smi will not report is
+# taken at the operator's word — an unreadable card must not silently halve a healthy node.
+size_engines_to_the_card() {
+    local smallest_card_mb engines_that_fit
+    # `|| true` for the same reason as the GPU count below: grep exits 1 when nothing matches, and
+    # under `set -e` + pipefail that would kill the script at this assignment, with nothing logged.
+    smallest_card_mb="$( { nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null |
+        tr -d ' ' | grep -E '^[0-9]+$' | sort -n | head -1; } || true)"
+    if [[ -n "${smallest_card_mb}" ]]; then
+        # Against the 85% the engines actually get, not the whole card: sizing the count on total
+        # VRAM and the allocation on 0.85/N lets a card pass the clamp and still hand each engine
+        # less than one needs — the crash-loop this clamp exists to prevent.
+        engines_that_fit=$(( smallest_card_mb * 85 / 100 / MIN_ENGINE_VRAM_MB ))
+        (( engines_that_fit < 1 )) && engines_that_fit=1
+        if (( ENGINES_PER_GPU > engines_that_fit )); then
+            echo "[engy] ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} does not fit a ${smallest_card_mb}MB card at" \
+                 "${MIN_ENGINE_VRAM_MB}MB usable per engine; using ${engines_that_fit}." >&2
+            ENGINES_PER_GPU="${engines_that_fit}"
+        fi
+    else
+        echo "[engy] could not read card size; keeping ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} as given" >&2
+    fi
+}
+
+# What ONE engine passes to --mem-fraction-static, given its slot on the card it shares.
+#
+# sglang does NOT read this as a share of the whole card. Its budget is
+# `free_after_loading_weights - free_before_loading_weights * (1 - fraction)` (model_runner's
+# rest_memory), so the reserve it keeps is a fraction of what THIS engine found free at its own
+# start — which shrinks with every sibling already resident. Giving each engine 0.85/N therefore
+# starves the later ones: measured live on an H200 (2026-08-06), engine 0 took its 0.42 and engine 1
+# then computed a NEGATIVE pool and died with "Not enough memory. Please try to increase
+# --mem-fraction-static". Solving for an equal share per engine gives fraction = s/(1 - slot*s)
+# where s = 0.85/N; at N=1 that is the plain 0.85 this image has always used.
+engine_mem_fraction() {
+    awk -v slot="$1" -v engines="${ENGINES_PER_GPU}" \
+        'BEGIN { share = 0.85 / engines; printf "%.4g", share / (1 - slot * share) }'
+}
+
+# Engines sharing a card get adjacent indexes, and card 0 keeps engine 0 — the one that seeds the
+# kernel cache.
+assign_engines_to_ports_and_cards() {
+    local index
+    for index in $(seq 0 $(( gpu_count * ENGINES_PER_GPU - 1 ))); do
+        engine_ports[index]=$((FIRST_PORT + index))
+        engine_gpus[index]=$((index / ENGINES_PER_GPU))
+    done
 }
 
 # Start engine 0 alone, let it fill the shared kernel cache, then release the rest.
@@ -233,29 +303,65 @@ start_engine() {
 # The wait is capped and never fatal: an engine that dies during seeding must not hold the node
 # hostage, so when the budget runs out the siblings start anyway and pay their own compile.
 start_engines_seeding_the_kernel_cache_first() {
-    local index waited=0
-    for index in $(seq 0 $((gpu_count - 1))); do
-        engine_ports[index]=$((FIRST_PORT + index))
-        start_engine "${index}" "${engine_ports[$index]}"
-        if (( index == 0 && gpu_count > 1 )); then
-            echo "[engy] engine on port ${engine_ports[0]} is seeding the shared kernel cache; the other $((gpu_count - 1)) wait up to ${CACHE_SEED_WAIT_SECONDS}s"
-            while (( waited < CACHE_SEED_WAIT_SECONDS )) && ! engine_is_generating "${engine_ports[0]}"; do
-                # A dead seed will never warm anything, and holding the other cards for the rest of
-                # the budget is pure lost mining. The supervisor restarts it either way.
-                if ! kill -0 "${engine_pids[0]}" 2>/dev/null; then
-                    echo "[engy] the seeding engine exited after ${waited}s; starting the rest now" >&2
-                    break
-                fi
-                interruptible_sleep 10
-                waited=$((waited + 10))
-            done
-            if engine_is_generating "${engine_ports[0]}"; then
-                echo "[engy] kernel cache seeded after ${waited}s; starting the remaining engines warm"
-            elif kill -0 "${engine_pids[0]}" 2>/dev/null; then
-                echo "[engy] cache not seeded after ${waited}s; starting the remaining engines anyway" >&2
+    local slot index
+    for slot in $(seq 0 $((ENGINES_PER_GPU - 1))); do
+        for index in "${!engine_ports[@]}"; do
+            (( index % ENGINES_PER_GPU == slot )) || continue
+            start_engine "${index}"
+            # `if`, never `(( … )) && …`: a false arithmetic test is the LAST status the loop (and
+            # then this function) returns, and under `set -e` that kills the container silently
+            # right after the engines start. Measured on the H200 test node.
+            if (( index == 0 )); then
+                seed_the_kernel_cache_with_the_first_engine
             fi
+        done
+        # Engines sharing a card size their KV pool against the memory they find FREE (see
+        # engine_mem_fraction), so the next slot must not start until this one has finished loading —
+        # otherwise both measure the same empty card and the second gets no pool at all.
+        if (( slot + 1 < ENGINES_PER_GPU )); then
+            wait_for_slot_to_load "${slot}"
         fi
     done
+}
+
+# Hold every card's slot-0 engine while the first one JIT-compiles the shared kernel cache.
+seed_the_kernel_cache_with_the_first_engine() {
+    local waited=0
+    (( ${#engine_ports[@]} > 1 )) || return 0
+    echo "[engy] engine on port ${engine_ports[0]} is seeding the shared kernel cache; the other $(( ${#engine_ports[@]} - 1 )) wait up to ${CACHE_SEED_WAIT_SECONDS}s"
+    while (( waited < CACHE_SEED_WAIT_SECONDS )) && ! engine_is_generating "${engine_ports[0]}"; do
+        # A dead seed will never warm anything, and holding the other cards for the rest of
+        # the budget is pure lost mining. The supervisor restarts it either way.
+        if ! kill -0 "${engine_pids[0]}" 2>/dev/null; then
+            echo "[engy] the seeding engine exited after ${waited}s; starting the rest now" >&2
+            return 0
+        fi
+        interruptible_sleep 10
+        waited=$((waited + 10))
+    done
+    if engine_is_generating "${engine_ports[0]}"; then
+        echo "[engy] kernel cache seeded after ${waited}s; starting the remaining engines warm"
+    else
+        echo "[engy] cache not seeded after ${waited}s; starting the remaining engines anyway" >&2
+    fi
+}
+
+# Hold the next slot until every engine of this one has taken its memory. Capped and never fatal:
+# a card whose engine never comes up must not stop its siblings from starting at all.
+wait_for_slot_to_load() {
+    local slot="$1" waited=0 index pending
+    while (( waited < ENGINE_READY_TIMEOUT_SECONDS )); do
+        pending=0
+        for index in "${!engine_ports[@]}"; do
+            (( index % ENGINES_PER_GPU == slot )) || continue
+            kill -0 "${engine_pids[$index]}" 2>/dev/null || continue   # dead: nothing left to wait for
+            engine_is_generating "${engine_ports[$index]}" || pending=$((pending + 1))
+        done
+        (( pending == 0 )) && return 0
+        interruptible_sleep 10
+        waited=$((waited + 10))
+    done
+    echo "[engy] slot ${slot} did not finish loading in ${waited}s; starting slot $((slot + 1)) anyway" >&2
 }
 
 # /health_generate, not /health: it answers only once the engine can actually GENERATE. A miner
@@ -295,18 +401,68 @@ start_miners_as_engines_become_ready() {
 
 # One name per miner. The worker ID is deliberately NOT pinned to it — see ARCHITECTURE.md,
 # "Why worker ids are random again".
+#
+# The name is the only handle on a worker in the engy dashboard, in the probe filenames and in the
+# `engy_worker` metric label, so it has to say which CARD went quiet. One engine per card keeps the
+# plain `-g<card>` every existing worker is already known by; engines sharing a card add the slot,
+# because `-g<engine>` alone would leave the card unknowable from any metric.
 miner_worker_name() {
-    local index="$1"
-    echo "${ENGY_WORKER_NAME:-$(hostname)}-g${index}"
+    local index="$1" prefix="${ENGY_WORKER_NAME:-$(hostname)}"
+    if (( ENGINES_PER_GPU == 1 )); then
+        echo "${prefix}-g${index}"
+    else
+        echo "${prefix}-g${engine_gpus[$index]}e$(( index % ENGINES_PER_GPU ))"
+    fi
 }
 
 # The hardware summary a miner sends the gateway comes from `nvidia-smi`, which lists the whole node
-# and ignores CUDA_VISIBLE_DEVICES. Every miner here fronts ONE engine on ONE card, so without this
-# all eight of ours announce the node's eight cards each. HW_GPUS is upstream's own override for it.
+# and ignores CUDA_VISIBLE_DEVICES. Every miner here fronts ONE engine, so without this all eight of
+# ours announce the node's eight cards each. HW_GPUS is upstream's own override for it. Engines
+# sharing a card each still say "1x", because there is no fractional form and the gateway sizes a
+# worker by the capacity probe it runs, not by this string.
 one_gpu_name() {
     local name
     name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^ *//;s/ *$//')"
     echo "${name:-GPU}"
+}
+
+# Read once at startup rather than per miner: the value is a constant, and every read is an
+# nvidia-smi driver round trip issued while N engines are loading 35GB apiece.
+read_gpu_name_once() {
+    GPU_NAME="$(one_gpu_name)"
+}
+
+# How many legs every miner must open, resolved ONCE for the whole container.
+#
+# The gateway admits a worker only if it dials every one of the gateway's workers — "Qualification
+# and sampling only target workers with all 8 legs live". The stock miner asks GW/meta for that
+# count itself, with a 5s timeout and `except: return 1`, so a single blip makes it open ONE leg and
+# the prober refuses it: "offered 1 distinct clean legs, below the required 8", after which the
+# worker earns nothing until someone re-onboards it. Seen live on 2026-08-06, on the second miner of
+# a split card while the first was fine — and with N miners per container the blip gets N chances.
+# So: ask once, retry, and hand every miner the answer through upstream's own ENGY_GW_WORKERS
+# override. The fallback is the gateway's known count, never upstream's 1, which cannot onboard.
+GATEWAY_WORKERS_WHEN_UNREACHABLE=8
+resolve_gateway_worker_count() {
+    local meta_url count attempt
+    meta_url="${GW/#wss:/https:}"
+    meta_url="${meta_url/#ws:/http:}/meta"
+    for attempt in 1 2 3; do
+        # `|| true` again: an unreachable gateway makes curl exit non-zero, pipefail hands that to
+        # the assignment, and `set -e` would kill the container on the very failure this retry loop
+        # exists to survive.
+        count="$( { curl -sf -m 10 "${meta_url}" 2>/dev/null |
+            sed -n 's/.*"workers"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1; } || true)"
+        if [[ "${count}" =~ ^[0-9]+$ ]] && (( count >= 1 )); then
+            GATEWAY_WORKERS="${count}"
+            echo "[engy] ${meta_url} reports ${GATEWAY_WORKERS} gateway worker(s); every miner dials that many legs"
+            return 0
+        fi
+        interruptible_sleep 2
+    done
+    GATEWAY_WORKERS="${GATEWAY_WORKERS_WHEN_UNREACHABLE}"
+    echo "[engy] could not read ${meta_url} in 3 tries; assuming ${GATEWAY_WORKERS} gateway worker(s)" \
+         "— the stock miner would have assumed 1 and been refused onboarding" >&2
 }
 
 start_miner() {
@@ -315,7 +471,8 @@ start_miner() {
     miner_names[index]="${name}"
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
     MAX_INFLIGHT="${PER_ENGINE_REQUESTS}" \
-    HW_GPUS="1x $(one_gpu_name)" \
+    ENGY_GW_WORKERS="${GATEWAY_WORKERS}" \
+    HW_GPUS="1x ${GPU_NAME}" \
     ENGY_WORKER_NAME="${name}" \
     ENGY_PROBE_DIR="${PROBE_DIR}" \
         python3 "${ENGY_MINER_DIR}/engy_launch.py" \
@@ -480,7 +637,7 @@ restart_engine() {
     engine_stall_since[index]=0
     engine_last_tokens[index]=""
     engine_restarts[index]=$(( ${engine_restarts[$index]:-0} + 1 ))
-    start_engine "${index}" "${engine_ports[$index]}"
+    start_engine "${index}"
 }
 
 # Publish what the supervisor has done, through the same file the miners' probes use — the sidecar
@@ -579,7 +736,12 @@ main() {
     if [[ "${gpu_count}" -lt 1 ]]; then
         refuse_to_start "no GPUs visible to the container."
     fi
-    echo "[engy] ${gpu_count} GPU(s) -> ${gpu_count} engine(s) x ${PER_ENGINE_REQUESTS} requests, one miner each"
+    size_engines_to_the_card
+    assign_engines_to_ports_and_cards
+    read_gpu_name_once
+    echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) x" \
+         "${PER_ENGINE_REQUESTS} requests at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
+         "of a card each, one miner per engine"
 
     export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
     export HF_HOME="${ENGY_HOME}/hf"
@@ -600,8 +762,10 @@ main() {
 
     start_metrics_sidecar
     # After the engines are spawned, not before: the miner is not needed until they are ready, and a
-    # slow GitHub would otherwise add a minute of dead time to every cold start.
+    # slow GitHub would otherwise add a minute of dead time to every cold start. The gateway's leg
+    # count is a miner prerequisite too, and its retries ride the same free window.
     refresh_vendored_miner
+    resolve_gateway_worker_count
 
     # One card that never comes up costs one card. This used to end the container, which was right
     # when a single miner fronted every engine — losing one engine lost the worker anyway. With a
@@ -611,7 +775,7 @@ main() {
     if (( mining_engines == 0 )); then
         refuse_to_start "no engine became ready on any of the ${gpu_count} GPU(s)."
     fi
-    echo "[engy] ${mining_engines} of ${gpu_count} engine(s) mining"
+    echo "[engy] ${mining_engines} of ${#engine_ports[@]} engine(s) mining"
 
     start_supervised_loop trim_log_forever
     trim_log_pid="${started_loop_pid}"

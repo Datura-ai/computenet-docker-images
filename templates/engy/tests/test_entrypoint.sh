@@ -16,20 +16,27 @@ pass() { echo "  ok: $*"; }
 # One sandbox per case: stub bin dir, a fake checkpoint so no download is attempted, and a log the
 # stubs append their argv to.
 new_sandbox() {
-    local gpu_count="$1"
+    local gpu_count="$1" card_mb="${2:-143771}"     # an H200 unless the case says otherwise
     SANDBOX="$(mktemp -d)"
     mkdir -p "${SANDBOX}/bin" "${SANDBOX}/home/models/Qwen/Qwen3.6-35B-A3B-FP8" "${SANDBOX}/miner"
     echo '{}' >"${SANDBOX}/home/models/Qwen/Qwen3.6-35B-A3B-FP8/config.json"
     : >"${SANDBOX}/calls.log"
 
-    { echo '#!/usr/bin/env bash'; echo "seq 0 $((gpu_count - 1))"; } >"${SANDBOX}/bin/nvidia-smi"
-    # Every engine reports ready immediately; the supervisor loop then sees them healthy.
-    { echo '#!/usr/bin/env bash'; echo 'exit 0'; } >"${SANDBOX}/bin/curl"
+    # Answers the two queries the entrypoint makes: the card list, and how big those cards are.
+    { echo '#!/usr/bin/env bash'
+      echo "case \"\$*\" in *memory.total*) for _ in \$(seq 1 ${gpu_count}); do echo ${card_mb}; done ;;"
+      echo "                *) seq 0 $((gpu_count - 1)) ;; esac"
+    } >"${SANDBOX}/bin/nvidia-smi"
+    # Every engine reports ready immediately; the supervisor loop then sees them healthy, and
+    # the gateway's /meta answers with its worker count like the real one.
+    { echo '#!/usr/bin/env bash'
+      echo 'case "$*" in *"/meta"*) echo "{\"workers\":8,\"instance\":\"test\"}" ;; esac; exit 0'
+    } >"${SANDBOX}/bin/curl"
     { echo '#!/usr/bin/env bash'; echo 'exit 0'; } >"${SANDBOX}/bin/hf"
     # python3 records how it was invoked and, for the miner, blocks so the loop does not spin.
     cat >"${SANDBOX}/bin/python3" <<'STUB'
 #!/usr/bin/env bash
-echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
+echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_GW_WORKERS=${ENGY_GW_WORKERS:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
 case "$*" in
     *engy_launch.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
     # Faithful to the image: PYTHONPATH points at sitecustomize.py, which prints an "armed" banner
@@ -53,13 +60,15 @@ start_entrypoint() {
     ENTRYPOINT_PID=$!
     # Loud on timeout, never silent: a readiness wait that expires and lets the assertions run anyway
     # reports "0 engines" on a busy machine and reads like a real regression.
+    # 60s, not 30: the suite runs a dozen sandboxes on one laptop and a cold start now also waits
+    # on the gateway leg-count resolve. A harness timeout that expires reads like a real regression.
     local waited=0
-    while (( waited < 150 )); do
+    while (( waited < 300 )); do
         grep -q "engy_launch.py" "${SANDBOX}/calls.log" 2>/dev/null && return 0
         sleep 0.2
         waited=$((waited + 1))
     done
-    fail "the miner never started within 30s; entrypoint said: $(tail -2 "${SANDBOX}/out.log" 2>&1)"
+    fail "the miner never started within 60s; entrypoint said: $(tail -2 "${SANDBOX}/out.log" 2>&1)"
 }
 
 # The distinct worker ids the miners were started with, one per line.
@@ -97,6 +106,10 @@ for port in 8000 8001 8002 8003; do
     grep -q -- "--port ${port}" "${SANDBOX}/calls.log" || fail "no engine on port ${port}"
 done
 grep -q -- "--tp-size 1" "${SANDBOX}/calls.log" && pass "engines are tp=1" || fail "engines are not tp=1"
+# An engine with a card to itself keeps the whole card: this is the value the image has always run.
+grep -q -- "--mem-fraction-static 0.85" "${SANDBOX}/calls.log" \
+    && pass "one engine per card reserves 0.85 of it" \
+    || fail "single-engine mem fraction changed: $(grep -o -- '--mem-fraction-static [0-9.]*' "${SANDBOX}/calls.log" | head -1)"
 # Without this flag sglang answers /health_generate but 404s on /metrics, so the sidecar reports
 # every engine unreachable and the node looks like it earns nothing.
 grep -q -- "--enable-metrics" "${SANDBOX}/calls.log" && pass "engines expose /metrics" || fail "engines do not expose /metrics"
@@ -140,6 +153,135 @@ fi
 distinct_names="$(worker_names | wc -l | tr -d " ")"
 [[ "${distinct_names}" -eq 2 ]] && pass "each card gets its own worker name" \
     || fail "expected 2 distinct worker names, got ${distinct_names}"
+rm -rf "${SANDBOX}"
+
+echo "== two engines per GPU share the card and each gets its own miner =="
+# The card is not the constraint on an H200/B200 (prod: 2 concurrent across eight engines), and the
+# gateway hands out work per WORKER — so a second engine on the same card is a second worker.
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_ENGINES_PER_GPU=2
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 4 ]] && pass "2 GPUs x 2 -> 4 engines" || fail "2 GPUs x 2 -> ${engines} engines"
+miners="$(grep -c "engy_launch.py" "${SANDBOX}/calls.log")"
+[[ "${miners}" -eq 4 ]] && pass "every engine still gets its own miner" || fail "expected 4 miners, got ${miners}"
+# The name is the only handle on a worker in the engy dashboard and the metric labels, so with
+# engines sharing a card it has to say which CARD, not just which engine.
+distinct_names="$(worker_names | wc -l | tr -d " ")"
+[[ "${distinct_names}" -eq 4 ]] && pass "and its own worker name" || fail "expected 4 distinct worker names, got ${distinct_names}"
+if worker_names | grep -q -- "-g1e1"; then
+    pass "worker names name the card and the slot on it"
+else
+    fail "worker names do not identify the card: $(worker_names | tr '\n' ' ')"
+fi
+# Engines 0-1 belong to card 0 and 2-3 to card 1. Getting this wrong piles every engine onto GPU 0,
+# which fits in VRAM and looks healthy — the second card just silently earns nothing.
+assert_engine_pinned_to_gpu() {
+    local port="$1" gpu="$2"
+    grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -- "--port ${port} " | grep -q "CUDA_VISIBLE_DEVICES=${gpu}$" \
+        && pass "the engine on ${port} runs on GPU ${gpu}" \
+        || fail "the engine on ${port} is not on GPU ${gpu}: $(grep -- "--port ${port} " "${SANDBOX}/calls.log")"
+}
+assert_engine_pinned_to_gpu 8000 0
+assert_engine_pinned_to_gpu 8001 0
+assert_engine_pinned_to_gpu 8002 1
+assert_engine_pinned_to_gpu 8003 1
+# sglang keeps a reserve proportional to what the engine finds FREE at its own start, not to the
+# whole card, so the second engine on a card needs a BIGGER fraction to end up with the same pool.
+# Measured live on an H200: two engines at 0.42 each left the second with a negative pool and it
+# died with "Not enough memory".
+assert_engine_mem_fraction() {
+    local port="$1" fraction="$2"
+    grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -- "--port ${port} " | grep -q -- "--mem-fraction-static ${fraction} " \
+        && pass "the engine on ${port} reserves ${fraction}" \
+        || fail "the engine on ${port} is not at ${fraction}: $(grep -- "--port ${port} " "${SANDBOX}/calls.log" | grep -o -- '--mem-fraction-static [0-9.]*')"
+}
+assert_engine_mem_fraction 8000 0.425
+assert_engine_mem_fraction 8001 0.7391
+assert_engine_mem_fraction 8002 0.425
+assert_engine_mem_fraction 8003 0.7391
+rm -rf "${SANDBOX}"
+
+echo "== the second engine on a card waits for the first to load =="
+# Both measure the memory they find free, so starting them together makes both plan for an empty
+# card and the second ends up with no pool at all.
+new_sandbox 1
+# Nothing ever becomes ready, so slot 0 never finishes loading and slot 1 must stay unstarted.
+{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *health_generate*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
+chmod +x "${SANDBOX}/bin/curl"
+CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
+    ENGY_MINER_DIR="${SANDBOX}/miner" \
+    env MINER_KEY=mk-test ENGY_ENGINES_PER_GPU=2 ENGY_CACHE_SEED_WAIT_SECONDS=2 \
+        ENGY_ENGINE_READY_TIMEOUT_SECONDS=15 bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
+ENTRYPOINT_PID=$!
+sleep 8
+engines_early="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines_early}" -eq 1 ]] && pass "slot 1 is held while slot 0 is still loading" \
+    || fail "expected 1 engine while slot 0 loads, got ${engines_early}"
+# The seed wait and the slot wait both poll on a 10s tick, so the release lands ~30s in, not at the
+# raw timeout value.
+sleep 35
+engines_late="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines_late}" -eq 2 ]] && pass "and starts anyway once the wait is spent" \
+    || fail "expected 2 engines after the wait, got ${engines_late}"
+grep -q "slot 0 did not finish loading" "${SANDBOX}/out.log" \
+    && pass "a slot that never loads is reported, not fatal" || fail "silent about the stuck slot"
+kill -TERM "${ENTRYPOINT_PID}" 2>/dev/null; wait "${ENTRYPOINT_PID}" 2>/dev/null
+rm -rf "${SANDBOX}"
+
+echo "== a card too small for the split runs fewer engines instead of OOM-looping =="
+# The value comes from platform config, and each engine holds its own 35GB copy of the checkpoint.
+# A wrong one must cost a log line, not a crash-loop of 35GB loads.
+new_sandbox 1 49152                                  # exactly one engine's worth of VRAM
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_ENGINES_PER_GPU=4
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 1 ]] && pass "4 per card on a 48GB card -> 1 engine" || fail "started ${engines} engines on a card that holds one"
+grep -q "does not fit a 49152MB card" "${SANDBOX}/out.log" \
+    && pass "and the log says it was clamped" || fail "clamped silently"
+rm -rf "${SANDBOX}"
+
+echo "== a card whose size cannot be read is taken at the operator's word =="
+# An unreadable card must not silently halve a healthy node.
+new_sandbox 1
+{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *memory.total*) exit 1 ;; *) echo 0 ;; esac'; } >"${SANDBOX}/bin/nvidia-smi"
+chmod +x "${SANDBOX}/bin/nvidia-smi"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_ENGINES_PER_GPU=2
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 2 ]] && pass "the requested split still runs" || fail "expected 2 engines, got ${engines}"
+grep -q "could not read card size" "${SANDBOX}/out.log" && pass "and says so" || fail "silent about the unreadable card"
+rm -rf "${SANDBOX}"
+
+echo "== every miner is told how many gateway legs to open =="
+# The stock miner asks GW/meta itself with a 5s timeout and falls back to ONE leg on any error —
+# and a worker offering 1 of the required 8 legs is refused onboarding and never earns. Resolving it
+# once per container turns N chances to hit that blip into one.
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "ENGY_GW_WORKERS=8"; then
+    fail "a miner was left to ask for itself: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "every miner gets the gateway's own count"
+fi
+rm -rf "${SANDBOX}"
+
+echo "== an unreachable gateway does not leave miners on one leg =="
+new_sandbox 1
+# /meta never answers; upstream would assume 1 leg, which cannot pass the probe.
+{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *"/meta"*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
+chmod +x "${SANDBOX}/bin/curl"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -q "ENGY_GW_WORKERS=8" \
+    && pass "it falls back to the gateway's known 8, not upstream's 1" \
+    || fail "fallback is not 8: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+grep -q "could not read .*meta" "${SANDBOX}/out.log" && pass "and says the count was unreadable" || fail "silent fallback"
+rm -rf "${SANDBOX}"
+
+echo "== a nonsense engines-per-GPU falls back to one =="
+new_sandbox 1
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_ENGINES_PER_GPU=abc
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 1 ]] && pass "a non-numeric value runs the default shape" || fail "started ${engines} engines"
+grep -q "is not a positive number" "${SANDBOX}/out.log" \
+    && pass "and the fallback is logged" || fail "fell back silently"
 rm -rf "${SANDBOX}"
 
 echo "== the default declared concurrency is the onboarding floor, not lower =="
@@ -424,7 +566,7 @@ else
 fi
 # The entrypoint's own lines matter as much as the miner's: "engine never became ready" is the whole
 # answer when an engine dies, and it is printed by this script, not by the miner.
-grep -q "GPU(s) ->" "${miner_log}" 2>/dev/null \
+grep -q "GPU(s) x .* engine(s)" "${miner_log}" 2>/dev/null \
     && pass "the entrypoint's own output is captured too" \
     || fail "entrypoint output missing from the log"
 # Every line carries a timestamp, or reading this against engy's per-second dashboard is guesswork.
@@ -445,6 +587,8 @@ echo "== a refusal to start is logged, not just printed =="
 new_sandbox 1
 PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" CALLS_LOG="${SANDBOX}/calls.log" \
     bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
+sleep 1                       # same flush wait the first refusal case takes: tee writes the log
+                              # through a process substitution, which outlives the exit on a busy box
 grep -q "MINER_KEY is required" "${SANDBOX}/home/logs/miner.log" 2>/dev/null \
     && pass "the missing-key refusal reaches the log file" \
     || fail "refusal never reached the log: $(ls "${SANDBOX}/home/logs" 2>&1)"
