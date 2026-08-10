@@ -56,6 +56,7 @@ start_entrypoint() {
     PATH="${SANDBOX}/bin:${PATH}" \
     ENGY_HOME="${SANDBOX}/home" \
     ENGY_MINER_DIR="${SANDBOX}/miner" \
+    ENGY_MINER_START_STAGGER_SECONDS=0 \
     "$@" bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
     ENTRYPOINT_PID=$!
     # Loud on timeout, never silent: a readiness wait that expires and lets the assertions run anyway
@@ -211,6 +212,7 @@ chmod +x "${SANDBOX}/bin/curl"
 CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
     ENGY_MINER_DIR="${SANDBOX}/miner" \
     env MINER_KEY=mk-test ENGY_ENGINES_PER_GPU=2 ENGY_CACHE_SEED_WAIT_SECONDS=2 \
+        ENGY_MINER_START_STAGGER_SECONDS=0 \
         ENGY_ENGINE_READY_TIMEOUT_SECONDS=15 bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
 ENTRYPOINT_PID=$!
 sleep 8
@@ -273,6 +275,25 @@ grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -q "ENGY_GW_WORKERS=8" \
     && pass "it falls back to the gateway's known 8, not upstream's 1" \
     || fail "fallback is not 8: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 grep -q "could not read .*meta" "${SANDBOX}/out.log" && pass "and says the count was unreadable" || fail "silent fallback"
+rm -rf "${SANDBOX}"
+
+echo "== miners start one at a time, not as a batch =="
+# The gateway claims a worker ~3s after its first HELLO and judges it on the legs live at that
+# moment. Eight miners dialing 8 legs each at once raced 64 handshakes on a real 8-card node and two
+# workers were failed at 7/8, one landing its last leg 15s after the verdict.
+new_sandbox 4
+start_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_MINER_START_STAGGER_SECONDS=6
+sleep 4
+started_early="$(grep -c "engy_launch.py" "${SANDBOX}/calls.log")"
+[[ "${started_early}" -eq 1 ]] && pass "only the first miner starts immediately" \
+    || fail "expected 1 miner in the first seconds, got ${started_early}"
+sleep 9
+started_later="$(grep -c "engy_launch.py" "${SANDBOX}/calls.log")"
+[[ "${started_later}" -ge 2 ]] && pass "the next one follows after the gap" \
+    || fail "expected a second miner after the stagger, got ${started_later}"
+[[ "${started_later}" -lt 4 ]] && pass "and the batch is still not started at once" \
+    || fail "all 4 miners started inside the stagger window"
+kill -TERM "${ENTRYPOINT_PID}" 2>/dev/null; wait "${ENTRYPOINT_PID}" 2>/dev/null
 rm -rf "${SANDBOX}"
 
 echo "== a nonsense engines-per-GPU falls back to one =="
@@ -368,7 +389,7 @@ new_sandbox 4
 chmod +x "${SANDBOX}/bin/curl"
 CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
     ENGY_MINER_DIR="${SANDBOX}/miner" \
-    env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=20 ENGY_ENGINE_READY_TIMEOUT_SECONDS=2 \
+    env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=20 ENGY_ENGINE_READY_TIMEOUT_SECONDS=2 ENGY_MINER_START_STAGGER_SECONDS=0 \
     bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
 ENTRYPOINT_PID=$!
 sleep 6
@@ -419,7 +440,7 @@ new_sandbox 2
 chmod +x "${SANDBOX}/bin/curl"
 PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" ENGY_MINER_DIR="${SANDBOX}/miner" \
     CALLS_LOG="${SANDBOX}/calls.log" \
-    env MINER_KEY=mk-test ENGY_ENGINE_READY_TIMEOUT_SECONDS=3 ENGY_CACHE_SEED_WAIT_SECONDS=5 bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
+    env MINER_KEY=mk-test ENGY_ENGINE_READY_TIMEOUT_SECONDS=3 ENGY_CACHE_SEED_WAIT_SECONDS=5 ENGY_MINER_START_STAGGER_SECONDS=0 bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
 if [[ $? -ne 0 ]] && grep -q "no engine became ready" "${SANDBOX}/out.log"; then
     pass "zero ready engines -> refuse with a named reason"
 else
@@ -482,7 +503,7 @@ new_sandbox 2
 chmod +x "${SANDBOX}/bin/curl"
 CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
     ENGY_MINER_DIR="${SANDBOX}/miner" \
-    env MINER_KEY=mk-test METRICS_TOKEN=t ENGY_CACHE_SEED_WAIT_SECONDS=2 \
+    env MINER_KEY=mk-test METRICS_TOKEN=t ENGY_CACHE_SEED_WAIT_SECONDS=2 ENGY_MINER_START_STAGGER_SECONDS=0 \
         ENGY_ENGINE_READY_TIMEOUT_SECONDS=2 bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1 &
 refusal_pid=$!
 waited=0
