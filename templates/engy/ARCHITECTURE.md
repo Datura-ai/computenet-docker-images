@@ -88,7 +88,7 @@ What it costs: acceptance is scored per **hotkey**, so twice the workers is twic
 bad capacity probe to drag the key's day. Each worker also needs its own 8 clean gateway legs. Both
 are why this ships defaulting to 1 and is turned up per environment.
 
-Watch the KV cache when you turn it up: `ENGY_MAX_RUNNING_REQUESTS` does NOT split with the pool, so
+Watch the KV cache when you turn it up: the engine's slot count does NOT split with the pool, so
 at 2 engines on an H200 each one serves 16 concurrent requests out of ~25GB of KV instead of ~87GB.
 Preemption and prefill recompute would show up as tokens/GPU-h below the baseline rather than as an
 error.
@@ -104,8 +104,8 @@ per card is the same tokens at twice the acceptance surface — a loss. The base
 
 ## Why every miner declares exactly 8
 
-`ENGY_MAX_RUNNING_REQUESTS` (default **8**) is both sglang's `--max-running-requests` and what one
-miner declares to the gateway as `MAX_INFLIGHT`. **8 is a floor, not a tuning choice.**
+`ENGY_DECLARED_INFLIGHT` (default **8**) is what one miner declares to the gateway as
+`MAX_INFLIGHT`. **8 is a floor, not a tuning choice.**
 
 The miner derives its gateway connection count from this number (`_leg_plan`): when `MAX_INFLIGHT`
 is below the gateway's worker count it opens that many connections instead, one inflight each. The
@@ -124,7 +124,29 @@ Above 8 buys nothing either. Same box, same day: declaring 8 drew a burst of 8 c
 **64 drew the same burst of 8**. The number we declare is an admission ticket, not a throttle — the
 gateway sends what it wants to send. Prod, meanwhile, sat at 2 concurrent across all eight engines
 over a 7-minute sample. 481 of the network's 635 workers declare 8; only 7 declare 64, and until
-this change we were one of them.
+this change we were one of them. Re-read on 2026-08-11 as the network grew: **2250 of 2305 workers
+declare 8**, 46 declare 16. Declaring 8 is what everyone who gets routed does.
+
+## Why the engine is twice the declaration
+
+sglang's `--max-running-requests` is NOT the declaration. It is `ENGY_DECLARED_INFLIGHT` x
+`ENGINE_SLOTS_PER_DECLARED` (**2**), so the default shape is a worker that advertises 8 and an engine
+that holds 16.
+
+The two used to be the same number, and that is a bug with a name. The miner splits `MAX_INFLIGHT`
+into one inflight per gateway leg, so at 8 the engine had exactly one slot per leg and no spare.
+The prober requires all 8 legs to serve **concurrently**; anything else holding a slot at that
+moment — our own `/health_generate`, a leg that had not drained — leaves 7, and the worker is failed
+with `served only 7 CONCURRENT legs` while every HTTP response in the log is a 200.
+
+Measured as a clean A/B on one rented H100 (2026-08-10, same box, same image 0.0.7): declared 8 ->
+failed after 790 requests, all of them successful; declared 16 -> `active`. Raising the declaration
+was never the fix, it just happened to buy the engine a spare slot. Prod paid for that confusion
+twice — DAH-2603 rolled 16 back to 8 on 2026-08-06 reading the symptom backwards, and prod
+onboarding failed from that day until DAH-2601 rolled it forward again on 2026-08-11.
+
+Spare engine slots cost KV cache and nothing else; a missing one costs the entire worker. That is
+why the multiplier lives in the image as a constant rather than as one more knob to get wrong.
 
 ## Why worker ids are random again
 
@@ -141,7 +163,7 @@ the same worker, request history intact.
 **Reverted on 2026-08-04, because a pinned id also pins the CAPACITY.** engy records a worker's
 declared max inflight at the record it creates on first onboarding and never refreshes it on
 reconnect. With a pinned id the node reconnected into its record from 2026-08-03 forever, so raising
-`ENGY_MAX_RUNNING_REQUESTS` was a silent no-op: the container booted with the new number, the miner
+the declared inflight was a silent no-op: the container booted with the new number, the miner
 sent it on every hello, and the dashboard kept showing the old one — which is also the number the
 gateway routes against. Onboarding is quick now, so re-onboarding on restart is the cheaper half of
 the trade, and it is the only way a config change ever lands.

@@ -125,7 +125,7 @@ echo "== one miner per engine, each declaring only its own engine's capacity =="
 # The GIL is per PROCESS, so one miner driving N engines serialises every hidden-state parse behind
 # one interpreter. One miner per engine turns that single queue into N. See ARCHITECTURE.md.
 new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_MAX_RUNNING_REQUESTS=8
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=8
 miners="$(grep -c "engy_launch.py" "${SANDBOX}/calls.log")"
 [[ "${miners}" -eq 2 ]] && pass "2 engines -> 2 miners" || fail "2 engines -> ${miners} miners"
 for port in 8000 8001; do
@@ -316,18 +316,50 @@ if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; the
 else
     pass "with no override every miner declares 8"
 fi
-grep -q -- "--max-running-requests 8" "${SANDBOX}/calls.log" \
-    && pass "the engine is sized to match what the miner declares" \
-    || fail "engine --max-running-requests does not match the declared 8"
 rm -rf "${SANDBOX}"
 
 new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_MAX_RUNNING_REQUESTS=4
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=4
 if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
     fail "an override below the floor reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
     pass "an override below the floor is raised back to 8 instead of earning nothing"
 fi
+rm -rf "${SANDBOX}"
+
+echo "== the engine holds more requests than the miner declares =="
+# The prober requires all 8 legs to serve CONCURRENTLY. One engine slot per leg means our own
+# /health_generate queues a leg behind itself and the worker is failed with "served only 7
+# CONCURRENT legs" — the whole failure mode is the missing slack, not the declared number
+# (clean A/B on one H100, 2026-08-10: declared 8 failed, declared 16 passed, same box and image).
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+grep -q -- "--max-running-requests 16" "${SANDBOX}/calls.log" \
+    && pass "the default declaration of 8 runs the engine at 16" \
+    || fail "engine slots are not twice the declaration: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
+rm -rf "${SANDBOX}"
+
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=12
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=12"; then
+    fail "an override above the floor did not reach the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "an override above the floor is declared as given"
+fi
+grep -q -- "--max-running-requests 24" "${SANDBOX}/calls.log" \
+    && pass "and the engine follows it at twice the size" \
+    || fail "engine slots did not follow the override: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
+rm -rf "${SANDBOX}"
+
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=abc
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
+    fail "a non-numeric declaration reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "a non-numeric declaration falls back to the floor"
+fi
+grep -q "is not a number" "${SANDBOX}/out.log" \
+    && pass "and the fallback is logged" || fail "fell back silently"
 rm -rf "${SANDBOX}"
 
 echo "== the event-loop lag probe is wired up =="

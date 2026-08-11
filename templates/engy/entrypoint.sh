@@ -17,26 +17,34 @@ MODEL="${MODEL:-qwen3.6-35b-a3b}"
 CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
 CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
-# Per-engine concurrency, and also what ONE miner declares to the gateway as MAX_INFLIGHT.
+# What ONE miner declares to the gateway as MAX_INFLIGHT.
 # 8 is a FLOOR, not a preference: the miner derives its gateway connection count from this number
 # (see _leg_plan), the gateway runs 8 workers, and a miner holding fewer than 8 connections is
 # refused onboarding outright — "offered N distinct clean legs, below the required 8". Measured by
 # running this image at 4: instant failure, zero traffic, ever.
 # See ARCHITECTURE.md, "Why every miner declares exactly 8".
 GATEWAY_REQUIRED_INFLIGHT=8
-PER_ENGINE_REQUESTS="${ENGY_MAX_RUNNING_REQUESTS:-${GATEWAY_REQUIRED_INFLIGHT}}"
+DECLARED_INFLIGHT="${ENGY_DECLARED_INFLIGHT:-${GATEWAY_REQUIRED_INFLIGHT}}"
 # Checked as text before any arithmetic: under `set -u` a non-numeric value makes (( )) treat it as
 # an unset variable NAME and kill the script here, before the log capture that would explain why.
-if [[ ! "${PER_ENGINE_REQUESTS}" =~ ^[0-9]+$ ]]; then
-    echo "[engy] ENGY_MAX_RUNNING_REQUESTS='${PER_ENGINE_REQUESTS}' is not a number;" \
+if [[ ! "${DECLARED_INFLIGHT}" =~ ^[0-9]+$ ]]; then
+    echo "[engy] ENGY_DECLARED_INFLIGHT='${DECLARED_INFLIGHT}' is not a number;" \
          "using ${GATEWAY_REQUIRED_INFLIGHT}." >&2
-    PER_ENGINE_REQUESTS="${GATEWAY_REQUIRED_INFLIGHT}"
+    DECLARED_INFLIGHT="${GATEWAY_REQUIRED_INFLIGHT}"
 fi
-if (( PER_ENGINE_REQUESTS < GATEWAY_REQUIRED_INFLIGHT )); then
-    echo "[engy] ENGY_MAX_RUNNING_REQUESTS=${PER_ENGINE_REQUESTS} is below the gateway's floor;" \
+if (( DECLARED_INFLIGHT < GATEWAY_REQUIRED_INFLIGHT )); then
+    echo "[engy] ENGY_DECLARED_INFLIGHT=${DECLARED_INFLIGHT} is below the gateway's floor;" \
          "using ${GATEWAY_REQUIRED_INFLIGHT} instead — a lower value earns nothing at all." >&2
-    PER_ENGINE_REQUESTS="${GATEWAY_REQUIRED_INFLIGHT}"
+    DECLARED_INFLIGHT="${GATEWAY_REQUIRED_INFLIGHT}"
 fi
+# How many request slots the ENGINE holds, as a multiple of what the miner declares. These used to
+# be one number, which left exactly one slot per gateway leg: our own /health_generate then queued a
+# leg behind itself and the prober, which requires all 8 legs to serve CONCURRENTLY, failed the
+# worker with "served only 7 CONCURRENT legs". The engine is the cheap side of the pair — spare
+# slots cost KV cache, a missing one costs the whole worker.
+# See ARCHITECTURE.md, "Why the engine is twice the declaration".
+ENGINE_SLOTS_PER_DECLARED=2
+ENGINE_SLOTS=$(( DECLARED_INFLIGHT * ENGINE_SLOTS_PER_DECLARED ))
 # How many engines share ONE card, each with its own miner and therefore its own gateway worker.
 # The card is not the constraint on an H200/B200 — prod measured 2 concurrent requests across eight
 # engines — so this exists to buy routing share, which the gateway hands out per WORKER.
@@ -238,7 +246,7 @@ start_engine() {
         --served-model-name Qwen3.6 --tp-size 1 --trust-remote-code \
         --kv-cache-dtype fp8_e4m3 \
         --mem-fraction-static "$(engine_mem_fraction "$(( index % ENGINES_PER_GPU ))")" \
-        --chunked-prefill-size 8192 --max-running-requests "${PER_ENGINE_REQUESTS}" \
+        --chunked-prefill-size 8192 --max-running-requests "${ENGINE_SLOTS}" \
         --context-length "${CONTEXT_LENGTH}" --enable-return-hidden-states --enable-cache-report \
         --enable-metrics \
         --host 127.0.0.1 --port "${port}" &
@@ -486,7 +494,7 @@ start_miner() {
     name="$(miner_worker_name "${index}")"
     miner_names[index]="${name}"
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
-    MAX_INFLIGHT="${PER_ENGINE_REQUESTS}" \
+    MAX_INFLIGHT="${DECLARED_INFLIGHT}" \
     ENGY_GW_WORKERS="${GATEWAY_WORKERS}" \
     HW_GPUS="1x ${GPU_NAME}" \
     ENGY_WORKER_NAME="${name}" \
@@ -756,8 +764,8 @@ main() {
     assign_engines_to_ports_and_cards
     read_gpu_name_once
     echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) x" \
-         "${PER_ENGINE_REQUESTS} requests at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
-         "of a card each, one miner per engine"
+         "${ENGINE_SLOTS} slots at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
+         "of a card each, one miner per engine declaring ${DECLARED_INFLIGHT}"
 
     export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
     export HF_HOME="${ENGY_HOME}/hf"
