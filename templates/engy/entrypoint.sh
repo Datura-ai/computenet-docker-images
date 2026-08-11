@@ -70,6 +70,14 @@ CACHE_SEED_WAIT_SECONDS="${ENGY_CACHE_SEED_WAIT_SECONDS:-1500}"
 # A miner exiting means something is genuinely wrong (it has its own websocket reconnect loop), so
 # back off before respawning rather than spinning against the gateway.
 MINER_RESTART_BACKOFF_SECONDS="${ENGY_MINER_RESTART_BACKOFF_SECONDS:-60}"
+# Gap between STARTING one miner and the next, so each worker finishes dialing its 8 gateway legs
+# before the following one begins. The gateway claims a worker for capacity probing ~3s after its
+# first HELLO and judges it on the legs live AT THAT MOMENT — a worker caught mid-dial is failed
+# outright with "offered N distinct clean legs, below the required 8" and earns nothing until
+# someone re-onboards it. Measured on an 8-card node (2026-08-10): all 8 miners started in the same
+# pass, 64 handshakes raced, and two workers were judged at 7/8 — one of them landed its last leg 15s
+# AFTER the verdict. Started one at a time, a miner's 8 legs settle in about a second.
+MINER_START_STAGGER_SECONDS="${ENGY_MINER_START_STAGGER_SECONDS:-15}"
 # How long engines and miners get to act on TERM during a refusal before they are killed outright.
 REFUSAL_KILL_GRACE_SECONDS="${ENGY_REFUSAL_KILL_GRACE_SECONDS:-10}"
 # Where the miner is refreshed from on every boot, and the switch to stop doing that. Upstream tags
@@ -377,13 +385,21 @@ engine_is_generating() {
 # at, so one sick GPU delayed seven healthy ones by the full timeout. Cards also warm at different
 # speeds, and there is no reason a fast one should wait for a slow one.
 start_miners_as_engines_become_ready() {
-    local deadline=$((SECONDS + ENGINE_READY_TIMEOUT_SECONDS)) index
+    # The deadline covers the readiness WAIT; the staggered starts are added on top so a node with
+    # many cards cannot run out of budget purely because it has more miners to bring up.
+    local deadline=$(( SECONDS + ENGINE_READY_TIMEOUT_SECONDS
+                       + ${#engine_ports[@]} * MINER_START_STAGGER_SECONDS )) index
     mining_engines=0
     while true; do
         for index in "${!engine_ports[@]}"; do
             [[ -n "${miner_pids[$index]:-}" ]] && continue
             if engine_is_generating "${engine_ports[$index]}"; then
                 echo "[engy] engine on port ${engine_ports[$index]} ready"
+                # One miner per pass-through, then a gap: see MINER_START_STAGGER_SECONDS. Starting
+                # the whole ready batch at once is what gets workers judged mid-dial at 7/8 legs.
+                if (( mining_engines > 0 )); then
+                    interruptible_sleep "${MINER_START_STAGGER_SECONDS}"
+                fi
                 start_miner "${index}"
                 mining_engines=$((mining_engines + 1))
             fi
