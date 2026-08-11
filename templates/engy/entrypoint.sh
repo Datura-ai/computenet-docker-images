@@ -17,34 +17,30 @@ MODEL="${MODEL:-qwen3.6-35b-a3b}"
 CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
 CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
+# The gateway's worker count when GW/meta cannot be read. Every miner must hold one leg per gateway
+# worker or it is refused onboarding, so this stands in for the live count everywhere the live count
+# is not available yet — the real one (resolve_gateway_worker_count) always wins over it.
+ASSUMED_GATEWAY_WORKERS=8
 # What ONE miner declares to the gateway as MAX_INFLIGHT.
-# 8 is a FLOOR, not a preference: the miner derives its gateway connection count from this number
-# (see _leg_plan), the gateway runs 8 workers, and a miner holding fewer than 8 connections is
-# refused onboarding outright — "offered N distinct clean legs, below the required 8". Measured by
-# running this image at 4: instant failure, zero traffic, ever.
-# See ARCHITECTURE.md, "Why every miner declares exactly 8".
-GATEWAY_REQUIRED_INFLIGHT=8
-DECLARED_INFLIGHT="${ENGY_DECLARED_INFLIGHT:-${GATEWAY_REQUIRED_INFLIGHT}}"
+# The gateway's worker count is a FLOOR, not a preference: the miner derives its connection count
+# from this number (see _leg_plan), and a miner holding fewer connections than the gateway has
+# workers is refused onboarding outright — "offered N distinct clean legs, below the required 8".
+# Measured by running this image at 4: instant failure, zero traffic, ever.
+# See ARCHITECTURE.md, "Why a miner declares one inflight per gateway worker".
+DECLARED_INFLIGHT="${ENGY_DECLARED_INFLIGHT:-${ASSUMED_GATEWAY_WORKERS}}"
 # Checked as text before any arithmetic: under `set -u` a non-numeric value makes (( )) treat it as
 # an unset variable NAME and kill the script here, before the log capture that would explain why.
 if [[ ! "${DECLARED_INFLIGHT}" =~ ^[0-9]+$ ]]; then
     echo "[engy] ENGY_DECLARED_INFLIGHT='${DECLARED_INFLIGHT}' is not a number;" \
-         "using ${GATEWAY_REQUIRED_INFLIGHT}." >&2
-    DECLARED_INFLIGHT="${GATEWAY_REQUIRED_INFLIGHT}"
+         "using ${ASSUMED_GATEWAY_WORKERS}." >&2
+    DECLARED_INFLIGHT="${ASSUMED_GATEWAY_WORKERS}"
 fi
-if (( DECLARED_INFLIGHT < GATEWAY_REQUIRED_INFLIGHT )); then
-    echo "[engy] ENGY_DECLARED_INFLIGHT=${DECLARED_INFLIGHT} is below the gateway's floor;" \
-         "using ${GATEWAY_REQUIRED_INFLIGHT} instead — a lower value earns nothing at all." >&2
-    DECLARED_INFLIGHT="${GATEWAY_REQUIRED_INFLIGHT}"
-fi
-# How many request slots the ENGINE holds, as a multiple of what the miner declares. These used to
-# be one number, which left exactly one slot per gateway leg: our own /health_generate then queued a
-# leg behind itself and the prober, which requires all 8 legs to serve CONCURRENTLY, failed the
-# worker with "served only 7 CONCURRENT legs". The engine is the cheap side of the pair — spare
-# slots cost KV cache, a missing one costs the whole worker.
-# See ARCHITECTURE.md, "Why the engine is twice the declaration".
-ENGINE_SLOTS_PER_DECLARED=2
-ENGINE_SLOTS=$(( DECLARED_INFLIGHT * ENGINE_SLOTS_PER_DECLARED ))
+# The gateway never sends more than the declaration, so the only slots it cannot fill are ours: the
+# supervisor's /health_generate, and a leg that has not drained. Without them the prober, which
+# needs every leg serving CONCURRENTLY, fails the worker with "served only 7 CONCURRENT legs".
+# Additive on purpose — a multiplier would grow this with the gateway, which nothing requires.
+# See ARCHITECTURE.md, "Why the engine holds more than it declares".
+ENGINE_SLOTS_FOR_OUR_OWN_PROBES=2
 # How many engines share ONE card, each with its own miner and therefore its own gateway worker.
 # The card is not the constraint on an H200/B200 — prod measured 2 concurrent requests across eight
 # engines — so this exists to buy routing share, which the gateway hands out per WORKER.
@@ -466,7 +462,6 @@ read_gpu_name_once() {
 # a split card while the first was fine — and with N miners per container the blip gets N chances.
 # So: ask once, retry, and hand every miner the answer through upstream's own ENGY_GW_WORKERS
 # override. The fallback is the gateway's known count, never upstream's 1, which cannot onboard.
-GATEWAY_WORKERS_WHEN_UNREACHABLE=8
 resolve_gateway_worker_count() {
     local meta_url count attempt
     meta_url="${GW/#wss:/https:}"
@@ -484,9 +479,23 @@ resolve_gateway_worker_count() {
         fi
         interruptible_sleep 2
     done
-    GATEWAY_WORKERS="${GATEWAY_WORKERS_WHEN_UNREACHABLE}"
+    GATEWAY_WORKERS="${ASSUMED_GATEWAY_WORKERS}"
     echo "[engy] could not read ${meta_url} in 3 tries; assuming ${GATEWAY_WORKERS} gateway worker(s)" \
          "— the stock miner would have assumed 1 and been refused onboarding" >&2
+}
+
+# A declaration below the gateway's worker count is fatal, not suboptimal: _leg_plan opens
+# `declared` legs instead of one per worker, and a worker short of a leg is refused. So the floor is
+# the LIVE count, never a constant — hard-coding 8 next to a number the gateway is free to change is
+# how a whole fleet stops onboarding overnight.
+size_declaration_and_engine_to_the_gateway() {
+    if (( DECLARED_INFLIGHT < GATEWAY_WORKERS )); then
+        echo "[engy] ENGY_DECLARED_INFLIGHT=${DECLARED_INFLIGHT} is below the gateway's" \
+             "${GATEWAY_WORKERS} worker(s); declaring ${GATEWAY_WORKERS} instead — one leg short" \
+             "earns nothing at all." >&2
+        DECLARED_INFLIGHT="${GATEWAY_WORKERS}"
+    fi
+    ENGINE_SLOTS=$(( DECLARED_INFLIGHT + ENGINE_SLOTS_FOR_OUR_OWN_PROBES ))
 }
 
 start_miner() {
@@ -763,6 +772,13 @@ main() {
     size_engines_to_the_card
     assign_engines_to_ports_and_cards
     read_gpu_name_once
+    # Before the engines, unlike the miner refresh below: an engine's slot count is fixed at launch,
+    # and it can only be sized once the declaration is settled against the gateway's real count.
+    # This used to ride the free window while the engines loaded; sizing them costs that overlap,
+    # which is up to ~36s of retries against an unreachable gateway — against a 10-20 minute JIT,
+    # and against a gateway there would be nothing to onboard to anyway.
+    resolve_gateway_worker_count
+    size_declaration_and_engine_to_the_gateway
     echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) x" \
          "${ENGINE_SLOTS} slots at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
          "of a card each, one miner per engine declaring ${DECLARED_INFLIGHT}"
@@ -786,10 +802,8 @@ main() {
 
     start_metrics_sidecar
     # After the engines are spawned, not before: the miner is not needed until they are ready, and a
-    # slow GitHub would otherwise add a minute of dead time to every cold start. The gateway's leg
-    # count is a miner prerequisite too, and its retries ride the same free window.
+    # slow GitHub would otherwise add a minute of dead time to every cold start.
     refresh_vendored_miner
-    resolve_gateway_worker_count
 
     # One card that never comes up costs one card. This used to end the container, which was right
     # when a single miner fronted every engine — losing one engine lost the worker anyway. With a

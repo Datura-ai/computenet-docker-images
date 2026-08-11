@@ -102,23 +102,29 @@ follows worker count. If it routes by hotkey and splits the same work over more 
 per card is the same tokens at twice the acceptance surface — a loss. The baseline to beat is
 118,540 tokens/GPU-h.
 
-## Why every miner declares exactly 8
+## Why a miner declares one inflight per gateway worker
 
 `ENGY_DECLARED_INFLIGHT` (default **8**) is what one miner declares to the gateway as
-`MAX_INFLIGHT`. **8 is a floor, not a tuning choice.**
+`MAX_INFLIGHT`. **The gateway's worker count is a floor, not a tuning choice.**
 
 The miner derives its gateway connection count from this number (`_leg_plan`): when `MAX_INFLIGHT`
-is below the gateway's worker count it opens that many connections instead, one inflight each. The
-gateway runs 8 workers, and a worker holding fewer than 8 connections is refused before it ever
-serves anything — the portal says so in as many words: *"Qualification and sampling only target
-workers with all 8 legs live, so it will receive no test traffic — and cannot be onboarded — until
-every leg connects."*
+is below the gateway's worker count it opens that many connections instead, one inflight each. A
+worker holding fewer connections than the gateway has workers is refused before it ever serves
+anything — the portal says so in as many words: *"Qualification and sampling only target workers
+with all 8 legs live, so it will receive no test traffic — and cannot be onboarded — until every leg
+connects."*
 
 Measured by running this image at 4 on a rented H100 (2026-07-30): the worker connected, opened four
 connections, and was failed in three seconds with `offered 4 distinct clean legs, below the required
-8`. Zero requests, ever. **Never set this below 8.** The entrypoint no longer lets anyone: a lower
-override is logged and raised back to 8, because a knob whose wrong value silently earns nothing is
-a trap, not a setting.
+8`. Zero requests, ever. The entrypoint no longer lets anyone go under: `size_declaration_and_engine_to_the_gateway`
+raises a short declaration to the count `resolve_gateway_worker_count` just read from `GW/meta`,
+because a knob whose wrong value silently earns nothing is a trap, not a setting.
+
+**The floor is that live count, never the constant 8.** The gateway runs 8 workers today, and 8 is
+what the entrypoint assumes when `GW/meta` cannot be read — but hard-coding it next to a number engy
+is free to change is how a whole fleet stops onboarding overnight. Sizing against the live count is
+also why the container asks the gateway BEFORE it launches an engine: an engine's slot count is
+fixed at launch, and it is sized from the settled declaration.
 
 Above 8 buys nothing either. Same box, same day: declaring 8 drew a burst of 8 concurrent; declaring
 **64 drew the same burst of 8**. The number we declare is an admission ticket, not a throttle — the
@@ -127,11 +133,11 @@ over a 7-minute sample. 481 of the network's 635 workers declare 8; only 7 decla
 this change we were one of them. Re-read on 2026-08-11 as the network grew: **2250 of 2305 workers
 declare 8**, 46 declare 16. Declaring 8 is what everyone who gets routed does.
 
-## Why the engine is twice the declaration
+## Why the engine holds more than it declares
 
-sglang's `--max-running-requests` is NOT the declaration. It is `ENGY_DECLARED_INFLIGHT` x
-`ENGINE_SLOTS_PER_DECLARED` (**2**), so the default shape is a worker that advertises 8 and an engine
-that holds 16.
+sglang's `--max-running-requests` is NOT the declaration. It is the declaration plus
+`ENGINE_SLOTS_FOR_OUR_OWN_PROBES` (**2**), so the default shape is a worker that advertises 8 and an
+engine that holds 10.
 
 The two used to be the same number, and that is a bug with a name. The miner splits `MAX_INFLIGHT`
 into one inflight per gateway leg, so at 8 the engine had exactly one slot per leg and no spare.
@@ -145,8 +151,13 @@ was never the fix, it just happened to buy the engine a spare slot. Prod paid fo
 twice — DAH-2603 rolled 16 back to 8 on 2026-08-06 reading the symptom backwards, and prod
 onboarding failed from that day until DAH-2601 rolled it forward again on 2026-08-11.
 
-Spare engine slots cost KV cache and nothing else; a missing one costs the entire worker. That is
-why the multiplier lives in the image as a constant rather than as one more knob to get wrong.
+**Additive, not a multiplier.** The gateway never sends more than the declaration — declaring 8 drew
+a burst of 8, declaring 64 drew the same 8 — so the only slots it cannot fill are the ones this
+container takes: `engine_is_generating`'s `/health_generate` in the supervisor loop, and a leg that
+has not drained. That is a constant two, and it must stay constant: doubling the declaration instead
+would silently take a 16-worker gateway to 32 concurrent sequences on one card's KV pool, which is
+the preemption-and-prefill-recompute cost this file warns about under the split. Spare slots cost
+nothing while they sit idle; a missing one costs the entire worker.
 
 ## Why worker ids are random again
 

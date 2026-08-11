@@ -34,7 +34,7 @@ supervisor: one dead card costs one card, not the node. See ARCHITECTURE.md.
 | `MINER_KEY` | **yes** | — | gateway key from provider.engy.ai, bound to a registered SN53 hotkey |
 | `GW` | no | `wss://api.engy.ai/gw` | gateway websocket |
 | `MODEL` | no | `qwen3.6-35b-a3b` | the gateway's model id |
-| `ENGY_DECLARED_INFLIGHT` | no | `8` | what each miner declares as `MAX_INFLIGHT`; 8 is the gateway's onboarding floor, so lower values are raised back to it. The engine is sized at twice this — see ARCHITECTURE.md, "Why the engine is twice the declaration" |
+| `ENGY_DECLARED_INFLIGHT` | no | `8` | what each miner declares as `MAX_INFLIGHT`; the gateway's live worker count is the floor, so lower values are raised to it at startup. The engine is sized at this plus room for our own probes — see ARCHITECTURE.md, "Why the engine holds more than it declares" |
 | `ENGY_ENGINES_PER_GPU` | no | `1` | engines sharing one card, each with its own miner and gateway worker; clamped to what the card's VRAM holds at 48GB per engine |
 | `ENGY_WORKER_NAME` | no | hostname | prefix for the per-card worker names; must be unique per machine |
 | `ENGY_MINER_AUTO_UPDATE` | no | `1` | refresh the miner from upstream on boot; `0` pins the image's copy |

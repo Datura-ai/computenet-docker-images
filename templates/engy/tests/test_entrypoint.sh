@@ -15,6 +15,24 @@ pass() { echo "  ok: $*"; }
 
 # One sandbox per case: stub bin dir, a fake checkpoint so no download is attempted, and a log the
 # stubs append their argv to.
+# Restubs curl so the gateway's /meta answers with the given worker count, like the real one. Call
+# it after new_sandbox to override the default of 8.
+gateway_reports_workers() {
+    { echo '#!/usr/bin/env bash'
+      echo "case \"\$*\" in *\"/meta\"*) echo '{\"workers\":$1,\"instance\":\"test\"}' ;; esac; exit 0"
+    } >"${SANDBOX}/bin/curl"
+    chmod +x "${SANDBOX}/bin/curl"
+}
+
+# Same, plus /health_generate always failing, so no engine ever reports ready. /meta still has to
+# answer: the entrypoint asks for the gateway's worker count before it launches an engine.
+no_engine_ever_becomes_ready() {
+    { echo '#!/usr/bin/env bash'
+      echo 'case "$*" in *health_generate*) exit 7 ;; *"/meta"*) echo "{\"workers\":8}" ;; esac; exit 0'
+    } >"${SANDBOX}/bin/curl"
+    chmod +x "${SANDBOX}/bin/curl"
+}
+
 new_sandbox() {
     local gpu_count="$1" card_mb="${2:-143771}"     # an H200 unless the case says otherwise
     SANDBOX="$(mktemp -d)"
@@ -27,12 +45,9 @@ new_sandbox() {
       echo "case \"\$*\" in *memory.total*) for _ in \$(seq 1 ${gpu_count}); do echo ${card_mb}; done ;;"
       echo "                *) seq 0 $((gpu_count - 1)) ;; esac"
     } >"${SANDBOX}/bin/nvidia-smi"
-    # Every engine reports ready immediately; the supervisor loop then sees them healthy, and
-    # the gateway's /meta answers with its worker count like the real one.
-    { echo '#!/usr/bin/env bash'
-      echo 'case "$*" in *"/meta"*) echo "{\"workers\":8,\"instance\":\"test\"}" ;; esac; exit 0'
-    } >"${SANDBOX}/bin/curl"
+    # Every engine reports ready immediately; the supervisor loop then sees them healthy.
     { echo '#!/usr/bin/env bash'; echo 'exit 0'; } >"${SANDBOX}/bin/hf"
+    gateway_reports_workers 8
     # python3 records how it was invoked and, for the miner, blocks so the loop does not spin.
     cat >"${SANDBOX}/bin/python3" <<'STUB'
 #!/usr/bin/env bash
@@ -207,8 +222,7 @@ echo "== the second engine on a card waits for the first to load =="
 # card and the second ends up with no pool at all.
 new_sandbox 1
 # Nothing ever becomes ready, so slot 0 never finishes loading and slot 1 must stay unstarted.
-{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *health_generate*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
-chmod +x "${SANDBOX}/bin/curl"
+no_engine_ever_becomes_ready
 CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
     ENGY_MINER_DIR="${SANDBOX}/miner" \
     env MINER_KEY=mk-test ENGY_ENGINES_PER_GPU=2 ENGY_CACHE_SEED_WAIT_SECONDS=2 \
@@ -305,17 +319,23 @@ grep -q "is not a positive number" "${SANDBOX}/out.log" \
     && pass "and the fallback is logged" || fail "fell back silently"
 rm -rf "${SANDBOX}"
 
-echo "== the default declared concurrency is the onboarding floor, not lower =="
+echo "== a miner declares one inflight per gateway worker, and the engine holds more =="
 # The miner derives its gateway connection count from MAX_INFLIGHT, and a worker holding fewer than
-# the gateway's 8 connections is refused onboarding outright. Measured on a rented H100: declaring 4
+# the gateway's connections is refused onboarding outright. Measured on a rented H100: declaring 4
 # failed in three seconds with "offered 4 distinct clean legs, below the required 8", zero traffic.
+# The engine then needs slots the gateway will never fill: our own /health_generate takes one, and
+# at one slot per leg it queues a leg behind itself — "served only 7 CONCURRENT legs", every HTTP
+# response a 200 (clean A/B on one H100, 2026-08-10: engine at 8 failed, engine at 16 passed).
 new_sandbox 2
 run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
 if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
     fail "default declared concurrency is not 8: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "with no override every miner declares 8"
+    pass "with no override every miner declares the gateway's 8"
 fi
+grep -q -- "--max-running-requests 10" "${SANDBOX}/calls.log" \
+    && pass "and the engine holds those 8 plus room for our own probes" \
+    || fail "engine slots do not clear the declaration: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
 rm -rf "${SANDBOX}"
 
 new_sandbox 2
@@ -323,20 +343,8 @@ run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARE
 if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
     fail "an override below the floor reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "an override below the floor is raised back to 8 instead of earning nothing"
+    pass "an override below the gateway's count is raised back instead of earning nothing"
 fi
-rm -rf "${SANDBOX}"
-
-echo "== the engine holds more requests than the miner declares =="
-# The prober requires all 8 legs to serve CONCURRENTLY. One engine slot per leg means our own
-# /health_generate queues a leg behind itself and the worker is failed with "served only 7
-# CONCURRENT legs" — the whole failure mode is the missing slack, not the declared number
-# (clean A/B on one H100, 2026-08-10: declared 8 failed, declared 16 passed, same box and image).
-new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
-grep -q -- "--max-running-requests 16" "${SANDBOX}/calls.log" \
-    && pass "the default declaration of 8 runs the engine at 16" \
-    || fail "engine slots are not twice the declaration: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
 rm -rf "${SANDBOX}"
 
 new_sandbox 2
@@ -344,10 +352,10 @@ run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARE
 if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=12"; then
     fail "an override above the floor did not reach the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "an override above the floor is declared as given"
+    pass "an override above the gateway's count is declared as given"
 fi
-grep -q -- "--max-running-requests 24" "${SANDBOX}/calls.log" \
-    && pass "and the engine follows it at twice the size" \
+grep -q -- "--max-running-requests 14" "${SANDBOX}/calls.log" \
+    && pass "and the engine's headroom follows it" \
     || fail "engine slots did not follow the override: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
 rm -rf "${SANDBOX}"
 
@@ -356,10 +364,27 @@ run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARE
 if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
     fail "a non-numeric declaration reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "a non-numeric declaration falls back to the floor"
+    pass "a non-numeric declaration falls back to the assumed count"
 fi
 grep -q "is not a number" "${SANDBOX}/out.log" \
     && pass "and the fallback is logged" || fail "fell back silently"
+rm -rf "${SANDBOX}"
+
+echo "== the floor is the gateway's LIVE worker count, not a constant =="
+# _leg_plan opens `declared` legs when the declaration is under the gateway's worker count, and a
+# worker one leg short is refused. So a gateway that grows past 8 must raise the declaration with
+# it: hard-coding the floor would take the whole fleet offline the day engy adds a worker.
+new_sandbox 2
+gateway_reports_workers 12
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=8
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=12"; then
+    fail "the declaration stayed under the gateway's 12 workers: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "a 12-worker gateway raises the declaration from 8 to 12"
+fi
+grep -q -- "--max-running-requests 14" "${SANDBOX}/calls.log" \
+    && pass "and the engine is sized against the raised declaration" \
+    || fail "engine slots were sized before the gateway was asked: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
 rm -rf "${SANDBOX}"
 
 echo "== the event-loop lag probe is wired up =="
@@ -417,8 +442,7 @@ echo "== the first engine seeds the shared kernel cache before the rest start ==
 # every engine pays that 10-20 minute compile and they race over the same files.
 new_sandbox 4
 # Nothing is ever ready, so the seed wait runs to its (short) budget and we can see the ordering.
-{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *health_generate*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
-chmod +x "${SANDBOX}/bin/curl"
+no_engine_ever_becomes_ready
 CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
     ENGY_MINER_DIR="${SANDBOX}/miner" \
     env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=20 ENGY_ENGINE_READY_TIMEOUT_SECONDS=2 ENGY_MINER_START_STAGGER_SECONDS=0 \
@@ -468,8 +492,7 @@ rm -rf "${SANDBOX}"
 
 echo "== a node where nothing came up is still refused =="
 new_sandbox 2
-{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *health_generate*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
-chmod +x "${SANDBOX}/bin/curl"
+no_engine_ever_becomes_ready
 PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" ENGY_MINER_DIR="${SANDBOX}/miner" \
     CALLS_LOG="${SANDBOX}/calls.log" \
     env MINER_KEY=mk-test ENGY_ENGINE_READY_TIMEOUT_SECONDS=3 ENGY_CACHE_SEED_WAIT_SECONDS=5 ENGY_MINER_START_STAGGER_SECONDS=0 bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
@@ -531,8 +554,7 @@ echo "== a container that refuses to start actually exits =="
 # Killing the sidecar subshell leaves its python holding the log pipe, so refuse_to_start's wait
 # for the pipe never returns and the container hangs instead of refusing. Reproduced on bare bash.
 new_sandbox 2
-{ echo '#!/usr/bin/env bash'; echo 'case "$*" in *health_generate*) exit 7 ;; esac; exit 0'; } >"${SANDBOX}/bin/curl"
-chmod +x "${SANDBOX}/bin/curl"
+no_engine_ever_becomes_ready
 CALLS_LOG="${SANDBOX}/calls.log" PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" \
     ENGY_MINER_DIR="${SANDBOX}/miner" \
     env MINER_KEY=mk-test METRICS_TOKEN=t ENGY_CACHE_SEED_WAIT_SECONDS=2 ENGY_MINER_START_STAGGER_SECONDS=0 \
