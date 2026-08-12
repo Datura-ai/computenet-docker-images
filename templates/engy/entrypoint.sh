@@ -21,19 +21,22 @@ CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
 # worker or it is refused onboarding, so this stands in for the live count everywhere the live count
 # is not available yet — the real one (resolve_gateway_worker_count) always wins over it.
 ASSUMED_GATEWAY_WORKERS=8
-# What ONE miner declares to the gateway as MAX_INFLIGHT.
-# The gateway's worker count is a FLOOR, not a preference: the miner derives its connection count
-# from this number (see _leg_plan), and a miner holding fewer connections than the gateway has
-# workers is refused onboarding outright — "offered N distinct clean legs, below the required 8".
-# Measured by running this image at 4: instant failure, zero traffic, ever.
-# See ARCHITECTURE.md, "Why a miner declares one inflight per gateway worker".
-DECLARED_INFLIGHT="${ENGY_DECLARED_INFLIGHT:-${ASSUMED_GATEWAY_WORKERS}}"
+# How much ONE gateway leg may hold. The miner splits its declaration evenly across the legs
+# (_leg_plan), so this — not the total — is the number onboarding actually turns on, and the total
+# is derived from it once the live leg count is known.
+# Measured A/B on a rented H100x8 (2026-08-12), same image and box, only this changed: at 2 the node
+# onboarded 6 of 8, failing the other two with "served only 7 concurrent legs" and "offered 7
+# distinct clean legs" — the pair prod shows — and at 3 it onboarded 8 of 8, neither failure in 16
+# worker-starts. See ARCHITECTURE.md, "Why a leg needs three inflight, not one".
+MEASURED_REQUESTS_PER_GATEWAY_LEG=3
+REQUESTS_PER_GATEWAY_LEG="${ENGY_REQUESTS_PER_GATEWAY_LEG:-${MEASURED_REQUESTS_PER_GATEWAY_LEG}}"
 # Checked as text before any arithmetic: under `set -u` a non-numeric value makes (( )) treat it as
 # an unset variable NAME and kill the script here, before the log capture that would explain why.
-if [[ ! "${DECLARED_INFLIGHT}" =~ ^[0-9]+$ ]]; then
-    echo "[engy] ENGY_DECLARED_INFLIGHT='${DECLARED_INFLIGHT}' is not a number;" \
-         "using ${ASSUMED_GATEWAY_WORKERS}." >&2
-    DECLARED_INFLIGHT="${ASSUMED_GATEWAY_WORKERS}"
+# Zero is refused with it — a leg that may hold nothing is routed nothing, and earns nothing.
+if [[ ! "${REQUESTS_PER_GATEWAY_LEG}" =~ ^[0-9]+$ ]] || (( REQUESTS_PER_GATEWAY_LEG < 1 )); then
+    echo "[engy] ENGY_REQUESTS_PER_GATEWAY_LEG='${REQUESTS_PER_GATEWAY_LEG}' is not a positive" \
+         "number; using ${MEASURED_REQUESTS_PER_GATEWAY_LEG}." >&2
+    REQUESTS_PER_GATEWAY_LEG="${MEASURED_REQUESTS_PER_GATEWAY_LEG}"
 fi
 # The gateway never sends more than the declaration, so the only slots it cannot fill are ours: the
 # supervisor's /health_generate, and a leg that has not drained. Without them the prober, which
@@ -484,17 +487,11 @@ resolve_gateway_worker_count() {
          "— the stock miner would have assumed 1 and been refused onboarding" >&2
 }
 
-# A declaration below the gateway's worker count is fatal, not suboptimal: _leg_plan opens
-# `declared` legs instead of one per worker, and a worker short of a leg is refused. So the floor is
-# the LIVE count, never a constant — hard-coding 8 next to a number the gateway is free to change is
-# how a whole fleet stops onboarding overnight.
+# Per-leg capacity is what was measured, so the total is derived from the LIVE leg count rather
+# than configured: pin the total instead and the day engy runs 12 legs every worker silently drops
+# to 2 per leg, which is the configuration the A/B lost two cards out of eight on.
 size_declaration_and_engine_to_the_gateway() {
-    if (( DECLARED_INFLIGHT < GATEWAY_WORKERS )); then
-        echo "[engy] ENGY_DECLARED_INFLIGHT=${DECLARED_INFLIGHT} is below the gateway's" \
-             "${GATEWAY_WORKERS} worker(s); declaring ${GATEWAY_WORKERS} instead — one leg short" \
-             "earns nothing at all." >&2
-        DECLARED_INFLIGHT="${GATEWAY_WORKERS}"
-    fi
+    DECLARED_INFLIGHT=$(( REQUESTS_PER_GATEWAY_LEG * GATEWAY_WORKERS ))
     ENGINE_SLOTS=$(( DECLARED_INFLIGHT + ENGINE_SLOTS_FOR_OUR_OWN_PROBES ))
 }
 

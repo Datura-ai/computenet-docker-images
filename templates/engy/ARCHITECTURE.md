@@ -102,42 +102,55 @@ follows worker count. If it routes by hotkey and splits the same work over more 
 per card is the same tokens at twice the acceptance surface — a loss. The baseline to beat is
 118,540 tokens/GPU-h.
 
-## Why a miner declares one inflight per gateway worker
+## Why a leg needs three inflight, not one
 
-`ENGY_DECLARED_INFLIGHT` (default **8**) is what one miner declares to the gateway as
-`MAX_INFLIGHT`. **The gateway's worker count is a floor, not a tuning choice.**
+`ENGY_REQUESTS_PER_GATEWAY_LEG` (default **3**) is the knob. The total a miner declares as
+`MAX_INFLIGHT` is derived from it — per-leg times the gateway's live leg count, so 24 against
+today's 8 — and is never configured directly.
 
-The miner derives its gateway connection count from this number (`_leg_plan`): when `MAX_INFLIGHT`
-is below the gateway's worker count it opens that many connections instead, one inflight each. A
-worker holding fewer connections than the gateway has workers is refused before it ever serves
-anything — the portal says so in as many words: *"Qualification and sampling only target workers
-with all 8 legs live, so it will receive no test traffic — and cannot be onboarded — until every leg
-connects."*
+**Per leg is the unit that matters because that is the unit the miner uses.** `_leg_plan` splits the
+declaration evenly across the legs, so a total only ever reaches the gateway as a per-leg number;
+configuring the total means configuring the per-leg value by accident, and getting it wrong the day
+engy changes its leg count. Below one per leg it is worse than wrong: `_leg_plan` opens `declared`
+legs instead of one per worker, and a worker short of a leg is refused before it serves anything.
+The portal says so in as many words: *"Qualification and sampling only target workers with all 8
+legs live, so it will receive no test traffic — and cannot be onboarded — until every leg
+connects."* Measured by running this image at a total of 4 on a rented H100 (2026-07-30): the worker
+connected, opened four connections, and was failed in three seconds with `offered 4 distinct clean
+legs, below the required 8`. Zero requests, ever.
 
-Measured by running this image at 4 on a rented H100 (2026-07-30): the worker connected, opened four
-connections, and was failed in three seconds with `offered 4 distinct clean legs, below the required
-8`. Zero requests, ever. The entrypoint no longer lets anyone go under: `size_declaration_and_engine_to_the_gateway`
-raises a short declaration to the count `resolve_gateway_worker_count` just read from `GW/meta`,
-because a knob whose wrong value silently earns nothing is a trap, not a setting.
+**Three is measured, not chosen.** Clean A/B on one rented H100x8 (2026-08-12) — same image `0.0.7`,
+same box, same hour, warm weights, nothing but this number different:
 
-**The floor is that live count, never the constant 8.** The gateway runs 8 workers today, and 8 is
-what the entrypoint assumes when `GW/meta` cannot be read — but hard-coding it next to a number engy
-is free to change is how a whole fleet stops onboarding overnight. Sizing against the live count is
-also why the container asks the gateway BEFORE it launches an engine: an engine's slot count is
-fixed at launch, and it is sized from the settled declaration.
+| per leg | declared | onboarded | failures |
+|---|---|---|---|
+| 2 | 16 | **6 of 8** | `served only 7 concurrent legs`, `offered 7 distinct clean legs`, one each, both on attempt 1 |
+| 3 | 24 | **8 of 8** | none, across 16 worker-starts |
 
-Above 8 buys nothing either. Same box, same day: declaring 8 drew a burst of 8 concurrent; declaring
-**64 drew the same burst of 8**. The number we declare is an admission ticket, not a throttle — the
-gateway sends what it wants to send. Prod, meanwhile, sat at 2 concurrent across all eight engines
-over a 7-minute sample. 481 of the network's 635 workers declare 8; only 7 declare 64, and until
-this change we were one of them. Re-read on 2026-08-11 as the network grew: **2250 of 2305 workers
-declare 8**, 46 declare 16. Declaring 8 is what everyone who gets routed does.
+Prod runs 2 per leg and sits at exactly 6 active + 2 failed with that same pair of reasons, so the
+control reproduced prod's split on the first try. The two failure strings are two stages of one
+shortfall — `offered 7 distinct clean legs` is the dial stage, `served only 7 concurrent legs` the
+serve stage — and at 3 per leg neither appears. Why a third slot is enough: the prober needs all 8
+legs serving *concurrently*, and each probe prompt is ~12.9k tokens against a
+`--chunked-prefill-size` of 8192, so sglang admits one sequence per prefill pass (`#new-seq: 1`) and
+the legs enter the running batch serially over ~1.2s. At 2 per leg anything else holding a leg
+during that ramp leaves seven; the third slot is the margin that ramp needs.
+
+**The total tracks the live leg count, never a constant.** The gateway runs 8 legs today, and 8 is
+what the entrypoint assumes when `GW/meta` cannot be read — but pinning 24 would silently become 2
+per leg the day engy runs 12, which is the configuration that loses two cards out of eight. Sizing
+against the live count is also why the container asks the gateway BEFORE it launches an engine: an
+engine's slot count is fixed at launch, and it is sized from the settled declaration.
+
+The declaration is an admission ticket, not a throttle: same box, same day, declaring 8 drew a burst
+of 8 concurrent and declaring **64 drew the same burst of 8**. Raising it does not pull more
+traffic — it only decides whether onboarding passes.
 
 ## Why the engine holds more than it declares
 
 sglang's `--max-running-requests` is NOT the declaration. It is the declaration plus
-`ENGINE_SLOTS_FOR_OUR_OWN_PROBES` (**2**), so the default shape is a worker that advertises 8 and an
-engine that holds 10.
+`ENGINE_SLOTS_FOR_OUR_OWN_PROBES` (**2**), so the default shape is a worker that advertises 24 and
+an engine that holds 26.
 
 The two used to be the same number, and that is a bug with a name. The miner splits `MAX_INFLIGHT`
 into one inflight per gateway leg, so at 8 the engine had exactly one slot per leg and no spare.

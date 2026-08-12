@@ -140,7 +140,7 @@ echo "== one miner per engine, each declaring only its own engine's capacity =="
 # The GIL is per PROCESS, so one miner driving N engines serialises every hidden-state parse behind
 # one interpreter. One miner per engine turns that single queue into N. See ARCHITECTURE.md.
 new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=8
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
 miners="$(grep -c "engy_launch.py" "${SANDBOX}/calls.log")"
 [[ "${miners}" -eq 2 ]] && pass "2 engines -> 2 miners" || fail "2 engines -> ${miners} miners"
 for port in 8000 8001; do
@@ -150,10 +150,10 @@ done
 pass "each miner drives exactly one engine"
 # Each miner declares its OWN engine's concurrency, never the node total: the probe burst the gateway
 # sends is sized against what a single worker advertises.
-if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
-    fail "a miner declared something other than its engine's 8: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=24"; then
+    fail "a miner declared something other than its engine's 24: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "every miner declares MAX_INFLIGHT=8, not the node sum"
+    pass "every miner declares MAX_INFLIGHT=24, not the node sum"
 fi
 
 echo "== no worker id is pinned, and each card gets its own name =="
@@ -319,70 +319,76 @@ grep -q "is not a positive number" "${SANDBOX}/out.log" \
     && pass "and the fallback is logged" || fail "fell back silently"
 rm -rf "${SANDBOX}"
 
-echo "== a miner declares one inflight per gateway worker, and the engine holds more =="
-# The miner derives its gateway connection count from MAX_INFLIGHT, and a worker holding fewer than
-# the gateway's connections is refused onboarding outright. Measured on a rented H100: declaring 4
-# failed in three seconds with "offered 4 distinct clean legs, below the required 8", zero traffic.
+echo "== a miner declares three inflight per gateway leg, and the engine holds more =="
+# The miner splits its declaration evenly across the gateway's legs (_leg_plan), so the declaration
+# is only ever a way of saying how much ONE leg may hold. Measured A/B on a rented H100x8
+# (2026-08-12), same image, same box, same hour, this number the only difference: 2 per leg
+# onboarded 6 of 8 and failed the other two with "served only 7 concurrent legs" and "offered 7
+# distinct clean legs" — prod's exact pair — while 3 per leg onboarded 8 of 8 and produced neither
+# failure in 16 worker-starts.
 # The engine then needs slots the gateway will never fill: our own /health_generate takes one, and
-# at one slot per leg it queues a leg behind itself — "served only 7 CONCURRENT legs", every HTTP
-# response a 200 (clean A/B on one H100, 2026-08-10: engine at 8 failed, engine at 16 passed).
+# a leg that has not drained holds another.
 new_sandbox 2
 run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
-if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
-    fail "default declared concurrency is not 8: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=24"; then
+    fail "default declaration is not 3 per leg: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "with no override every miner declares the gateway's 8"
+    pass "with no override every miner declares 3 x the gateway's 8 legs"
 fi
-grep -q -- "--max-running-requests 10" "${SANDBOX}/calls.log" \
-    && pass "and the engine holds those 8 plus room for our own probes" \
+grep -q -- "--max-running-requests 26" "${SANDBOX}/calls.log" \
+    && pass "and the engine holds those 24 plus room for our own probes" \
     || fail "engine slots do not clear the declaration: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
 rm -rf "${SANDBOX}"
 
 new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=4
-if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
-    fail "an override below the floor reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_REQUESTS_PER_GATEWAY_LEG=5
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=40"; then
+    fail "an override did not reach the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "an override below the gateway's count is raised back instead of earning nothing"
+    pass "an override is multiplied by the gateway's leg count"
 fi
-rm -rf "${SANDBOX}"
-
-new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=12
-if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=12"; then
-    fail "an override above the floor did not reach the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
-else
-    pass "an override above the gateway's count is declared as given"
-fi
-grep -q -- "--max-running-requests 14" "${SANDBOX}/calls.log" \
+grep -q -- "--max-running-requests 42" "${SANDBOX}/calls.log" \
     && pass "and the engine's headroom follows it" \
     || fail "engine slots did not follow the override: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
 rm -rf "${SANDBOX}"
 
+# Zero per leg is a worker with no capacity at all: the gateway routes it nothing and it earns
+# nothing, silently, which is worse than refusing the value.
 new_sandbox 2
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=abc
-if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=8"; then
-    fail "a non-numeric declaration reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_REQUESTS_PER_GATEWAY_LEG=0
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=24"; then
+    fail "zero per leg reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "a non-numeric declaration falls back to the assumed count"
+    pass "zero per leg falls back to the measured 3"
 fi
-grep -q "is not a number" "${SANDBOX}/out.log" \
+grep -q "is not a positive number" "${SANDBOX}/out.log" \
     && pass "and the fallback is logged" || fail "fell back silently"
 rm -rf "${SANDBOX}"
 
-echo "== the floor is the gateway's LIVE worker count, not a constant =="
-# _leg_plan opens `declared` legs when the declaration is under the gateway's worker count, and a
-# worker one leg short is refused. So a gateway that grows past 8 must raise the declaration with
-# it: hard-coding the floor would take the whole fleet offline the day engy adds a worker.
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_REQUESTS_PER_GATEWAY_LEG=abc
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=24"; then
+    fail "a non-numeric value reached the gateway: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+else
+    pass "a non-numeric value falls back to the measured 3"
+fi
+grep -q "is not a positive number" "${SANDBOX}/out.log" \
+    && pass "and the fallback is logged" || fail "fell back silently"
+rm -rf "${SANDBOX}"
+
+echo "== the declaration is sized on the gateway's LIVE leg count, not a constant =="
+# Per-leg capacity is the thing that was measured, so the total has to track the gateway: hard-code
+# 24 and the day engy runs 12 legs every worker silently drops to 2 per leg — the configuration the
+# A/B showed losing two cards out of eight.
 new_sandbox 2
 gateway_reports_workers 12
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_DECLARED_INFLIGHT=8
-if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=12"; then
-    fail "the declaration stayed under the gateway's 12 workers: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+if grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -qv "MAX_INFLIGHT=36"; then
+    fail "the declaration ignored the gateway's 12 legs: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
 else
-    pass "a 12-worker gateway raises the declaration from 8 to 12"
+    pass "a 12-leg gateway raises the declaration to 36, keeping 3 per leg"
 fi
-grep -q -- "--max-running-requests 14" "${SANDBOX}/calls.log" \
+grep -q -- "--max-running-requests 38" "${SANDBOX}/calls.log" \
     && pass "and the engine is sized against the raised declaration" \
     || fail "engine slots were sized before the gateway was asked: $(grep -o -- '--max-running-requests [0-9]*' "${SANDBOX}/calls.log" | head -1)"
 rm -rf "${SANDBOX}"
