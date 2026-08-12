@@ -88,10 +88,10 @@ What it costs: acceptance is scored per **hotkey**, so twice the workers is twic
 bad capacity probe to drag the key's day. Each worker also needs its own 8 clean gateway legs. Both
 are why this ships defaulting to 1 and is turned up per environment.
 
-Watch the KV cache when you turn it up: `ENGY_MAX_RUNNING_REQUESTS` does NOT split with the pool, so
-at 2 engines on an H200 each one serves 16 concurrent requests out of ~25GB of KV instead of ~87GB.
-Preemption and prefill recompute would show up as tokens/GPU-h below the baseline rather than as an
-error.
+Watch the KV cache when you turn it up: the engine's slot count does NOT split with the pool, so at
+2 engines on an H200 each one still holds 26 concurrent requests (3 per leg x 8 legs, plus our own
+two) out of ~25GB of KV instead of ~87GB. Preemption and prefill recompute would show up as
+tokens/GPU-h below the baseline rather than as an error.
 
 Verified live on a rented H200 (2026-08-06, `ENGY_ENGINES_PER_GPU=2`): two engines at 62886 MiB and
 60384 MiB — 86% of the card — two workers `…-g0e0` and `…-g0e1`, each dialing **8 of 8 gateway legs**
@@ -102,29 +102,75 @@ follows worker count. If it routes by hotkey and splits the same work over more 
 per card is the same tokens at twice the acceptance surface — a loss. The baseline to beat is
 118,540 tokens/GPU-h.
 
-## Why every miner declares exactly 8
+## Why a leg needs three inflight, not one
 
-`ENGY_MAX_RUNNING_REQUESTS` (default **8**) is both sglang's `--max-running-requests` and what one
-miner declares to the gateway as `MAX_INFLIGHT`. **8 is a floor, not a tuning choice.**
+`ENGY_REQUESTS_PER_GATEWAY_LEG` (default **3**) is the knob. The total a miner declares as
+`MAX_INFLIGHT` is derived from it — per-leg times the gateway's live leg count, so 24 against
+today's 8 — and is never configured directly.
 
-The miner derives its gateway connection count from this number (`_leg_plan`): when `MAX_INFLIGHT`
-is below the gateway's worker count it opens that many connections instead, one inflight each. The
-gateway runs 8 workers, and a worker holding fewer than 8 connections is refused before it ever
-serves anything — the portal says so in as many words: *"Qualification and sampling only target
-workers with all 8 legs live, so it will receive no test traffic — and cannot be onboarded — until
-every leg connects."*
+**Per leg is the unit that matters because that is the unit the miner uses.** `_leg_plan` splits the
+declaration evenly across the legs, so a total only ever reaches the gateway as a per-leg number;
+configuring the total means configuring the per-leg value by accident, and getting it wrong the day
+engy changes its leg count. Below one per leg it is worse than wrong: `_leg_plan` opens `declared`
+legs instead of one per worker, and a worker short of a leg is refused before it serves anything.
+The portal says so in as many words: *"Qualification and sampling only target workers with all 8
+legs live, so it will receive no test traffic — and cannot be onboarded — until every leg
+connects."* Measured by running this image at a total of 4 on a rented H100 (2026-07-30): the worker
+connected, opened four connections, and was failed in three seconds with `offered 4 distinct clean
+legs, below the required 8`. Zero requests, ever.
 
-Measured by running this image at 4 on a rented H100 (2026-07-30): the worker connected, opened four
-connections, and was failed in three seconds with `offered 4 distinct clean legs, below the required
-8`. Zero requests, ever. **Never set this below 8.** The entrypoint no longer lets anyone: a lower
-override is logged and raised back to 8, because a knob whose wrong value silently earns nothing is
-a trap, not a setting.
+**Three is measured, not chosen.** Clean A/B on one rented H100x8 (2026-08-12) — same image `0.0.7`,
+same box, same hour, warm weights, nothing but this number different:
 
-Above 8 buys nothing either. Same box, same day: declaring 8 drew a burst of 8 concurrent; declaring
-**64 drew the same burst of 8**. The number we declare is an admission ticket, not a throttle — the
-gateway sends what it wants to send. Prod, meanwhile, sat at 2 concurrent across all eight engines
-over a 7-minute sample. 481 of the network's 635 workers declare 8; only 7 declare 64, and until
-this change we were one of them.
+| per leg | declared | onboarded | failures |
+|---|---|---|---|
+| 2 | 16 | **6 of 8** | `served only 7 concurrent legs`, `offered 7 distinct clean legs`, one each, both on attempt 1 |
+| 3 | 24 | **8 of 8** | none, across 16 worker-starts |
+
+Prod runs 2 per leg and sits at exactly 6 active + 2 failed with that same pair of reasons, so the
+control reproduced prod's split on the first try. The two failure strings are two stages of one
+shortfall — `offered 7 distinct clean legs` is the dial stage, `served only 7 concurrent legs` the
+serve stage — and at 3 per leg neither appears. Why a third slot is enough: the prober needs all 8
+legs serving *concurrently*, and each probe prompt is ~12.9k tokens against a
+`--chunked-prefill-size` of 8192, so sglang admits one sequence per prefill pass (`#new-seq: 1`) and
+the legs enter the running batch serially over ~1.2s. At 2 per leg anything else holding a leg
+during that ramp leaves seven; the third slot is the margin that ramp needs.
+
+**The total tracks the live leg count, never a constant.** The gateway runs 8 legs today, and 8 is
+what the entrypoint assumes when `GW/meta` cannot be read — but pinning 24 would silently become 2
+per leg the day engy runs 12, which is the configuration that loses two cards out of eight. Sizing
+against the live count is also why the container asks the gateway BEFORE it launches an engine: an
+engine's slot count is fixed at launch, and it is sized from the settled declaration.
+
+The declaration is an admission ticket, not a throttle: same box, same day, declaring 8 drew a burst
+of 8 concurrent and declaring **64 drew the same burst of 8**. Raising it does not pull more
+traffic — it only decides whether onboarding passes.
+
+## Why the engine holds more than it declares
+
+sglang's `--max-running-requests` is NOT the declaration. It is the declaration plus
+`ENGINE_SLOTS_FOR_OUR_OWN_PROBES` (**2**), so the default shape is a worker that advertises 24 and
+an engine that holds 26.
+
+The two used to be the same number, and that is a bug with a name. The miner splits `MAX_INFLIGHT`
+into one inflight per gateway leg, so at 8 the engine had exactly one slot per leg and no spare.
+The prober requires all 8 legs to serve **concurrently**; anything else holding a slot at that
+moment — our own `/health_generate`, a leg that had not drained — leaves 7, and the worker is failed
+with `served only 7 CONCURRENT legs` while every HTTP response in the log is a 200.
+
+Measured as a clean A/B on one rented H100 (2026-08-10, same box, same image 0.0.7): declared 8 ->
+failed after 790 requests, all of them successful; declared 16 -> `active`. Raising the declaration
+was never the fix, it just happened to buy the engine a spare slot. Prod paid for that confusion
+twice — DAH-2603 rolled 16 back to 8 on 2026-08-06 reading the symptom backwards, and prod
+onboarding failed from that day until DAH-2601 rolled it forward again on 2026-08-11.
+
+**Additive, not a multiplier.** The gateway never sends more than the declaration — declaring 8 drew
+a burst of 8, declaring 64 drew the same 8 — so the only slots it cannot fill are the ones this
+container takes: `engine_is_generating`'s `/health_generate` in the supervisor loop, and a leg that
+has not drained. That is a constant two, and it must stay constant: doubling the declaration instead
+would silently take a 16-worker gateway to 32 concurrent sequences on one card's KV pool, which is
+the preemption-and-prefill-recompute cost this file warns about under the split. Spare slots cost
+nothing while they sit idle; a missing one costs the entire worker.
 
 ## Why worker ids are random again
 
@@ -141,7 +187,7 @@ the same worker, request history intact.
 **Reverted on 2026-08-04, because a pinned id also pins the CAPACITY.** engy records a worker's
 declared max inflight at the record it creates on first onboarding and never refreshes it on
 reconnect. With a pinned id the node reconnected into its record from 2026-08-03 forever, so raising
-`ENGY_MAX_RUNNING_REQUESTS` was a silent no-op: the container booted with the new number, the miner
+the declared inflight was a silent no-op: the container booted with the new number, the miner
 sent it on every hello, and the dashboard kept showing the old one — which is also the number the
 gateway routes against. Onboarding is quick now, so re-onboarding on restart is the cheaper half of
 the trade, and it is the only way a config change ever lands.

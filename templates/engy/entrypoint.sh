@@ -17,26 +17,33 @@ MODEL="${MODEL:-qwen3.6-35b-a3b}"
 CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
 CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
-# Per-engine concurrency, and also what ONE miner declares to the gateway as MAX_INFLIGHT.
-# 8 is a FLOOR, not a preference: the miner derives its gateway connection count from this number
-# (see _leg_plan), the gateway runs 8 workers, and a miner holding fewer than 8 connections is
-# refused onboarding outright — "offered N distinct clean legs, below the required 8". Measured by
-# running this image at 4: instant failure, zero traffic, ever.
-# See ARCHITECTURE.md, "Why every miner declares exactly 8".
-GATEWAY_REQUIRED_INFLIGHT=8
-PER_ENGINE_REQUESTS="${ENGY_MAX_RUNNING_REQUESTS:-${GATEWAY_REQUIRED_INFLIGHT}}"
+# The gateway's worker count when GW/meta cannot be read. Every miner must hold one leg per gateway
+# worker or it is refused onboarding, so this stands in for the live count everywhere the live count
+# is not available yet — the real one (resolve_gateway_worker_count) always wins over it.
+ASSUMED_GATEWAY_WORKERS=8
+# How much ONE gateway leg may hold. The miner splits its declaration evenly across the legs
+# (_leg_plan), so this — not the total — is the number onboarding actually turns on, and the total
+# is derived from it once the live leg count is known.
+# Measured A/B on a rented H100x8 (2026-08-12), same image and box, only this changed: at 2 the node
+# onboarded 6 of 8, failing the other two with "served only 7 concurrent legs" and "offered 7
+# distinct clean legs" — the pair prod shows — and at 3 it onboarded 8 of 8, neither failure in 16
+# worker-starts. See ARCHITECTURE.md, "Why a leg needs three inflight, not one".
+MEASURED_REQUESTS_PER_GATEWAY_LEG=3
+REQUESTS_PER_GATEWAY_LEG="${ENGY_REQUESTS_PER_GATEWAY_LEG:-${MEASURED_REQUESTS_PER_GATEWAY_LEG}}"
 # Checked as text before any arithmetic: under `set -u` a non-numeric value makes (( )) treat it as
 # an unset variable NAME and kill the script here, before the log capture that would explain why.
-if [[ ! "${PER_ENGINE_REQUESTS}" =~ ^[0-9]+$ ]]; then
-    echo "[engy] ENGY_MAX_RUNNING_REQUESTS='${PER_ENGINE_REQUESTS}' is not a number;" \
-         "using ${GATEWAY_REQUIRED_INFLIGHT}." >&2
-    PER_ENGINE_REQUESTS="${GATEWAY_REQUIRED_INFLIGHT}"
+# Zero is refused with it — a leg that may hold nothing is routed nothing, and earns nothing.
+if [[ ! "${REQUESTS_PER_GATEWAY_LEG}" =~ ^[0-9]+$ ]] || (( REQUESTS_PER_GATEWAY_LEG < 1 )); then
+    echo "[engy] ENGY_REQUESTS_PER_GATEWAY_LEG='${REQUESTS_PER_GATEWAY_LEG}' is not a positive" \
+         "number; using ${MEASURED_REQUESTS_PER_GATEWAY_LEG}." >&2
+    REQUESTS_PER_GATEWAY_LEG="${MEASURED_REQUESTS_PER_GATEWAY_LEG}"
 fi
-if (( PER_ENGINE_REQUESTS < GATEWAY_REQUIRED_INFLIGHT )); then
-    echo "[engy] ENGY_MAX_RUNNING_REQUESTS=${PER_ENGINE_REQUESTS} is below the gateway's floor;" \
-         "using ${GATEWAY_REQUIRED_INFLIGHT} instead — a lower value earns nothing at all." >&2
-    PER_ENGINE_REQUESTS="${GATEWAY_REQUIRED_INFLIGHT}"
-fi
+# The gateway never sends more than the declaration, so the only slots it cannot fill are ours: the
+# supervisor's /health_generate, and a leg that has not drained. Without them the prober, which
+# needs every leg serving CONCURRENTLY, fails the worker with "served only 7 CONCURRENT legs".
+# Additive on purpose — a multiplier would grow this with the gateway, which nothing requires.
+# See ARCHITECTURE.md, "Why the engine holds more than it declares".
+ENGINE_SLOTS_FOR_OUR_OWN_PROBES=2
 # How many engines share ONE card, each with its own miner and therefore its own gateway worker.
 # The card is not the constraint on an H200/B200 — prod measured 2 concurrent requests across eight
 # engines — so this exists to buy routing share, which the gateway hands out per WORKER.
@@ -238,7 +245,7 @@ start_engine() {
         --served-model-name Qwen3.6 --tp-size 1 --trust-remote-code \
         --kv-cache-dtype fp8_e4m3 \
         --mem-fraction-static "$(engine_mem_fraction "$(( index % ENGINES_PER_GPU ))")" \
-        --chunked-prefill-size 8192 --max-running-requests "${PER_ENGINE_REQUESTS}" \
+        --chunked-prefill-size 8192 --max-running-requests "${ENGINE_SLOTS}" \
         --context-length "${CONTEXT_LENGTH}" --enable-return-hidden-states --enable-cache-report \
         --enable-metrics \
         --host 127.0.0.1 --port "${port}" &
@@ -458,7 +465,6 @@ read_gpu_name_once() {
 # a split card while the first was fine — and with N miners per container the blip gets N chances.
 # So: ask once, retry, and hand every miner the answer through upstream's own ENGY_GW_WORKERS
 # override. The fallback is the gateway's known count, never upstream's 1, which cannot onboard.
-GATEWAY_WORKERS_WHEN_UNREACHABLE=8
 resolve_gateway_worker_count() {
     local meta_url count attempt
     meta_url="${GW/#wss:/https:}"
@@ -476,9 +482,17 @@ resolve_gateway_worker_count() {
         fi
         interruptible_sleep 2
     done
-    GATEWAY_WORKERS="${GATEWAY_WORKERS_WHEN_UNREACHABLE}"
+    GATEWAY_WORKERS="${ASSUMED_GATEWAY_WORKERS}"
     echo "[engy] could not read ${meta_url} in 3 tries; assuming ${GATEWAY_WORKERS} gateway worker(s)" \
          "— the stock miner would have assumed 1 and been refused onboarding" >&2
+}
+
+# Per-leg capacity is what was measured, so the total is derived from the LIVE leg count rather
+# than configured: pin the total instead and the day engy runs 12 legs every worker silently drops
+# to 2 per leg, which is the configuration the A/B lost two cards out of eight on.
+size_declaration_and_engine_to_the_gateway() {
+    DECLARED_INFLIGHT=$(( REQUESTS_PER_GATEWAY_LEG * GATEWAY_WORKERS ))
+    ENGINE_SLOTS=$(( DECLARED_INFLIGHT + ENGINE_SLOTS_FOR_OUR_OWN_PROBES ))
 }
 
 start_miner() {
@@ -486,7 +500,7 @@ start_miner() {
     name="$(miner_worker_name "${index}")"
     miner_names[index]="${name}"
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
-    MAX_INFLIGHT="${PER_ENGINE_REQUESTS}" \
+    MAX_INFLIGHT="${DECLARED_INFLIGHT}" \
     ENGY_GW_WORKERS="${GATEWAY_WORKERS}" \
     HW_GPUS="1x ${GPU_NAME}" \
     ENGY_WORKER_NAME="${name}" \
@@ -755,9 +769,16 @@ main() {
     size_engines_to_the_card
     assign_engines_to_ports_and_cards
     read_gpu_name_once
+    # Before the engines, unlike the miner refresh below: an engine's slot count is fixed at launch,
+    # and it can only be sized once the declaration is settled against the gateway's real count.
+    # This used to ride the free window while the engines loaded; sizing them costs that overlap,
+    # which is up to ~36s of retries against an unreachable gateway — against a 10-20 minute JIT,
+    # and against a gateway there would be nothing to onboard to anyway.
+    resolve_gateway_worker_count
+    size_declaration_and_engine_to_the_gateway
     echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) x" \
-         "${PER_ENGINE_REQUESTS} requests at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
-         "of a card each, one miner per engine"
+         "${ENGINE_SLOTS} slots at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
+         "of a card each, one miner per engine declaring ${DECLARED_INFLIGHT}"
 
     export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
     export HF_HOME="${ENGY_HOME}/hf"
@@ -778,10 +799,8 @@ main() {
 
     start_metrics_sidecar
     # After the engines are spawned, not before: the miner is not needed until they are ready, and a
-    # slow GitHub would otherwise add a minute of dead time to every cold start. The gateway's leg
-    # count is a miner prerequisite too, and its retries ride the same free window.
+    # slow GitHub would otherwise add a minute of dead time to every cold start.
     refresh_vendored_miner
-    resolve_gateway_worker_count
 
     # One card that never comes up costs one card. This used to end the container, which was right
     # when a single miner fronted every engine — losing one engine lost the worker anyway. With a
