@@ -71,7 +71,7 @@ def _add_devices(spec: dict) -> None:
         )
 
 
-def _cluster_environment() -> list[str]:
+def _cluster_environment_entries() -> list[str]:
     if not os.path.isfile(CLUSTER_ENV_FILE):
         return []
     with open(CLUSTER_ENV_FILE) as handle:
@@ -88,7 +88,7 @@ def _add_cluster_environment(spec: dict) -> None:
     environment = process.setdefault("env", [])
     already_set = {entry.split("=", 1)[0] for entry in environment}
 
-    for entry in _cluster_environment():
+    for entry in _cluster_environment_entries():
         if entry.split("=", 1)[0] not in already_set:
             environment.append(entry)
 

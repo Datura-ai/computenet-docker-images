@@ -22,15 +22,18 @@ set -uo pipefail
 mkdir -p /usr/local/bin
 printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/wg-quick
 printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/wg
+# what `ip` reports once the real wg-quick has raised the interface from the injected config
+printf '#!/bin/sh\necho "5: wg0    inet 10.42.0.1/24 scope global wg0"\n' > /usr/local/bin/ip
 printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/python3     # only configure_nested_docker needs it
 printf '#!/bin/sh\necho handed-off-to-base-entrypoint\n' > /pytorch-entrypoint.sh
-chmod +x /usr/local/bin/wg-quick /usr/local/bin/wg /usr/local/bin/python3 /pytorch-entrypoint.sh
+chmod +x /usr/local/bin/wg-quick /usr/local/bin/wg /usr/local/bin/ip /usr/local/bin/python3 /pytorch-entrypoint.sh
 
 bash /template/entrypoint.sh >/tmp/out.log 2>&1
 echo "exit_status=$?"
 echo "handed_off=$(grep -c handed-off-to-base-entrypoint /tmp/out.log)"
 echo "cluster_env=$(cat /etc/lium-cluster.env 2>/dev/null | tr '\n' ',')"
 echo "etc_environment_has_ifname=$(grep -c '^NCCL_SOCKET_IFNAME=wg0$' /etc/environment 2>/dev/null)"
+echo "login_shell_ifname=$(env -i sh -c '. /etc/profile.d/lium-cluster.sh 2>/dev/null; echo ${NCCL_SOCKET_IFNAME:-}')"
 echo "private_key=$(cat /root/.ssh/id_ed25519 2>/dev/null | head -1)"
 echo "private_key_mode=$(stat -c '%a' /root/.ssh/id_ed25519 2>/dev/null)"
 echo "ssh_dir_mode=$(stat -c '%a' /root/.ssh 2>/dev/null)"
@@ -59,6 +62,7 @@ RESULT="$(run_entrypoint \
     && pass "the overlay settings are published for nested containers" \
     || fail "cluster env file reads: $(fact cluster_env)"
 [[ "$(fact etc_environment_has_ifname)" == "1" ]] && pass "an SSH session still reads them too" || fail "/etc/environment lost the settings"
+[[ "$(fact login_shell_ifname)" == "wg0" ]] && pass "a login shell reads them too" || fail "a login shell got: $(fact login_shell_ifname)"
 # DAH-2664 item 3: without a private key and the matching authorized key, mpirun cannot start a
 # rank on a peer.
 [[ "$(fact private_key)" == "-----BEGIN OPENSSH PRIVATE KEY-----" ]] && pass "the cluster private key is installed" || fail "private key reads: $(fact private_key)"

@@ -10,10 +10,6 @@ set -euo pipefail
 # and the nested-container runtime. Written only while the pod is a cluster member.
 CLUSTER_ENV_FILE=/etc/lium-cluster.env
 
-# The overlay subnet the backend hands out (CLUSTER_OVERLAY_CIDR). A launcher dialling a peer here
-# has never seen it before, and there is no host to impersonate on a private mesh.
-CLUSTER_OVERLAY_HOST_PATTERN="10.42.0.*"
-
 raise_cluster_overlay() {
     local conf_b64="${LIUM_WIREGUARD_CONF_B64:-}"
     if [[ -z "$conf_b64" ]]; then
@@ -70,9 +66,9 @@ publish_cluster_env() {
     mkdir -p /etc/profile.d
     {
         echo "# DAH-2620: the cluster overlay this pod is a member of."
-        for var in "${vars[@]}"; do
-            echo "export $var"
-        done
+        echo "set -a"
+        echo ". $CLUSTER_ENV_FILE"
+        echo "set +a"
     } > /etc/profile.d/lium-cluster.sh
     chmod 644 /etc/profile.d/lium-cluster.sh
 
@@ -103,9 +99,19 @@ install_cluster_ssh_identity() {
     grep -qxF "$authorized_key" /root/.ssh/authorized_keys || echo "$authorized_key" >> /root/.ssh/authorized_keys
 
     # A launcher fails outright on an unknown host key, and nothing on this private mesh can be
-    # impersonated — the peers are exactly the pods WireGuard let in.
+    # impersonated — the peers are exactly the pods WireGuard let in. The subnet is read off wg0
+    # rather than hardcoded: the backend owns the address plan, and a copy baked into this image
+    # would silently stop matching the day that plan changes.
+    local overlay_address overlay_host_pattern
+    overlay_address="$(ip -o -4 addr show wg0 | awk '{print $4}' | head -1)"
+    if [[ -z "$overlay_address" ]]; then
+        echo "lium-cluster: wg0 has no address, so peers cannot be dialled by name" >&2
+        return 0
+    fi
+    overlay_host_pattern="${overlay_address%.*}.*"
+
     cat > /root/.ssh/config <<EOF
-Host $CLUSTER_OVERLAY_HOST_PATTERN
+Host $overlay_host_pattern
     IdentityFile /root/.ssh/id_ed25519
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
