@@ -88,10 +88,10 @@ What it costs: acceptance is scored per **hotkey**, so twice the workers is twic
 bad capacity probe to drag the key's day. Each worker also needs its own 8 clean gateway legs. Both
 are why this ships defaulting to 1 and is turned up per environment.
 
-Watch the KV cache when you turn it up: the engine's slot count does NOT split with the pool, so
-at 2 engines on an H200 each one serves 16 concurrent requests out of ~25GB of KV instead of ~87GB.
-Preemption and prefill recompute would show up as tokens/GPU-h below the baseline rather than as an
-error.
+Watch the KV cache when you turn it up: the engine's slot count does NOT split with the pool, so at
+2 engines on an H200 each one still holds 26 concurrent requests (3 per leg x 8 legs, plus our own
+two) out of ~25GB of KV instead of ~87GB. Preemption and prefill recompute would show up as
+tokens/GPU-h below the baseline rather than as an error.
 
 Verified live on a rented H200 (2026-08-06, `ENGY_ENGINES_PER_GPU=2`): two engines at 62886 MiB and
 60384 MiB — 86% of the card — two workers `…-g0e0` and `…-g0e1`, each dialing **8 of 8 gateway legs**
