@@ -10,6 +10,10 @@ set -euo pipefail
 # and the nested-container runtime. Written only while the pod is a cluster member.
 CLUSTER_ENV_FILE=/etc/lium-cluster.env
 
+# The group's shared SSH login, kept under names of our own so a restored backup's ~/.ssh survives.
+CLUSTER_SSH_KEY_FILE=/root/.ssh/lium_cluster_ed25519
+CLUSTER_SSH_CONFIG_MARKER="# DAH-2664: the Lium cluster overlay"
+
 raise_cluster_overlay() {
     local conf_b64="${LIUM_WIREGUARD_CONF_B64:-}"
     if [[ -z "$conf_b64" ]]; then
@@ -88,9 +92,11 @@ install_cluster_ssh_identity() {
 
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
-    # Restricted before it holds anything: ssh refuses a private key other users can read.
-    install -m 600 /dev/null /root/.ssh/id_ed25519
-    echo "$key_b64" | base64 -d > /root/.ssh/id_ed25519
+    # Its own filename, not id_ed25519: a rental can restore a backup into this home directory
+    # before the container starts, and the customer's own key must not be overwritten by ours.
+    # Restricted before it holds anything — ssh refuses a private key other users can read.
+    install -m 600 /dev/null "$CLUSTER_SSH_KEY_FILE"
+    echo "$key_b64" | base64 -d > "$CLUSTER_SSH_KEY_FILE"
 
     # Appended, never written over: the validator puts the renter's own key in the same file, and
     # the two execs race.
@@ -103,21 +109,34 @@ install_cluster_ssh_identity() {
     # rather than hardcoded: the backend owns the address plan, and a copy baked into this image
     # would silently stop matching the day that plan changes.
     local overlay_address overlay_host_pattern
-    overlay_address="$(ip -o -4 addr show wg0 | awk '{print $4}' | head -1)"
+    # `|| true` because `set -o pipefail` is on: without it a missing wg0 kills the whole entrypoint
+    # here, which would fail the pod over an SSH convenience instead of degrading.
+    overlay_address="$(ip -o -4 addr show wg0 2>/dev/null | awk '{print $4}' | head -1 || true)"
     if [[ -z "$overlay_address" ]]; then
         echo "lium-cluster: wg0 has no address, so peers cannot be dialled by name" >&2
         return 0
     fi
     overlay_host_pattern="${overlay_address%.*}.*"
 
-    cat > /root/.ssh/config <<EOF
+    # PREPENDED, and only once: ssh takes the FIRST value it finds for an option, so a restored
+    # config opening with `Host *` would otherwise keep its own StrictHostKeyChecking and the
+    # launcher would still stop at the fingerprint prompt. The customer's file is kept below ours.
+    touch /root/.ssh/config
+    chmod 600 /root/.ssh/config
+    if ! grep -q "$CLUSTER_SSH_CONFIG_MARKER" /root/.ssh/config; then
+        local existing_config
+        existing_config="$(cat /root/.ssh/config)"
+        cat > /root/.ssh/config <<EOF
+$CLUSTER_SSH_CONFIG_MARKER
 Host $overlay_host_pattern
-    IdentityFile /root/.ssh/id_ed25519
+    IdentityFile $CLUSTER_SSH_KEY_FILE
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR
+
+$existing_config
 EOF
-    chmod 600 /root/.ssh/config
+    fi
 }
 
 configure_nested_docker() {

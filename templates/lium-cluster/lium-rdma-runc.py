@@ -79,11 +79,24 @@ def _cluster_environment_entries() -> list[str]:
     return [line for line in lines if "=" in line and not line.startswith("#")]
 
 
+def _has_its_own_network_namespace(spec: dict) -> bool:
+    """Whether this container gets a fresh netns instead of the pod's (i.e. NOT `--network host`)."""
+    namespaces = spec.get("linux", {}).get("namespaces", [])
+    return any(namespace.get("type") == "network" for namespace in namespaces)
+
+
 def _add_cluster_environment(spec: dict) -> None:
     """Hand the container the overlay settings, unless it already sets that variable itself.
 
     Never overriding is the point: a renter who passes `-e NCCL_SOCKET_IFNAME=...` means it.
+
+    Skipped entirely for a container with its own network namespace: wg0 lives in the pod's, so
+    naming it there would point NCCL at an interface that does not exist and break an ordinary
+    single-node job that used to run fine on the bridge.
     """
+    if _has_its_own_network_namespace(spec):
+        return
+
     process = spec.setdefault("process", {})
     environment = process.setdefault("env", [])
     already_set = {entry.split("=", 1)[0] for entry in environment}

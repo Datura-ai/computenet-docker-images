@@ -37,9 +37,9 @@ Nothing.
   NCCL_SOCKET_IFNAME` used to come back empty and NCCL then picked the inner bridge. A variable the
   renter passes with `-e` is left alone.
 - Pod-to-pod SSH works over the overlay (DAH-2664). The backend mints one keypair per cluster; the
-  entrypoint installs the private half at `/root/.ssh/id_ed25519`, appends the public half to
-  `authorized_keys`, and adds an `~/.ssh/config` entry for `10.42.0.*` that skips the host-key
-  prompt. This is what `mpirun`, DeepSpeed's pdsh launcher and the nccl-tests recipes need — without
+  entrypoint installs the private half at `/root/.ssh/lium_cluster_ed25519` (its own name, so a
+  restored backup's `id_ed25519` survives), appends the public half to `authorized_keys`, and
+  appends an `~/.ssh/config` block for the overlay subnet that skips the host-key prompt. This is what `mpirun`, DeepSpeed's pdsh launcher and the nccl-tests recipes need — without
   it the only working launcher is torchrun with a hand-typed `--node_rank` per node.
 - `libibverbs` and the provider plugins are installed here. They are not in the base, and without
   them NCCL logs `Failed to open libibverbs.so[.1]` and silently falls back to its socket

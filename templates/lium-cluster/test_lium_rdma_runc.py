@@ -143,6 +143,25 @@ def test_a_setting_the_renter_passed_himself_is_never_overridden(cluster_env_fil
     assert "NCCL_SOCKET_IFNAME=wg0" not in environment
 
 
+def test_a_container_with_its_own_network_gets_no_overlay_settings(cluster_env_file, fake_verbs) -> None:
+    # Arrange — a plain `docker run` (no --network host) has a network namespace of its own, and
+    # wg0 is not in it; naming it would break NCCL for a job that ran fine on the bridge.
+    spec: dict = _spec()
+    spec["linux"] = {"namespaces": [{"type": "network"}, {"type": "pid"}]}
+
+    # Act
+    injected: dict = lium_rdma_runc.inject(spec)
+
+    # Assert
+    assert injected["process"].get("env", []) == []
+    # the fabric itself still goes in — RDMA does not care about the network namespace
+    assert [Path(device["path"]).name for device in injected["linux"]["devices"]] == [
+        "rdma_cm",
+        "uverbs0",
+        "uverbs1",
+    ]
+
+
 def test_a_standalone_pod_adds_no_settings(tmp_path, monkeypatch) -> None:
     # Arrange — no cluster membership, so the entrypoint never wrote the file
     monkeypatch.setattr(lium_rdma_runc, "CLUSTER_ENV_FILE", str(tmp_path / "absent"))
