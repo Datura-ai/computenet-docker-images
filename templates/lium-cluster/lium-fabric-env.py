@@ -26,6 +26,7 @@ here belongs to the fabric the cluster was rented on.
 
 import re
 import subprocess
+import sys
 
 # The GID that can cross a router. RoCE v1 is L2-only, and NCCL addresses its peers by IP here.
 ROUTABLE_GID_TYPE = "roce v2"
@@ -64,6 +65,11 @@ class FabricPort:
     def is_infiniband(self) -> bool:
         return self.link_layer.lower() == "infiniband"
 
+    def segment_of_gid(self, index: int) -> str:
+        """The /24 the port's IPv4-mapped GID sits on — what tells two rails apart."""
+        address: str = self.gids[index][0].split(":")[-1]
+        return address.rsplit(".", 1)[0]
+
     def routable_gid_index(self) -> int | None:
         """The index of the IPv4-mapped RoCE v2 entry, the only one a peer on another host can dial.
 
@@ -97,6 +103,7 @@ def read_ports() -> list[FabricPort]:
         hca = _HCA.match(line)
         if hca:
             device = hca.group(1)
+            current = None
             continue
         port = _PORT.match(line)
         if port:
@@ -129,6 +136,7 @@ def fabric_environment() -> dict[str, str]:
 
     rails: list[str] = []
     gid_indexes: set[int] = set()
+    segments: set[str] = set()
     for port in live_ports:
         if not port.is_roce:
             continue
@@ -137,11 +145,20 @@ def fabric_environment() -> dict[str, str]:
             continue
         rails.append(f"{port.device}:{port.port}")
         gid_indexes.add(gid_index)
+        segments.add(port.segment_of_gid(gid_index))
 
     if not rails:
         return {}
+    # Rails on two different segments mean one of them is not this cluster's fabric — a storage or
+    # management NIC that also speaks RDMA. Naming both would send NCCL down a rail its peers do not
+    # answer on. The backend refuses to sell such a host for the same reason; here we simply say
+    # nothing and let NCCL choose, rather than choose wrong.
+    if len(segments) != 1:
+        return {}
 
-    environment: dict[str, str] = {"NCCL_IB_HCA": ",".join(sorted(rails))}
+    # The leading "=" makes NCCL match device names EXACTLY. Without it the list is a prefix match,
+    # so naming mlx5_1 also hands NCCL mlx5_10 and mlx5_11 — the storage NIC this is meant to avoid.
+    environment: dict[str, str] = {"NCCL_IB_HCA": "=" + ",".join(sorted(rails))}
     # NCCL_IB_GID_INDEX is one value for the whole job, so rails that disagree get none: a wrong
     # index breaks every rail, while NCCL's own v2 detection is at least right on most of them.
     if len(gid_indexes) == 1:
@@ -154,4 +171,9 @@ def render(environment: dict[str, str]) -> str:
 
 
 if __name__ == "__main__":
+    # Exit non-zero when this pod holds no usable fabric, so the entrypoint can refuse to start on
+    # it. One answer, in the one place that opens the devices — the shell asking `ibv_devinfo`
+    # separately used to accept PORT_ACTIVE_DEFER, which this rejects.
+    if not any(port.is_active for port in read_ports()):
+        sys.exit("lium-cluster: no ACTIVE RDMA port answers verbs in this pod")
     print(render(fabric_environment()))

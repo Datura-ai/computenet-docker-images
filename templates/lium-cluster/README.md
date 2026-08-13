@@ -43,17 +43,19 @@ MAD) — the same allowlist the validator applies when it forwards devices into 
 The same image serves a group rented over RoCE. The overlay, the devices and the nested-container
 runtime are the same; two things are not.
 
-- **NCCL is told which card and which GID to use.** `lium-fabric-env` reads `/sys/class/infiniband`
+- **NCCL is told which card and which GID to use.** `lium-fabric-env` reads `ibv_devinfo -v`
   and exports `NCCL_IB_HCA` (the live RoCE rails) and `NCCL_IB_GID_INDEX` (the IPv4-mapped RoCE v2
   entry, whose index moves with the driver — mlx5 puts it at 2-3, Intel irdma at 1). Left to itself
   NCCL can pick the host's storage or internet NIC, or a v1 GID that cannot cross a router. On an
   InfiniBand host it prints nothing and the behaviour is unchanged: there is one fabric and NCCL
   finds it. Reading only this host is enough because the backend never sells a host whose live RoCE
   ports straddle two segments.
-- **A pod without a usable fabric refuses to start.** `ibv_devinfo` must report an `PORT_ACTIVE`
-  port; sysfs alone is not evidence, since `/sys/class/infiniband` is mounted into every container
-  whether or not the verbs devices were forwarded. Without this check NCCL falls back to TCP over
-  the overlay and the renter pays for a cluster that quietly is not one.
+- **A pod without a usable fabric refuses to start.** `lium-fabric-env` is also the gate: it exits
+  non-zero when no `PORT_ACTIVE` port answers verbs, and the entrypoint turns that into a refused
+  pod. Sysfs alone is not evidence, since `/sys/class/infiniband` is mounted into every container
+  whether or not the verbs devices were forwarded — and inside a cluster pod its attribute files
+  read back empty. Without this check NCCL falls back to TCP over the overlay and the renter pays
+  for a cluster that quietly is not one.
 
 ## Verified on real hardware
 
@@ -71,7 +73,7 @@ API on 2026-08-11:
 
 ```bash
 cd templates/lium-cluster
-VERSION=0.0.5 docker buildx bake --push
+VERSION=0.0.7 docker buildx bake --push
 ```
 
 `docker-bake.hcl` pins amd64 and the base tag. Bump `VERSION` and the tag in the backend's
@@ -82,7 +84,10 @@ decides which tag a cluster rental actually runs.
 
 `test_lium_rdma_runc.py` covers the runtime wrapper: the allowlist, the cgroup rules that must
 accompany each device, memory pinning, a host with no fabric, and running twice over one bundle.
+`test_lium_fabric_env.py` covers the fabric reader against real `ibv_devinfo -v` dumps: which GID
+index is picked per driver, the InfiniBand host it must stay silent on, rails that straddle two
+segments, and the exact-match `=` NCCL needs.
 
 ```bash
-pytest test_lium_rdma_runc.py
+pytest test_lium_rdma_runc.py test_lium_fabric_env.py
 ```

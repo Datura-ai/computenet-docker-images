@@ -27,39 +27,7 @@ raise_cluster_overlay() {
         exit 1
     fi
 
-    require_usable_fabric
     publish_cluster_env
-}
-
-require_usable_fabric() {
-    # DAH-2667: refuse the pod rather than hand the renter a cluster that quietly is not one.
-    #
-    # /sys/class/infiniband is mounted into every container, so a card is VISIBLE even when the
-    # verbs character devices are not forwarded — detection lies about capability. ibv_devinfo opens
-    # the devices, which is what a job does, so its answer is the one that counts. Without a fabric
-    # NCCL falls back to TCP over the overlay: the job still runs, at a fraction of the speed the
-    # cluster was rented for, and nothing in the logs says why.
-    if ibv_devinfo 2>/dev/null | grep -q "PORT_ACTIVE"; then
-        return 0
-    fi
-
-    echo "lium-cluster: no usable RDMA port in this pod (no ACTIVE port answers verbs), so a" >&2
-    echo "lium-cluster: multi-node job would silently run over the overlay. Refusing to start." >&2
-    exit 1
-}
-
-cluster_environment() {
-    # The one contract with the workload: the overlay is always called wg0. NCCL and gloo do not
-    # pick a second interface on their own, so we name it for them here and the renter never has to.
-    echo "NCCL_SOCKET_IFNAME=wg0"
-    echo "GLOO_SOCKET_IFNAME=wg0"
-    # Bootstrap rides one flow otherwise; these fan it across the wire (measured 7.3x on our fabric).
-    echo "NCCL_SOCKET_NTHREADS=4"
-    echo "NCCL_NSOCKS_PERTHREAD=8"
-    # On RoCE, which card and which GID carry the fabric (DAH-2667). Empty on InfiniBand, where NCCL
-    # needs no help — hence `grep .` to drop the blank line, and `|| true` because an empty answer
-    # is the normal one there.
-    python3 /usr/local/bin/lium-fabric-env | grep . || true
 }
 
 publish_cluster_env() {
@@ -67,12 +35,36 @@ publish_cluster_env() {
     # session starts from a clean environment — and NCCL then picks the docker bridge, announces
     # 172.x to its peers and the job hangs or crawls. So the same variables are written where a
     # session will read them: PAM reads /etc/environment, a login shell reads /etc/profile.d.
-    local vars=()
-    mapfile -t vars < <(cluster_environment)
+    # The one contract with the workload: the overlay is always called wg0. NCCL and gloo do not
+    # pick a second interface on their own, so we name it for them here and the renter never has to.
+    # The socket fan-out spreads the bootstrap across flows (measured 7.3x on our fabric).
+    local vars=(
+        "NCCL_SOCKET_IFNAME=wg0"
+        "GLOO_SOCKET_IFNAME=wg0"
+        "NCCL_SOCKET_NTHREADS=4"
+        "NCCL_NSOCKS_PERTHREAD=8"
+    )
+
+    # DAH-2667: which RoCE card and GID carry this pod's fabric, empty on InfiniBand where NCCL needs
+    # no help. It is also the fabric GATE — it exits non-zero when no ACTIVE port answers verbs, and
+    # a pod without a fabric must not start: NCCL would fall back to TCP over the overlay and the
+    # renter would pay cluster price for a job nothing in the logs explains. A crash in it is fatal
+    # here for the same reason, which is why its status is checked instead of being piped away.
+    local fabric_env
+    if ! fabric_env=$(python3 /usr/local/bin/lium-fabric-env); then
+        echo "lium-cluster: no usable RDMA fabric in this pod. Refusing to start." >&2
+        exit 1
+    fi
+    if [[ -n "$fabric_env" ]]; then
+        mapfile -t -O "${#vars[@]}" vars <<< "$fabric_env"
+    fi
 
     for var in "${vars[@]}"; do
         export "$var"
-        grep -q "^${var%%=*}=" /etc/environment 2>/dev/null || echo "$var" >> /etc/environment
+        # Rewritten, not appended-once: these values are read off the host's cards, so a container
+        # restart on a re-enumerated fabric must not leave a stale line behind.
+        sed -i "/^${var%%=*}=/d" /etc/environment 2>/dev/null || true
+        echo "$var" >> /etc/environment
     done
 
     mkdir -p /etc/profile.d

@@ -47,6 +47,32 @@ INFINIBAND = """hca_id:\tmlx5_2
 """
 
 
+def _with_devinfo(output: str) -> dict:
+    """Run the module against a canned dump without pytest's monkeypatch (used by plain asserts)."""
+
+    class _Result:
+        stdout = output
+
+    original = lium_fabric_env.subprocess.run
+    lium_fabric_env.subprocess.run = lambda *a, **k: _Result()
+    try:
+        return lium_fabric_env.fabric_environment()
+    finally:
+        lium_fabric_env.subprocess.run = original
+
+
+def _ports_from(output: str) -> list:
+    class _Result:
+        stdout = output
+
+    original = lium_fabric_env.subprocess.run
+    lium_fabric_env.subprocess.run = lambda *a, **k: _Result()
+    try:
+        return lium_fabric_env.read_ports()
+    finally:
+        lium_fabric_env.subprocess.run = original
+
+
 @pytest.fixture
 def devinfo(monkeypatch: pytest.MonkeyPatch):
     """Feed a canned `ibv_devinfo -v` dump, so the real parser is what the tests exercise."""
@@ -64,21 +90,21 @@ def test_a_soft_roce_pod_names_its_device_and_the_ipv4_mapped_v2_gid(devinfo) ->
     """Measured inside a staging cluster pod: sysfs reads back empty there, ibverbs does not."""
     devinfo(SOFT_ROCE)
 
-    assert lium_fabric_env.fabric_environment() == {"NCCL_IB_HCA": "rxe0:1", "NCCL_IB_GID_INDEX": "1"}
+    assert lium_fabric_env.fabric_environment() == {"NCCL_IB_HCA": "=rxe0:1", "NCCL_IB_GID_INDEX": "1"}
 
 
 def test_the_gid_index_is_read_not_assumed(devinfo) -> None:
     """mlx5 puts the IPv4-mapped v2 entry at 3, Soft-RoCE at 1 — position is never a constant."""
     devinfo(MLX5_ROCE)
 
-    assert lium_fabric_env.fabric_environment() == {"NCCL_IB_HCA": "mlx5_0:1", "NCCL_IB_GID_INDEX": "3"}
+    assert lium_fabric_env.fabric_environment() == {"NCCL_IB_HCA": "=mlx5_0:1", "NCCL_IB_GID_INDEX": "3"}
 
 
 def test_a_down_port_is_ignored(devinfo) -> None:
     """mlx5_1 in the sample is DOWN; only mlx5_0 may be offered to NCCL."""
     devinfo(MLX5_ROCE)
 
-    assert lium_fabric_env.fabric_environment()["NCCL_IB_HCA"] == "mlx5_0:1"
+    assert lium_fabric_env.fabric_environment()["NCCL_IB_HCA"] == "=mlx5_0:1"
 
 
 def test_an_infiniband_host_is_left_alone(devinfo) -> None:
@@ -134,7 +160,7 @@ def test_rails_that_disagree_about_the_gid_index_leave_it_to_nccl(devinfo) -> No
 
     environment = lium_fabric_env.fabric_environment()
 
-    assert environment["NCCL_IB_HCA"] == "mlx5_0:1,mlx5_1:1"
+    assert environment["NCCL_IB_HCA"] == "=mlx5_0:1,mlx5_1:1"
     assert "NCCL_IB_GID_INDEX" not in environment
 
 
@@ -148,5 +174,32 @@ def test_the_output_is_shell_assignments(devinfo) -> None:
     devinfo(SOFT_ROCE)
 
     assert lium_fabric_env.render(lium_fabric_env.fabric_environment()) == (
-        "NCCL_IB_HCA=rxe0:1\nNCCL_IB_GID_INDEX=1"
+        "NCCL_IB_HCA==rxe0:1\nNCCL_IB_GID_INDEX=1"
     )
+
+
+def test_the_device_list_asks_nccl_for_an_exact_match() -> None:
+    """Without the leading "=", NCCL treats the list as a PREFIX: naming mlx5_1 also hands it
+    mlx5_10 and mlx5_11 — the storage NIC this exists to keep out of the job."""
+    devinfo_output = MLX5_ROCE.replace("mlx5_1\n", "mlx5_10\n")
+    parsed = _with_devinfo(devinfo_output)
+
+    assert parsed["NCCL_IB_HCA"].startswith("=")
+
+
+def test_rails_on_two_segments_name_nothing() -> None:
+    """One of them is not this cluster's fabric, and pointing NCCL at the wrong rail hangs the job.
+    The backend refuses to sell such a host for the same reason."""
+    second_segment = (
+        "hca_id:\tmlx5_9\n\t\tport:\t1\n\t\t\tstate:\t\t\tPORT_ACTIVE (4)\n"
+        "\t\t\tlink_layer:\t\tEthernet\n\t\t\tGID[  1]:\t\t::ffff:192.168.9.9, RoCE v2\n"
+    )
+
+    assert _with_devinfo(SOFT_ROCE + second_segment) == {}
+
+
+def test_a_pod_with_no_active_port_is_refused() -> None:
+    """The script is the gate: the entrypoint turns its non-zero exit into a refused pod."""
+    down_only = SOFT_ROCE.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)")
+
+    assert not any(port.is_active for port in _ports_from(down_only))
