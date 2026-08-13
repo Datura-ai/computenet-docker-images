@@ -38,6 +38,23 @@ Nothing.
 Only `uverbs*` and `rdma_cm` are ever forwarded, never `issm*` (subnet manager) or `umad*` (raw
 MAD) — the same allowlist the validator applies when it forwards devices into the pod.
 
+## RoCE clusters (DAH-2667)
+
+The same image serves a group rented over RoCE. The overlay, the devices and the nested-container
+runtime are the same; two things are not.
+
+- **NCCL is told which card and which GID to use.** `lium-fabric-env` reads `/sys/class/infiniband`
+  and exports `NCCL_IB_HCA` (the live RoCE rails) and `NCCL_IB_GID_INDEX` (the IPv4-mapped RoCE v2
+  entry, whose index moves with the driver — mlx5 puts it at 2-3, Intel irdma at 1). Left to itself
+  NCCL can pick the host's storage or internet NIC, or a v1 GID that cannot cross a router. On an
+  InfiniBand host it prints nothing and the behaviour is unchanged: there is one fabric and NCCL
+  finds it. Reading only this host is enough because the backend never sells a host whose live RoCE
+  ports straddle two segments.
+- **A pod without a usable fabric refuses to start.** `ibv_devinfo` must report an `PORT_ACTIVE`
+  port; sysfs alone is not evidence, since `/sys/class/infiniband` is mounted into every container
+  whether or not the verbs devices were forwarded. Without this check NCCL falls back to TCP over
+  the overlay and the renter pays for a cluster that quietly is not one.
+
 ## Verified on real hardware
 
 Two Nebius 8xH100 nodes on one fabric, 8x ConnectX at 400 Gb/sec 4X NDR, rented through the staging
