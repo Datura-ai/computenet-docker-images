@@ -59,11 +59,19 @@ publish_cluster_env() {
         mapfile -t -O "${#vars[@]}" vars <<< "$fabric_env"
     fi
 
+    # Every name this script can write, cleared before anything is written back. Clearing only what
+    # we are about to write would strand a value from a previous boot: a pod restarted on a fabric
+    # that no longer pins a GID index would keep serving the old NCCL_IB_GID_INDEX to SSH sessions.
+    local managed=(
+        NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_SOCKET_NTHREADS NCCL_NSOCKS_PERTHREAD
+        NCCL_IB_HCA NCCL_IB_GID_INDEX
+    )
+    for name in "${managed[@]}"; do
+        sed -i "/^${name}=/d" /etc/environment 2>/dev/null || true
+    done
+
     for var in "${vars[@]}"; do
         export "$var"
-        # Rewritten, not appended-once: these values are read off the host's cards, so a container
-        # restart on a re-enumerated fabric must not leave a stale line behind.
-        sed -i "/^${var%%=*}=/d" /etc/environment 2>/dev/null || true
         echo "$var" >> /etc/environment
     done
 

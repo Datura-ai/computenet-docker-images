@@ -126,9 +126,9 @@ def read_ports() -> list[FabricPort]:
     return ports
 
 
-def fabric_environment() -> dict[str, str]:
+def fabric_environment(ports: list[FabricPort]) -> dict[str, str]:
     """What NCCL needs beyond the overlay, or nothing at all on an InfiniBand host."""
-    live_ports = [port for port in read_ports() if port.is_active]
+    live_ports = [port for port in ports if port.is_active]
     # A host holding a live InfiniBand port was sold on that fabric — pinning its Ethernet leg
     # would point the job at the wrong wire.
     if any(port.is_infiniband for port in live_ports):
@@ -174,6 +174,7 @@ if __name__ == "__main__":
     # Exit non-zero when this pod holds no usable fabric, so the entrypoint can refuse to start on
     # it. One answer, in the one place that opens the devices — the shell asking `ibv_devinfo`
     # separately used to accept PORT_ACTIVE_DEFER, which this rejects.
-    if not any(port.is_active for port in read_ports()):
+    ports = read_ports()
+    if not any(port.is_active for port in ports):
         sys.exit("lium-cluster: no ACTIVE RDMA port answers verbs in this pod")
-    print(render(fabric_environment()))
+    print(render(fabric_environment(ports)))

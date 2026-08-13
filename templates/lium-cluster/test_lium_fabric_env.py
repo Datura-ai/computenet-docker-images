@@ -56,7 +56,7 @@ def _with_devinfo(output: str) -> dict:
     original = lium_fabric_env.subprocess.run
     lium_fabric_env.subprocess.run = lambda *a, **k: _Result()
     try:
-        return lium_fabric_env.fabric_environment()
+        return lium_fabric_env.fabric_environment(lium_fabric_env.read_ports())
     finally:
         lium_fabric_env.subprocess.run = original
 
@@ -90,35 +90,35 @@ def test_a_soft_roce_pod_names_its_device_and_the_ipv4_mapped_v2_gid(devinfo) ->
     """Measured inside a staging cluster pod: sysfs reads back empty there, ibverbs does not."""
     devinfo(SOFT_ROCE)
 
-    assert lium_fabric_env.fabric_environment() == {"NCCL_IB_HCA": "=rxe0:1", "NCCL_IB_GID_INDEX": "1"}
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {"NCCL_IB_HCA": "=rxe0:1", "NCCL_IB_GID_INDEX": "1"}
 
 
 def test_the_gid_index_is_read_not_assumed(devinfo) -> None:
     """mlx5 puts the IPv4-mapped v2 entry at 3, Soft-RoCE at 1 — position is never a constant."""
     devinfo(MLX5_ROCE)
 
-    assert lium_fabric_env.fabric_environment() == {"NCCL_IB_HCA": "=mlx5_0:1", "NCCL_IB_GID_INDEX": "3"}
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {"NCCL_IB_HCA": "=mlx5_0:1", "NCCL_IB_GID_INDEX": "3"}
 
 
 def test_a_down_port_is_ignored(devinfo) -> None:
     """mlx5_1 in the sample is DOWN; only mlx5_0 may be offered to NCCL."""
     devinfo(MLX5_ROCE)
 
-    assert lium_fabric_env.fabric_environment()["NCCL_IB_HCA"] == "=mlx5_0:1"
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports())["NCCL_IB_HCA"] == "=mlx5_0:1"
 
 
 def test_an_infiniband_host_is_left_alone(devinfo) -> None:
     """NCCL finds an InfiniBand fabric by itself, and that path is what runs in prod today."""
     devinfo(INFINIBAND)
 
-    assert lium_fabric_env.fabric_environment() == {}
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
 
 
 def test_a_mixed_host_follows_its_infiniband_side(devinfo) -> None:
     """A host on both fabrics was sold on the InfiniBand one — pinning Ethernet points at the wrong wire."""
     devinfo(INFINIBAND + MLX5_ROCE)
 
-    assert lium_fabric_env.fabric_environment() == {}
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
 
 
 def test_a_roce_v1_only_port_is_ignored(devinfo) -> None:
@@ -128,7 +128,7 @@ def test_a_roce_v1_only_port_is_ignored(devinfo) -> None:
         "\t\t\tlink_layer:\t\tEthernet\n\t\t\tGID[  0]:\t\t::ffff:10.0.0.5, RoCE v1\n"
     )
 
-    assert lium_fabric_env.fabric_environment() == {}
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
 
 
 def test_a_card_with_no_address_is_ignored(devinfo) -> None:
@@ -138,7 +138,7 @@ def test_a_card_with_no_address_is_ignored(devinfo) -> None:
         "\t\t\tlink_layer:\t\tEthernet\n\t\t\tGID[  0]:\t\tfe80::1, RoCE v2\n"
     )
 
-    assert lium_fabric_env.fabric_environment() == {}
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
 
 
 def test_an_unconfigured_card_is_ignored(devinfo) -> None:
@@ -148,7 +148,7 @@ def test_an_unconfigured_card_is_ignored(devinfo) -> None:
         "\t\t\tlink_layer:\t\tEthernet\n\t\t\tGID[  0]:\t\t::ffff:169.254.3.7, RoCE v2\n"
     )
 
-    assert lium_fabric_env.fabric_environment() == {}
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
 
 
 def test_rails_that_disagree_about_the_gid_index_leave_it_to_nccl(devinfo) -> None:
@@ -158,7 +158,7 @@ def test_rails_that_disagree_about_the_gid_index_leave_it_to_nccl(devinfo) -> No
         + "\t\t\tGID[  1]:\t\t::ffff:172.16.5.7, RoCE v2\n"
     )
 
-    environment = lium_fabric_env.fabric_environment()
+    environment = lium_fabric_env.fabric_environment(lium_fabric_env.read_ports())
 
     assert environment["NCCL_IB_HCA"] == "=mlx5_0:1,mlx5_1:1"
     assert "NCCL_IB_GID_INDEX" not in environment
@@ -167,13 +167,13 @@ def test_rails_that_disagree_about_the_gid_index_leave_it_to_nccl(devinfo) -> No
 def test_a_host_with_no_rdma_asks_for_nothing(devinfo) -> None:
     devinfo("")
 
-    assert lium_fabric_env.fabric_environment() == {}
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
 
 
 def test_the_output_is_shell_assignments(devinfo) -> None:
     devinfo(SOFT_ROCE)
 
-    assert lium_fabric_env.render(lium_fabric_env.fabric_environment()) == (
+    assert lium_fabric_env.render(lium_fabric_env.fabric_environment(lium_fabric_env.read_ports())) == (
         "NCCL_IB_HCA==rxe0:1\nNCCL_IB_GID_INDEX=1"
     )
 
