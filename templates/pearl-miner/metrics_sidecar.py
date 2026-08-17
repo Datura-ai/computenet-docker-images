@@ -1,72 +1,80 @@
-"""Expose the PEARL container's per-GPU hashrate and miner log on :9101 for the platform.
+"""Expose the PEARL container's per-GPU hashrate, accepted work and miner log on :9101.
 
-Same contract as the Dolphin and engy sidecars (bearer token, fail-closed, port 9101), simpler
-plumbing: pearl-miner has no metrics port and no HTTP of any kind — the stripped binary's only
-output is stdout, one line per GPU every ~5s:
+Same contract as the Dolphin and engy sidecars (bearer token, fail-closed, port 9101). PeakMiner
+serves its own stats on the container's loopback, so this reads that JSON instead of parsing stdout:
 
-    Hashrate GPU #0 = 51.02 TH/s
-
-The entrypoint tees each per-GPU process into PEARL_LOG_DIR/gpu-<i>.log and its hashrate lines alone
-into PEARL_LOG_DIR/rate-<i>.log, which is what this reads. Hashrate is the ONLY signal the miner
-emits — it prints no accepted/rejected shares — so downstream revenue attribution is a
-hashrate-weighted split of the wallet payout, never measured accepted work.
+    GET http://127.0.0.1:4068/summary
 
   PEARL_LOG_DIR=/var/log/pearl PEARL_GPU_COUNT=8 METRICS_TOKEN=… python3 metrics_sidecar.py
 
+That API is also why ACCEPTED SHARES are exported here, not just hashrate. Pearl's V3 hard fork
+(2026-08-11) had the old miner submitting work the network rejected outright: every card sat at full
+hashrate and 100% GPU util, the platform called the fleet healthy, and six days of mining earned
+nothing. Hashrate says the GPU is busy; only accepted shares say the work counted.
+
 Two routes, both behind the same bearer token:
-  /metrics        per-GPU hashrate, per-GPU age of that sample, the node total over GPUs still
-                  hashing, and reporting vs expected GPU count
-  /logs?tail=N    the tail of the miner logs, because on a miner's host the container's stdout goes
+  /metrics        per-GPU hashrate and share counts, the node total, accepted/invalid work, how long
+                  since the pool took a share, and reporting vs expected GPU count
+  /logs?tail=N    the tail of the miner log, because on a miner's host the container's stdout goes
                   to a docker pipe we cannot reach
 
 Without METRICS_TOKEN it refuses to start: an unauthenticated port on a miner's host would publish
-our fleet's hashrate to whoever scans it.
+our fleet's hashrate to whoever scans it. PeakMiner's own API has no auth at all, which is why it
+stays on the container's loopback and this port is the only way out.
 """
 
 import hmac
 import http.server
+import json
 import os
-import re
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 from dataclasses import dataclass
 
 PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN: str = os.environ.get("METRICS_TOKEN", "")
 LOG_DIR: str = os.environ.get("PEARL_LOG_DIR", "/var/log/pearl")
-# How many miner processes the entrypoint launched. Kept as its own series rather than inferred from
-# the files present: a process that died before writing its first line leaves no file, and "2 of 8
-# GPUs reporting" is the alert, while a bare count of 2 reads as a healthy 2-card node.
+MINER_LOG_NAME: str = "peakminer.log"
+# PeakMiner's stats API. Its default binding is the container's own loopback and it is left there.
+MINER_API_URL: str = os.environ.get("PEAK_API_URL", "http://127.0.0.1:4068/summary")
+MINER_API_TIMEOUT_SECONDS: float = 3.0
+# How many GPUs the entrypoint counted at launch. Kept as its own series rather than inferred from
+# what the miner reports: "2 of 8 GPUs reporting" is the alert, while a bare count of 2 reads as a
+# healthy 2-card node.
 EXPECTED_GPUS: int = int(os.environ.get("PEARL_GPU_COUNT", "0"))
-# Enough to hold several minutes of a 5s cadence even if the miner starts printing more per line.
-TAIL_BYTES: int = 65536
-# A GPU counts as reporting only while its rate file is still growing. The miner prints every ~5s, so a
-# minute of silence is a stopped card, not a slow one. Without this a miner that is alive but has
-# stopped hashing (GPU fell off the bus, engine wedged) keeps its last rate forever and
-# gpus_reporting stays at full — the exact "N of 8 cards mining" alert this port exists to raise
-# would never fire. The stale value itself is still served, next to its age.
-STALE_AFTER_SECONDS: float = 60.0
 LOG_TAIL_DEFAULT_BYTES: int = 262144
 LOG_TAIL_MAX_BYTES: int = 8388608
 
-# Freshness comes from the rate file's mtime, so it must be a file ONLY hashrate lines can touch:
-# the miner keeps printing pool and job lines after a card stops hashing, and the full log's mtime
-# would report a dead card as fresh.
-RATE_NAME = re.compile(r"^rate-(?P<index>\d+)\.log$")
-LOG_NAME = re.compile(r"^gpu-(?P<index>\d+)\.log$")
-# The miner's own index is always 0 (one process per GPU, pinned with CUDA_VISIBLE_DEVICES), so the
-# label comes from the FILE name; only the rate is read off the line.
-HASHRATE_LINE = re.compile(r"^Hashrate GPU #\d+ = (?P<rate>[0-9.]+) (?P<unit>[KMGTPE]?)H/s\s*$")
-UNIT_SCALE: dict[str, float] = {
-    "": 1.0, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15, "E": 1e18,
-}
+
+@dataclass(frozen=True)
+class GpuSample:
+    """One card as the miner currently reports it."""
+
+    index: int
+    hashrate_hs: float
+    accepted_shares: int
+    invalid_shares: int
+
+
+@dataclass(frozen=True)
+class MinerSummary:
+    """The miner's own view of this node: what it is hashing and what the pool has taken."""
+
+    pool_connected: bool
+    hashrate_hs: float
+    accepted_shares: int
+    invalid_shares: int
+    last_share_at: float | None
+    gpus: list[GpuSample]
 
 
 @dataclass(frozen=True)
 class MetricsSnapshot:
-    """One rendered exposition and how many GPUs were mining when it was taken."""
+    """One rendered exposition and how many GPUs were hashing when it was taken."""
 
     body: bytes
     reporting_gpus: int
@@ -91,86 +99,91 @@ def read_tail(path: str, max_bytes: int) -> str:
         return ""
 
 
-def last_hashrate(text: str) -> float | None:
-    """Hashes per second from the most recent complete hashrate line, whatever unit it printed in."""
-    for line in reversed(text.splitlines()):
-        match = HASHRATE_LINE.match(line.strip())
-        if match is not None:
-            return float(match.group("rate")) * UNIT_SCALE[match.group("unit")]
-    return None
+def fetch_summary() -> MinerSummary | None:
+    """The miner's stats, or None while it is starting up, wedged, or already gone."""
+    try:
+        with urllib.request.urlopen(MINER_API_URL, timeout=MINER_API_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read())
+    except (OSError, urllib.error.HTTPError, ValueError) as error:
+        _log(f"cannot read {MINER_API_URL}: {error!r}")
+        return None
+    gpus: list[GpuSample] = [
+        GpuSample(
+            index=int(gpu["id"]),
+            hashrate_hs=float(gpu["hashrate"]),
+            accepted_shares=int(gpu["accepted_shares"]),
+            invalid_shares=int(gpu["invalid_shares"]),
+        )
+        for gpu in payload.get("gpus", [])
+    ]
+    last_share_at = payload.get("last_share_at")
+    return MinerSummary(
+        pool_connected=bool(payload.get("pool", {}).get("connected", False)),
+        hashrate_hs=float(payload.get("hashrate", 0.0)),
+        accepted_shares=int(payload.get("accepted_shares", 0)),
+        invalid_shares=int(payload.get("invalid_shares", 0)),
+        last_share_at=float(last_share_at) if last_share_at is not None else None,
+        gpus=gpus,
+    )
 
 
 def collect() -> MetricsSnapshot:
-    """Per-GPU hashrate series plus the reporting/expected counts, and how many GPUs answered.
+    """Per-GPU and node-level series, and how many GPUs are actually hashing.
 
-    A GPU whose rate file stopped growing keeps its last value and grows an age instead of
-    disappearing: a vanished series reads as "this card was never here", while a frozen one plus its
-    age says the miner stopped. It leaves the node TOTAL and the reporting count though — those two
-    answer "what is this node hashing right now", and a dead card's last rate would otherwise be
-    credited with work (and, downstream, with money) forever.
+    A GPU the miner reports at zero keeps its series at zero instead of disappearing: a vanished
+    series reads as "this card was never here", while a zero says the card is present and dead.
     """
-    now: float = time.time()
-    hashrate_lines: list[str] = []
-    age_lines: list[str] = []
-    reporting_gpus: int = 0
-    fresh_total_hs: float = 0.0
-    try:
-        names: list[str] = sorted(os.listdir(LOG_DIR))
-    except OSError as error:
-        _log(f"cannot list {LOG_DIR}: {error!r}")
-        names = []
-    for name in names:
-        match = RATE_NAME.match(name)
-        if match is None:
-            continue
-        path: str = os.path.join(LOG_DIR, name)
-        rate: float | None = last_hashrate(read_tail(path, TAIL_BYTES))
-        if rate is None:
-            continue  # the process started but has not printed a rate yet (GPU init takes ~10s)
-        index: str = match.group("index")
-        try:
-            age: float = max(0.0, now - os.path.getmtime(path))
-        except OSError:
-            age = 0.0
-        hashrate_lines.append(f'pearl_sidecar_gpu_hashrate_hs{{gpu="{index}"}} {rate:.0f}')
-        age_lines.append(f'pearl_sidecar_gpu_sample_age_seconds{{gpu="{index}"}} {age:.1f}')
-        if age <= STALE_AFTER_SECONDS:
-            reporting_gpus += 1
-            fresh_total_hs += rate
-    body: str = "\n".join(
-        [
-            "# HELP pearl_sidecar_gpu_hashrate_hs Last hashrate the miner printed for this GPU, in hashes per second.",
-            "# TYPE pearl_sidecar_gpu_hashrate_hs gauge",
-            *hashrate_lines,
-            "# HELP pearl_sidecar_gpu_sample_age_seconds Seconds since that GPU last printed a hashrate.",
-            "# TYPE pearl_sidecar_gpu_sample_age_seconds gauge",
-            *age_lines,
-            "# HELP pearl_sidecar_hashrate_total_hs Node hashrate counting only GPUs still printing rates.",
-            "# TYPE pearl_sidecar_hashrate_total_hs gauge",
-            f"pearl_sidecar_hashrate_total_hs {fresh_total_hs:.0f}",
-            "# HELP pearl_sidecar_gpus_reporting GPUs whose hashrate line is younger than the stale cutoff.",
-            "# TYPE pearl_sidecar_gpus_reporting gauge",
-            f"pearl_sidecar_gpus_reporting {reporting_gpus}",
-            "# HELP pearl_sidecar_gpus_expected Miner processes the entrypoint launched.",
-            "# TYPE pearl_sidecar_gpus_expected gauge",
-            f"pearl_sidecar_gpus_expected {EXPECTED_GPUS}",
-            "",
+    summary: MinerSummary | None = fetch_summary()
+    gpus: list[GpuSample] = summary.gpus if summary is not None else []
+    reporting_gpus: int = sum(1 for gpu in gpus if gpu.hashrate_hs > 0)
+    lines: list[str] = [
+        "# HELP pearl_sidecar_gpu_hashrate_hs Hashrate the miner reports for this GPU, in hashes per second.",
+        "# TYPE pearl_sidecar_gpu_hashrate_hs gauge",
+        *(f'pearl_sidecar_gpu_hashrate_hs{{gpu="{gpu.index}"}} {gpu.hashrate_hs:.0f}' for gpu in gpus),
+        "# HELP pearl_sidecar_gpu_accepted_shares Shares the pool accepted from this GPU since the miner started.",
+        "# TYPE pearl_sidecar_gpu_accepted_shares counter",
+        *(f'pearl_sidecar_gpu_accepted_shares{{gpu="{gpu.index}"}} {gpu.accepted_shares}' for gpu in gpus),
+        "# HELP pearl_sidecar_gpu_invalid_shares Shares the pool rejected from this GPU since the miner started.",
+        "# TYPE pearl_sidecar_gpu_invalid_shares counter",
+        *(f'pearl_sidecar_gpu_invalid_shares{{gpu="{gpu.index}"}} {gpu.invalid_shares}' for gpu in gpus),
+        "# HELP pearl_sidecar_hashrate_total_hs Node hashrate as the miner reports it.",
+        "# TYPE pearl_sidecar_hashrate_total_hs gauge",
+        f"pearl_sidecar_hashrate_total_hs {summary.hashrate_hs if summary else 0.0:.0f}",
+        "# HELP pearl_sidecar_accepted_shares Shares the pool accepted from this node since the miner started.",
+        "# TYPE pearl_sidecar_accepted_shares counter",
+        f"pearl_sidecar_accepted_shares {summary.accepted_shares if summary else 0}",
+        "# HELP pearl_sidecar_invalid_shares Shares the pool rejected from this node since the miner started.",
+        "# TYPE pearl_sidecar_invalid_shares counter",
+        f"pearl_sidecar_invalid_shares {summary.invalid_shares if summary else 0}",
+        "# HELP pearl_sidecar_pool_connected 1 while the miner holds a stratum connection to a pool.",
+        "# TYPE pearl_sidecar_pool_connected gauge",
+        f"pearl_sidecar_pool_connected {1 if summary is not None and summary.pool_connected else 0}",
+        "# HELP pearl_sidecar_gpus_reporting GPUs the miner reports as hashing right now.",
+        "# TYPE pearl_sidecar_gpus_reporting gauge",
+        f"pearl_sidecar_gpus_reporting {reporting_gpus}",
+        "# HELP pearl_sidecar_gpus_expected GPUs the entrypoint counted when it launched the miner.",
+        "# TYPE pearl_sidecar_gpus_expected gauge",
+        f"pearl_sidecar_gpus_expected {EXPECTED_GPUS}",
+    ]
+    # Absent until the pool takes the first share, so "never accepted anything" cannot be read as a
+    # fresh zero — a node whose work is being rejected wholesale has no last share to age.
+    if summary is not None and summary.last_share_at is not None:
+        age_seconds: float = max(0.0, time.time() - summary.last_share_at)
+        lines += [
+            "# HELP pearl_sidecar_last_share_age_seconds Seconds since the pool last accepted a share from this node.",
+            "# TYPE pearl_sidecar_last_share_age_seconds gauge",
+            f"pearl_sidecar_last_share_age_seconds {age_seconds:.1f}",
         ]
-    )
+    body: str = "\n".join([*lines, ""])
     return MetricsSnapshot(body=body.encode("utf-8"), reporting_gpus=reporting_gpus)
 
 
 def read_log_tail(max_bytes: int) -> bytes:
-    """Every GPU's log tail, concatenated with a header per file so they stay tellable apart."""
-    try:
-        names = sorted(name for name in os.listdir(LOG_DIR) if LOG_NAME.match(name))
-    except OSError as error:
-        return f"logs unavailable: {error!r}\n".encode()
-    if not names:
-        return b"no miner logs yet\n"
-    per_file: int = max(1024, max_bytes // len(names))
-    chunks: list[str] = [f"===== {name} =====\n{read_tail(os.path.join(LOG_DIR, name), per_file)}" for name in names]
-    return "\n".join(chunks).encode("utf-8")
+    """The tail of the miner log, or a readable stand-in before the miner has written one."""
+    path: str = os.path.join(LOG_DIR, MINER_LOG_NAME)
+    if not os.path.exists(path):
+        return b"no miner log yet\n"
+    return read_tail(path, max_bytes).encode("utf-8")
 
 
 def requested_tail_bytes(query: str) -> int:
@@ -219,7 +232,7 @@ def main() -> None:
     if not TOKEN:
         _log("METRICS_TOKEN is required — refusing to expose an unauthenticated metrics port.")
         raise SystemExit(1)
-    _log(f"serving :{PORT}/metrics from {LOG_DIR} for {EXPECTED_GPUS} GPU(s)")
+    _log(f"serving :{PORT}/metrics from {MINER_API_URL} for {EXPECTED_GPUS} GPU(s)")
     http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
