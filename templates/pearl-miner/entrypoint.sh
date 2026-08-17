@@ -39,22 +39,62 @@ LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
 mkdir -p "${LOG_DIR}"
 
 # One process for every GPU: PeakMiner drives them all itself and reports each card separately in
-# its stats API, so there is nothing left for per-GPU processes to buy.
+# its stats API, so there is nothing left for per-GPU processes to buy. The flip side is that one
+# crash takes all the node's cards down, so the miner is supervised here rather than left to the
+# platform: nothing sets a docker restart policy on a filler container, and the backend only
+# relaunches on its own scheduling cycle (self-heal is off by default), so an unsupervised crash
+# costs the whole node until a cycle notices.
 #
 # --log-file mirrors the log the sidecar serves on /logs, because on a miner's host we can reach
 # neither `docker logs` nor the container filesystem; --log-append keeps history across a restart,
 # which is exactly when the log is worth reading. The stats API stays on the container's loopback
 # (PeakMiner's default): it has no authentication, and the sidecar is the authenticated way out.
-/usr/local/bin/peakminer \
-    --coin pearl "${pool_args[@]}" \
-    --user "${PEARL_POOL_WALLET}.${WORKER}" \
-    --log-file "${LOG_DIR}/peakminer.log" --log-append &
+RESTART_DELAY_SECONDS="${PEARL_MINER_RESTART_DELAY_SECONDS:-10}"
+# Crash-loop ceiling: a miner that dies for a reason restarting cannot fix (bad wallet, pool
+# rejecting us, a card gone) must NOT be hidden behind a forever-loop — past the cap the container
+# exits non-zero so the platform sees a failed filler instead of a node that looks alive and earns
+# nothing. That is the failure mode this whole image exists to end.
+MAX_RESTARTS="${PEARL_MINER_MAX_RESTARTS:-5}"
+RESTART_WINDOW_SECONDS="${PEARL_MINER_RESTART_WINDOW_SECONDS:-600}"
+
+supervise_miner() {
+    local exit_code=0 now=0 window_started_at=0 restarts=0
+    while true; do
+        set +e
+        peakminer \
+            --coin pearl "${pool_args[@]}" \
+            --user "${PEARL_POOL_WALLET}.${WORKER}" \
+            --log-file "${LOG_DIR}/peakminer.log" --log-append
+        exit_code=$?
+        set -e
+
+        # Deaths are counted per fixed window rather than as a rolling history: a miner that runs
+        # fine for a window and then dies once is a blip and starts a fresh count, while one dying
+        # repeatedly inside a single window is the crash loop we refuse to hide.
+        now=$(date +%s)
+        if (( now - window_started_at >= RESTART_WINDOW_SECONDS )); then
+            window_started_at="${now}"
+            restarts=0
+        fi
+        restarts=$(( restarts + 1 ))
+
+        if (( restarts > MAX_RESTARTS )); then
+            echo "peakminer exited with code ${exit_code}; ${restarts} restarts in ${RESTART_WINDOW_SECONDS}s — giving up" >&2
+            # Non-zero even when the miner exited 0: a perpetual miner that stops is a failure, and a
+            # zero here would read to the platform as a filler that finished its work.
+            return "$(( exit_code == 0 ? 1 : exit_code ))"
+        fi
+        echo "peakminer exited with code ${exit_code}, restarting in ${RESTART_DELAY_SECONDS}s" >&2
+        sleep "${RESTART_DELAY_SECONDS}"
+    done
+}
+
+supervise_miner &
 miner_pid=$!
 
 # The metrics sidecar, only when the platform gave us a token — it refuses to start without one, and
 # an unguarded restart loop would spin forever on nodes that never enable metrics. Wrapped in a
-# forever-loop so it never exits: `wait -n` below has no way to tell WHICH child died, so a sidecar
-# that could exit would look exactly like a dead miner and take the whole container down with it.
+# forever-loop so a sidecar crash never leaves the node unobservable while the miner keeps earning.
 if [[ -n "${METRICS_TOKEN:-}" ]]; then
     (
         while true; do
@@ -66,13 +106,10 @@ if [[ -n "${METRICS_TOKEN:-}" ]]; then
     ) &
 fi
 
-# Exit (and let the platform restart the container) as soon as the miner dies. `wait -n` is called
-# WITHOUT pids (bash 5.1 returns a bogus 0 for an explicit pid that already exited) and with an
-# errexit guard (a plain non-zero `wait -n` would abort the script before the log line and kill).
+# The supervisor only returns once it has given up on the miner, so reaching this line means the
+# container really is done. Waited on BY PID (not `wait -n`): the sidecar loop is also a child, and
+# a bare `wait -n` would return the moment anything else finished.
 exit_code=0
-wait -n || exit_code=$?
-echo "peakminer exited with code ${exit_code}, shutting down" >&2
-kill "${miner_pid}" 2>/dev/null || true
-# A perpetual miner exiting is a failure even at code 0 (e.g. pool-initiated shutdown) — report
-# non-zero so the platform never mistakes a dead filler for a completed job.
+wait "${miner_pid}" || exit_code=$?
+echo "peakminer supervisor gave up (code ${exit_code}), shutting down" >&2
 exit "$(( exit_code == 0 ? 1 : exit_code ))"
