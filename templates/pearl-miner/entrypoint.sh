@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Launch one pearl-miner process per visible GPU.
+# Launch PeakMiner across every visible GPU.
 #
 # Env contract (pool-independent, injected by the Lium backend at filler launch):
-#   PEARL_POOL_HOST    pool hostname (default pool.pearlhash.xyz)
-#   PEARL_POOL_PORT    pool port (default 9000)
-#   PEARL_POOL_WALLET  PRL payout address (required)
-#   PEARL_POOL_WORKER  worker name shown in the pool (default: container hostname)
-#   PEARL_MDL_WALLET   modelOS merge-mining payout address (reserved: pearlhash registers it
-#                      pool-side per account, the miner CLI takes no MDL flag yet)
+#   PEARL_POOL_HOST      pool hostname (default prl.kryptex.network)
+#   PEARL_POOL_PORT      pool port (default 7048)
+#   PEARL_POOL_WALLET    PRL payout address (required)
+#   PEARL_POOL_WORKER    worker name shown in the pool (default: container hostname)
+#   PEARL_POOL_FAILOVER  optional "host:port,host:port" tried in order when the primary is down
 set -euo pipefail
 
 if [[ -z "${PEARL_POOL_WALLET:-}" ]]; then
@@ -15,7 +14,6 @@ if [[ -z "${PEARL_POOL_WALLET:-}" ]]; then
     exit 1
 fi
 
-POOL="${PEARL_POOL_HOST}:${PEARL_POOL_PORT}"
 WORKER="${PEARL_POOL_WORKER:-$(hostname)}"
 
 # `|| true` inside AND outside: nvidia-smi may be absent (no driver) and grep -c exits 1 on zero
@@ -26,41 +24,32 @@ if [[ "${GPU_COUNT}" -eq 0 ]]; then
     exit 1
 fi
 
+# One --url per pool, primary first: PeakMiner moves to the next one on its own when a pool stops
+# answering. The failover list is what keeps a dead pool from idling the whole fleet again.
+pool_args=(--url "${PEARL_POOL_HOST}:${PEARL_POOL_PORT}")
+if [[ -n "${PEARL_POOL_FAILOVER:-}" ]]; then
+    IFS=',' read -ra failover_pools <<< "${PEARL_POOL_FAILOVER}"
+    for pool in "${failover_pools[@]}"; do
+        pool="${pool//[[:space:]]/}"
+        [[ -n "${pool}" ]] && pool_args+=(--url "${pool}")
+    done
+fi
+
 LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
 mkdir -p "${LOG_DIR}"
-# The rate files carry FRESHNESS, so they must not survive a restart: a container that comes back in
-# under a minute would otherwise show the pre-restart rates as current and credit this node with
-# hashrate it is not producing while the GPUs are still initialising. The full logs stay appended —
-# they are diagnostics, and history across a restart is exactly what makes them useful.
-rm -f "${LOG_DIR}"/rate-*.log
 
-# One process per GPU: pearl-miner's multi-GPU behavior is undocumented, per-GPU processes with
-# CUDA_VISIBLE_DEVICES pinning work the same on 1-GPU and 8-GPU nodes. Worker names get a -g<i>
-# suffix on multi-GPU nodes so the pool shows each GPU separately.
+# One process for every GPU: PeakMiner drives them all itself and reports each card separately in
+# its stats API, so there is nothing left for per-GPU processes to buy.
 #
-# Each process is tee'd into its own log file as well as the container's stdout: the sidecar serves
-# those files on /logs, because on a miner's host we can reach neither `docker logs` nor the
-# container filesystem. Process substitution rather than a `| tee` pipeline so $! stays the MINER's
-# pid — through a pipe it would be tee's, and every miner crash would report tee's exit code 0.
-#
-# The hashrate lines ALSO go to a file of their own, and that is what the sidecar measures freshness
-# by: the miner keeps printing job and pool lines after a card stops hashing, so the full log's
-# mtime would call a dead card fresh. A file only hashrate lines can touch cannot lie about it.
-# grep hangs off a SECOND tee sink rather than a pipe after it: piping tee into grep would make
-# grep the only consumer of tee's stdout, and the miner's output would vanish from the container's
-# own stdout — the one place the platform's failure diagnostics can still read it.
-pids=()
-for ((i = 0; i < GPU_COUNT; i++)); do
-    name="${WORKER}"
-    if [[ "${GPU_COUNT}" -gt 1 ]]; then
-        name="${WORKER}-g${i}"
-    fi
-    CUDA_VISIBLE_DEVICES="${i}" /usr/local/bin/pearl-miner \
-        --host "${POOL}" --user "${PEARL_POOL_WALLET}" --worker "${name}" \
-        > >(tee -a "${LOG_DIR}/gpu-${i}.log" \
-             >(grep --line-buffered -E "^Hashrate GPU" >> "${LOG_DIR}/rate-${i}.log")) 2>&1 &
-    pids+=($!)
-done
+# --log-file mirrors the log the sidecar serves on /logs, because on a miner's host we can reach
+# neither `docker logs` nor the container filesystem; --log-append keeps history across a restart,
+# which is exactly when the log is worth reading. The stats API stays on the container's loopback
+# (PeakMiner's default): it has no authentication, and the sidecar is the authenticated way out.
+/usr/local/bin/peakminer \
+    --coin pearl "${pool_args[@]}" \
+    --user "${PEARL_POOL_WALLET}.${WORKER}" \
+    --log-file "${LOG_DIR}/peakminer.log" --log-append &
+miner_pid=$!
 
 # The metrics sidecar, only when the platform gave us a token — it refuses to start without one, and
 # an unguarded restart loop would spin forever on nodes that never enable metrics. Wrapped in a
@@ -77,13 +66,13 @@ if [[ -n "${METRICS_TOKEN:-}" ]]; then
     ) &
 fi
 
-# Exit (and let the platform restart the container) as soon as any miner dies. `wait -n` is called
+# Exit (and let the platform restart the container) as soon as the miner dies. `wait -n` is called
 # WITHOUT pids (bash 5.1 returns a bogus 0 for an explicit pid that already exited) and with an
 # errexit guard (a plain non-zero `wait -n` would abort the script before the log line and kill).
 exit_code=0
 wait -n || exit_code=$?
-echo "a pearl-miner process exited with code ${exit_code}, shutting down" >&2
-kill "${pids[@]}" 2>/dev/null || true
+echo "peakminer exited with code ${exit_code}, shutting down" >&2
+kill "${miner_pid}" 2>/dev/null || true
 # A perpetual miner exiting is a failure even at code 0 (e.g. pool-initiated shutdown) — report
 # non-zero so the platform never mistakes a dead filler for a completed job.
 exit "$(( exit_code == 0 ? 1 : exit_code ))"
