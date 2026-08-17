@@ -6,6 +6,10 @@ A renter who runs their job inside their own image should not have to know that 
 ulimit and nothing else, so the devices and the capability are injected here: this wrapper is
 registered as `default-runtime`, edits the OCI spec on `create`, and then hands off to runc.
 
+It also carries the overlay settings in (DAH-2664): a nested container inherits nothing from the
+pod, so without them NCCL picks the docker bridge inside that container and announces an address its
+peers cannot dial.
+
 Only `uverbs*` and `rdma_cm` are ever added. `issm*` is the subnet-manager interface and `umad*` is
 raw MAD access — a tenant holding either can disturb a fabric every other tenant shares, which is
 the same allowlist the validator applies when it forwards devices into the pod itself.
@@ -18,6 +22,8 @@ import sys
 
 VERBS_DIR = "/dev/infiniband"
 RLIMIT_INFINITY = 0xFFFFFFFFFFFFFFFF
+# Written by the pod's entrypoint, and only while the pod is a cluster member.
+CLUSTER_ENV_FILE = "/etc/lium-cluster.env"
 
 
 def _bundle_path(argv: list[str]) -> str | None:
@@ -65,6 +71,41 @@ def _add_devices(spec: dict) -> None:
         )
 
 
+def _cluster_environment_entries() -> list[str]:
+    if not os.path.isfile(CLUSTER_ENV_FILE):
+        return []
+    with open(CLUSTER_ENV_FILE) as handle:
+        lines = [line.strip() for line in handle]
+    return [line for line in lines if "=" in line and not line.startswith("#")]
+
+
+def _has_its_own_network_namespace(spec: dict) -> bool:
+    """Whether this container gets a fresh netns instead of the pod's (i.e. NOT `--network host`)."""
+    namespaces = spec.get("linux", {}).get("namespaces", [])
+    return any(namespace.get("type") == "network" for namespace in namespaces)
+
+
+def _add_cluster_environment(spec: dict) -> None:
+    """Hand the container the overlay settings, unless it already sets that variable itself.
+
+    Never overriding is the point: a renter who passes `-e NCCL_SOCKET_IFNAME=...` means it.
+
+    Skipped entirely for a container with its own network namespace: wg0 lives in the pod's, so
+    naming it there would point NCCL at an interface that does not exist and break an ordinary
+    single-node job that used to run fine on the bridge.
+    """
+    if _has_its_own_network_namespace(spec):
+        return
+
+    process = spec.setdefault("process", {})
+    environment = process.setdefault("env", [])
+    already_set = {entry.split("=", 1)[0] for entry in environment}
+
+    for entry in _cluster_environment_entries():
+        if entry.split("=", 1)[0] not in already_set:
+            environment.append(entry)
+
+
 def _add_memory_pinning(spec: dict) -> None:
     """Registering a memory region pins pages: the capability and the limit are needed together."""
     process = spec.setdefault("process", {})
@@ -86,6 +127,7 @@ def _add_memory_pinning(spec: dict) -> None:
 def inject(spec: dict) -> dict:
     _add_devices(spec)
     _add_memory_pinning(spec)
+    _add_cluster_environment(spec)
     return spec
 
 

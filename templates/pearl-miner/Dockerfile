@@ -1,10 +1,17 @@
-# Lium PEARL (PRL) pool miner — pool-independent wrapper around the pearlhash pearl-miner binary.
-# The binary is glibc-only (no CUDA toolkit needed at build time); libcuda is injected by the
+# Lium PEARL (PRL) pool miner — pool-independent wrapper around the PeakMiner binary.
+# The binary is standalone (glibc only, no CUDA toolkit at build time); libcuda is injected by the
 # NVIDIA container runtime at run time.
-FROM ubuntu:22.04
+#
+# PeakMiner replaced the pearlhash-hosted binary in DAH-2688: Pearl's V3 salted-seed hard fork
+# (block 98,900, 2026-08-11) made every older miner submit shares that the network rejects outright,
+# and the pearlhash binary that survives it is datacenter-only. PeakMiner covers consumer and
+# datacenter cards from one build, speaks plain Stratum V1 (so the pool is a flag), and serves its
+# own stats — which is what finally makes rejected work visible to us.
+FROM ubuntu:24.04
 
-ARG PEARL_MINER_URL=https://pearlhash.xyz/downloads/pearl-miner-v12
-ARG PEARL_MINER_SHA256=f6fe45f8fe9081987505af31f0249021a65b558af514f2e4e37340fb3182805f
+ARG PEAKMINER_VERSION=2.10.0
+ARG PEAKMINER_URL=https://github.com/peakminer/peakminer/releases/download/v${PEAKMINER_VERSION}/peakminer-${PEAKMINER_VERSION}-linux-x86_64
+ARG PEAKMINER_SHA256=25293f43691bdac1f1a209135c335b442991776640ff5552f495bc370d2c430d
 
 # python3: only for the metrics sidecar, which is stdlib-only on purpose — the miner binary itself
 # needs nothing but glibc. NOT python3-minimal: it ships a cut-down stdlib without hmac or
@@ -13,9 +20,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tini python3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL "${PEARL_MINER_URL}" -o /usr/local/bin/pearl-miner \
-    && echo "${PEARL_MINER_SHA256}  /usr/local/bin/pearl-miner" | sha256sum -c - \
-    && chmod +x /usr/local/bin/pearl-miner
+RUN curl -fsSL "${PEAKMINER_URL}" -o /usr/local/bin/peakminer \
+    && echo "${PEAKMINER_SHA256}  /usr/local/bin/peakminer" | sha256sum -c - \
+    && chmod +x /usr/local/bin/peakminer
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY metrics_sidecar.py /usr/local/bin/metrics_sidecar.py
@@ -23,7 +30,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    PEARL_POOL_HOST=pool.pearlhash.xyz \
-    PEARL_POOL_PORT=9000
+    PEARL_POOL_HOST=prl.kryptex.network \
+    PEARL_POOL_PORT=7048
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

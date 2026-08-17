@@ -108,3 +108,66 @@ def test_the_bundle_flag_is_read_in_both_forms() -> None:
     assert lium_rdma_runc._bundle_path(["create", "--bundle", "/run/x", "id"]) == "/run/x"
     assert lium_rdma_runc._bundle_path(["create", "-b", "/run/y", "id"]) == "/run/y"
     assert lium_rdma_runc._bundle_path(["state", "id"]) is None
+
+
+# --- DAH-2664: the overlay settings reach a nested container ---
+
+
+@pytest.fixture
+def cluster_env_file(tmp_path, monkeypatch) -> Path:
+    env_file = tmp_path / "lium-cluster.env"
+    env_file.write_text("NCCL_SOCKET_IFNAME=wg0\nGLOO_SOCKET_IFNAME=wg0\n")
+    monkeypatch.setattr(lium_rdma_runc, "CLUSTER_ENV_FILE", str(env_file))
+    return env_file
+
+
+def test_the_overlay_settings_are_handed_to_the_container(cluster_env_file) -> None:
+    # Act
+    injected: dict = lium_rdma_runc.inject(_spec())
+
+    # Assert — without this NCCL inside the nested container picks the docker bridge
+    assert "NCCL_SOCKET_IFNAME=wg0" in injected["process"]["env"]
+    assert "GLOO_SOCKET_IFNAME=wg0" in injected["process"]["env"]
+
+
+def test_a_setting_the_renter_passed_himself_is_never_overridden(cluster_env_file) -> None:
+    # Arrange — `docker run -e NCCL_SOCKET_IFNAME=eth0` is a deliberate choice
+    spec: dict = _spec()
+    spec["process"]["env"] = ["NCCL_SOCKET_IFNAME=eth0"]
+
+    # Act
+    environment: list[str] = lium_rdma_runc.inject(spec)["process"]["env"]
+
+    # Assert
+    assert "NCCL_SOCKET_IFNAME=eth0" in environment
+    assert "NCCL_SOCKET_IFNAME=wg0" not in environment
+
+
+def test_a_container_with_its_own_network_gets_no_overlay_settings(cluster_env_file, fake_verbs) -> None:
+    # Arrange — a plain `docker run` (no --network host) has a network namespace of its own, and
+    # wg0 is not in it; naming it would break NCCL for a job that ran fine on the bridge.
+    spec: dict = _spec()
+    spec["linux"] = {"namespaces": [{"type": "network"}, {"type": "pid"}]}
+
+    # Act
+    injected: dict = lium_rdma_runc.inject(spec)
+
+    # Assert
+    assert injected["process"].get("env", []) == []
+    # the fabric itself still goes in — RDMA does not care about the network namespace
+    assert [Path(device["path"]).name for device in injected["linux"]["devices"]] == [
+        "rdma_cm",
+        "uverbs0",
+        "uverbs1",
+    ]
+
+
+def test_a_standalone_pod_adds_no_settings(tmp_path, monkeypatch) -> None:
+    # Arrange — no cluster membership, so the entrypoint never wrote the file
+    monkeypatch.setattr(lium_rdma_runc, "CLUSTER_ENV_FILE", str(tmp_path / "absent"))
+
+    # Act
+    injected: dict = lium_rdma_runc.inject(_spec())
+
+    # Assert
+    assert injected["process"].get("env", []) == []
