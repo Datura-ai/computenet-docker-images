@@ -31,6 +31,16 @@ Nothing.
   and an unlimited memlock into every OCI spec. Docker can default a ulimit but not a device, hence
   the wrapper. It merges into the base image's `daemon.json` rather than replacing it, so the
   nvidia runtime survives.
+- Those same settings reach a **nested** container too (DAH-2664). The entrypoint writes them to
+  `/etc/lium-cluster.env` and `lium-rdma-runc` copies them into every OCI spec it sees, because a
+  container the inner daemon starts inherits nothing from the pod — `docker run … printenv
+  NCCL_SOCKET_IFNAME` used to come back empty and NCCL then picked the inner bridge. A variable the
+  renter passes with `-e` is left alone.
+- Pod-to-pod SSH works over the overlay (DAH-2664). The backend mints one keypair per cluster; the
+  entrypoint installs the private half at `/root/.ssh/lium_cluster_ed25519` (its own name, so a
+  restored backup's `id_ed25519` survives), appends the public half to `authorized_keys`, and
+  appends an `~/.ssh/config` block for the overlay subnet that skips the host-key prompt. This is what `mpirun`, DeepSpeed's pdsh launcher and the nccl-tests recipes need — without
+  it the only working launcher is torchrun with a hand-typed `--node_rank` per node.
 - `libibverbs` and the provider plugins are installed here. They are not in the base, and without
   them NCCL logs `Failed to open libibverbs.so[.1]` and silently falls back to its socket
   transport while every device check still passes.
@@ -64,8 +74,14 @@ decides which tag a cluster rental actually runs.
 ## Tests
 
 `test_lium_rdma_runc.py` covers the runtime wrapper: the allowlist, the cgroup rules that must
-accompany each device, memory pinning, a host with no fabric, and running twice over one bundle.
+accompany each device, memory pinning, the overlay settings a nested container inherits, a host with
+no fabric, and running twice over one bundle.
+
+`tests/test_entrypoint.sh` runs the entrypoint itself in a throwaway container (wg-quick and the
+base entrypoint stubbed) and checks where the overlay settings and the cluster login end up, with
+which permissions, and that a standalone pod gets neither. Needs Docker.
 
 ```bash
 pytest test_lium_rdma_runc.py
+bash tests/test_entrypoint.sh
 ```
