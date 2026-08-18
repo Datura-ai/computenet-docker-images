@@ -32,6 +32,9 @@ fi
 # Silent + status 0 is what the gate does on an InfiniBand host; a RoCE host prints the two vars.
 if [ -n "${TEST_NO_FABRIC:-}" ]; then
   printf '#!/bin/sh\ncase "$1" in *lium-fabric-env) exit 1;; esac\nexit 0\n' > /usr/local/bin/python3
+elif [ -n "${TEST_FABRIC_FLAPS:-}" ]; then
+  # a card whose link is still coming up: no ACTIVE port for the first two asks, fine on the third
+  printf '#!/bin/sh\ncase "$1" in *lium-fabric-env) n=$(cat /tmp/gate-calls 2>/dev/null || echo 0); n=$((n+1)); echo $n > /tmp/gate-calls; [ "$n" -lt 3 ] && exit 1;; esac\nexit 0\n' > /usr/local/bin/python3
 elif [ -n "${TEST_ROCE_FABRIC:-}" ]; then
   printf '#!/bin/sh\ncase "$1" in *lium-fabric-env) echo "NCCL_IB_HCA==mlx5_0:1"; echo "NCCL_IB_GID_INDEX=3";; esac\nexit 0\n' > /usr/local/bin/python3
 else
@@ -53,6 +56,7 @@ echo "etc_environment_has_ifname=$(grep -c '^NCCL_SOCKET_IFNAME=wg0$' /etc/envir
 echo "login_shell_ifname=$(env -i sh -c '. /etc/profile.d/lium-cluster.sh 2>/dev/null; echo ${NCCL_SOCKET_IFNAME:-}')"
 echo "login_shell_gid_index=$(env -i sh -c '. /etc/profile.d/lium-cluster.sh 2>/dev/null; echo ${NCCL_IB_GID_INDEX:-}')"
 echo "etc_environment_has_hca=$(grep -c '^NCCL_IB_HCA==mlx5_0:1$' /etc/environment 2>/dev/null)"
+echo "gate_calls=$(cat /tmp/gate-calls 2>/dev/null)"
 echo "private_key=$(cat /root/.ssh/lium_cluster_ed25519 2>/dev/null | head -1)"
 echo "private_key_mode=$(stat -c '%a' /root/.ssh/lium_cluster_ed25519 2>/dev/null)"
 echo "ssh_dir_mode=$(stat -c '%a' /root/.ssh 2>/dev/null)"
@@ -143,6 +147,15 @@ RESULT="$(run_entrypoint \
     || fail "cluster env file reads: $(fact cluster_env)"
 [[ "$(fact etc_environment_has_hca)" == "1" ]] && pass "an SSH session reads the card too" || fail "/etc/environment has no NCCL_IB_HCA"
 [[ "$(fact login_shell_gid_index)" == "3" ]] && pass "a login shell reads the GID index" || fail "a login shell got: $(fact login_shell_gid_index)"
+
+echo "== a pod whose card is still coming up: the gate waits instead of failing the rental =="
+RESULT="$(run_entrypoint \
+    -e TEST_FABRIC_FLAPS=1 \
+    -e LIUM_WIREGUARD_CONF_B64="${WIREGUARD_CONF_B64}")"
+
+[[ "$(fact exit_status)" == "0" ]] && pass "the pod came up" || fail "exit $(fact exit_status)"
+[[ "$(fact gate_calls)" == "3" ]] && pass "the gate was retried until the port answered" || fail "the gate was asked $(fact gate_calls) time(s)"
+[[ "$(fact handed_off)" == "1" ]] && pass "handed off to the base entrypoint" || fail "never reached the base entrypoint"
 
 echo "== a pod with no usable fabric: it refuses to start rather than run over TCP =="
 RESULT="$(run_entrypoint \

@@ -14,6 +14,12 @@ CLUSTER_ENV_FILE=/etc/lium-cluster.env
 CLUSTER_SSH_KEY_FILE=/root/.ssh/lium_cluster_ed25519
 CLUSTER_SSH_CONFIG_MARKER="# DAH-2664: the Lium cluster overlay"
 
+# How long the fabric gate waits before refusing the pod. A card whose driver is still loading or
+# whose link is renegotiating reports no ACTIVE port for a few seconds after boot, and refusing
+# there would fail a rental that used to come up; a pod with no device at all still refuses, later.
+FABRIC_GATE_ATTEMPTS=5
+FABRIC_GATE_RETRY_SECONDS=2
+
 raise_cluster_overlay() {
     local conf_b64="${LIUM_WIREGUARD_CONF_B64:-}"
     if [[ -z "$conf_b64" ]]; then
@@ -36,6 +42,23 @@ raise_cluster_overlay() {
     fi
 
     publish_cluster_env
+}
+
+await_fabric_env() {
+    local attempt=1
+    local output
+    while true; do
+        if output=$(python3 /usr/local/bin/lium-fabric-env); then
+            printf '%s' "$output"
+            return 0
+        fi
+        if (( attempt >= FABRIC_GATE_ATTEMPTS )); then
+            return 1
+        fi
+        echo "lium-cluster: no ACTIVE RDMA port yet, retrying in ${FABRIC_GATE_RETRY_SECONDS}s" >&2
+        attempt=$((attempt + 1))
+        sleep "$FABRIC_GATE_RETRY_SECONDS"
+    done
 }
 
 publish_cluster_env() {
@@ -62,7 +85,7 @@ publish_cluster_env() {
     # here for the same reason, which is why its status is checked instead of being piped away.
     # Appended BEFORE the file below is written, so a nested container inherits these too.
     local fabric_env
-    if ! fabric_env=$(python3 /usr/local/bin/lium-fabric-env); then
+    if ! fabric_env=$(await_fabric_env); then
         echo "lium-cluster: no usable RDMA fabric in this pod. Refusing to start." >&2
         exit 1
     fi
