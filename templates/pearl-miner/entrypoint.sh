@@ -35,6 +35,12 @@ if [[ -n "${PEARL_POOL_FAILOVER:-}" ]]; then
     done
 fi
 
+# Take a newer miner build when the pinned major has one. The updater never fails the container: on
+# any problem it installs nothing and the baked-in binary, still on PATH behind the install dir,
+# runs instead.
+"$(dirname "${BASH_SOURCE[0]}")/update_miner.sh" || true
+export PATH="${PEARL_MINER_DIR:-/var/lib/pearl/bin}:${PATH}"
+
 LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
 mkdir -p "${LOG_DIR}"
 
