@@ -28,7 +28,15 @@ if [ -n "${TEST_IP_FAILS:-}" ]; then
 else
   printf '#!/bin/sh\necho "5: wg0    inet 10.42.0.1/24 scope global wg0"\n' > /usr/local/bin/ip
 fi
-printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/python3     # only configure_nested_docker needs it
+# python3 runs both configure_nested_docker's script and lium-fabric-env, the fabric gate.
+# Silent + status 0 is what the gate does on an InfiniBand host; a RoCE host prints the two vars.
+if [ -n "${TEST_NO_FABRIC:-}" ]; then
+  printf '#!/bin/sh\ncase "$1" in *lium-fabric-env) exit 1;; esac\nexit 0\n' > /usr/local/bin/python3
+elif [ -n "${TEST_ROCE_FABRIC:-}" ]; then
+  printf '#!/bin/sh\ncase "$1" in *lium-fabric-env) echo "NCCL_IB_HCA==mlx5_0:1"; echo "NCCL_IB_GID_INDEX=3";; esac\nexit 0\n' > /usr/local/bin/python3
+else
+  printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/python3
+fi
 printf '#!/bin/sh\necho handed-off-to-base-entrypoint\n' > /pytorch-entrypoint.sh
 if [ -n "${TEST_RESTORED_HOME:-}" ]; then      # a backup restored into /root before start
   mkdir -p /root/.ssh
@@ -43,6 +51,8 @@ echo "handed_off=$(grep -c handed-off-to-base-entrypoint /tmp/out.log)"
 echo "cluster_env=$(cat /etc/lium-cluster.env 2>/dev/null | tr '\n' ',')"
 echo "etc_environment_has_ifname=$(grep -c '^NCCL_SOCKET_IFNAME=wg0$' /etc/environment 2>/dev/null)"
 echo "login_shell_ifname=$(env -i sh -c '. /etc/profile.d/lium-cluster.sh 2>/dev/null; echo ${NCCL_SOCKET_IFNAME:-}')"
+echo "login_shell_gid_index=$(env -i sh -c '. /etc/profile.d/lium-cluster.sh 2>/dev/null; echo ${NCCL_IB_GID_INDEX:-}')"
+echo "etc_environment_has_hca=$(grep -c '^NCCL_IB_HCA==mlx5_0:1$' /etc/environment 2>/dev/null)"
 echo "private_key=$(cat /root/.ssh/lium_cluster_ed25519 2>/dev/null | head -1)"
 echo "private_key_mode=$(stat -c '%a' /root/.ssh/lium_cluster_ed25519 2>/dev/null)"
 echo "ssh_dir_mode=$(stat -c '%a' /root/.ssh 2>/dev/null)"
@@ -119,6 +129,31 @@ RESULT="$(TEST_IP_FAILS=1 run_entrypoint \
 [[ "$(fact handed_off)" == "1" ]] && pass "handed off to the base entrypoint" || fail "never reached the base entrypoint"
 [[ "$(fact private_key)" == "-----BEGIN OPENSSH PRIVATE KEY-----" ]] && pass "the cluster login is still installed" || fail "no private key"
 [[ -z "$(fact ssh_config)" ]] && pass "no host block, since the subnet is unknown" || fail "ssh config reads: $(fact ssh_config)"
+
+echo "== a cluster pod on RoCE: the card and GID the gate found are published too =="
+RESULT="$(run_entrypoint \
+    -e TEST_ROCE_FABRIC=1 \
+    -e LIUM_WIREGUARD_CONF_B64="${WIREGUARD_CONF_B64}")"
+
+[[ "$(fact exit_status)" == "0" ]] && pass "entrypoint succeeded" || fail "exit $(fact exit_status)"
+# Appended after the overlay settings, and in the file BEFORE it is written, so a nested container
+# starts with the same card and GID as the pod.
+[[ "$(fact cluster_env)" == *"NCCL_NSOCKS_PERTHREAD=8,NCCL_IB_HCA==mlx5_0:1,NCCL_IB_GID_INDEX=3,"* ]] \
+    && pass "the fabric vars are published for nested containers" \
+    || fail "cluster env file reads: $(fact cluster_env)"
+[[ "$(fact etc_environment_has_hca)" == "1" ]] && pass "an SSH session reads the card too" || fail "/etc/environment has no NCCL_IB_HCA"
+[[ "$(fact login_shell_gid_index)" == "3" ]] && pass "a login shell reads the GID index" || fail "a login shell got: $(fact login_shell_gid_index)"
+
+echo "== a pod with no usable fabric: it refuses to start rather than run over TCP =="
+RESULT="$(run_entrypoint \
+    -e TEST_NO_FABRIC=1 \
+    -e LIUM_WIREGUARD_CONF_B64="${WIREGUARD_CONF_B64}" \
+    -e LIUM_CLUSTER_SSH_KEY_B64="${SSH_PRIVATE_KEY_B64}" \
+    -e LIUM_CLUSTER_SSH_PUBKEY="${SSH_AUTHORIZED_KEY}")"
+
+[[ "$(fact exit_status)" == "1" ]] && pass "the pod is refused" || fail "exit $(fact exit_status)"
+[[ "$(fact handed_off)" == "0" ]] && pass "the workload never starts" || fail "handed off to the base entrypoint anyway"
+[[ -z "$(fact cluster_env)" ]] && pass "nothing is published" || fail "cluster env file reads: $(fact cluster_env)"
 
 echo "== a cluster pod whose backend sends no login: the overlay still comes up =="
 RESULT="$(run_entrypoint -e LIUM_WIREGUARD_CONF_B64="${WIREGUARD_CONF_B64}")"
