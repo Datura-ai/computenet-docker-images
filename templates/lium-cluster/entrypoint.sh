@@ -14,6 +14,12 @@ CLUSTER_ENV_FILE=/etc/lium-cluster.env
 CLUSTER_SSH_KEY_FILE=/root/.ssh/lium_cluster_ed25519
 CLUSTER_SSH_CONFIG_MARKER="# DAH-2664: the Lium cluster overlay"
 
+# How long the fabric gate waits before refusing the pod. A card whose driver is still loading or
+# whose link is renegotiating reports no ACTIVE port for a few seconds after boot, and refusing
+# there would fail a rental that used to come up; a pod with no device at all still refuses, later.
+FABRIC_GATE_ATTEMPTS=5
+FABRIC_GATE_RETRY_SECONDS=2
+
 raise_cluster_overlay() {
     local conf_b64="${LIUM_WIREGUARD_CONF_B64:-}"
     if [[ -z "$conf_b64" ]]; then
@@ -35,15 +41,24 @@ raise_cluster_overlay() {
         exit 1
     fi
 
-    # The one contract with the workload: the overlay is always called wg0. NCCL and gloo do not
-    # pick a second interface on their own, so we name it for them here and the renter never has to.
-    export NCCL_SOCKET_IFNAME=wg0
-    export GLOO_SOCKET_IFNAME=wg0
-    # Bootstrap rides one flow otherwise; these fan it across the wire (measured 7.3x on our fabric).
-    export NCCL_SOCKET_NTHREADS=4
-    export NCCL_NSOCKS_PERTHREAD=8
-
     publish_cluster_env
+}
+
+await_fabric_env() {
+    local attempt=1
+    local output
+    while true; do
+        if output=$(python3 /usr/local/bin/lium-fabric-env); then
+            printf '%s' "$output"
+            return 0
+        fi
+        if (( attempt >= FABRIC_GATE_ATTEMPTS )); then
+            return 1
+        fi
+        echo "lium-cluster: no ACTIVE RDMA port yet, retrying in ${FABRIC_GATE_RETRY_SECONDS}s" >&2
+        attempt=$((attempt + 1))
+        sleep "$FABRIC_GATE_RETRY_SECONDS"
+    done
 }
 
 publish_cluster_env() {
@@ -53,6 +68,9 @@ publish_cluster_env() {
     # session will read them: PAM reads /etc/environment, a login shell reads /etc/profile.d, and
     # (DAH-2664) the nested-container runtime reads CLUSTER_ENV_FILE, because a container the inner
     # docker starts inherits nothing from this process either.
+    # The one contract with the workload: the overlay is always called wg0. NCCL and gloo do not
+    # pick a second interface on their own, so we name it for them here and the renter never has to.
+    # The socket fan-out spreads the bootstrap across flows (measured 7.3x on our fabric).
     local vars=(
         "NCCL_SOCKET_IFNAME=wg0"
         "GLOO_SOCKET_IFNAME=wg0"
@@ -60,11 +78,38 @@ publish_cluster_env() {
         "NCCL_NSOCKS_PERTHREAD=8"
     )
 
+    # DAH-2667: which RoCE card and GID carry this pod's fabric, empty on InfiniBand where NCCL needs
+    # no help. It is also the fabric GATE — it exits non-zero when no ACTIVE port answers verbs, and
+    # a pod without a fabric must not start: NCCL would fall back to TCP over the overlay and the
+    # renter would pay cluster price for a job nothing in the logs explains. A crash in it is fatal
+    # here for the same reason, which is why its status is checked instead of being piped away.
+    # Appended BEFORE the file below is written, so a nested container inherits these too.
+    local fabric_env
+    if ! fabric_env=$(await_fabric_env); then
+        echo "lium-cluster: no usable RDMA fabric in this pod. Refusing to start." >&2
+        exit 1
+    fi
+    if [[ -n "$fabric_env" ]]; then
+        mapfile -t -O "${#vars[@]}" vars <<< "$fabric_env"
+    fi
+
     printf '%s\n' "${vars[@]}" > "$CLUSTER_ENV_FILE"
     chmod 644 "$CLUSTER_ENV_FILE"
 
+    # Every name this script can write, cleared before anything is written back. Clearing only what
+    # we are about to write would strand a value from a previous boot: a pod restarted on a fabric
+    # that no longer pins a GID index would keep serving the old NCCL_IB_GID_INDEX to SSH sessions.
+    local managed=(
+        NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_SOCKET_NTHREADS NCCL_NSOCKS_PERTHREAD
+        NCCL_IB_HCA NCCL_IB_GID_INDEX
+    )
+    for name in "${managed[@]}"; do
+        sed -i "/^${name}=/d" /etc/environment 2>/dev/null || true
+    done
+
     for var in "${vars[@]}"; do
-        grep -q "^${var%%=*}=" /etc/environment 2>/dev/null || echo "$var" >> /etc/environment
+        export "$var"
+        echo "$var" >> /etc/environment
     done
 
     mkdir -p /etc/profile.d
