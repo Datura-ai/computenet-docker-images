@@ -46,6 +46,8 @@ run_entrypoint() {
     PEARL_MINER_RESTART_DELAY_SECONDS=0 \
     PEARL_MINER_MAX_RESTARTS="${max_restarts}" \
     PEARL_MINER_RESTART_WINDOW_SECONDS=600 \
+    PEARL_MINER_AUTO_UPDATE=0 \
+    PEARL_MINER_DIR="${stub_dir}/install" \
         bash "${ENTRYPOINT}" > "${stub_dir}/out" 2>&1
     echo $?
 }
