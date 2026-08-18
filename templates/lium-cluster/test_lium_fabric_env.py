@@ -47,7 +47,7 @@ INFINIBAND = """hca_id:\tmlx5_2
 """
 
 
-def _with_devinfo(output: str) -> dict:
+def _with_devinfo(output: str) -> dict[str, str]:
     """Run the module against a canned dump without pytest's monkeypatch (used by plain asserts)."""
 
     class _Result:
