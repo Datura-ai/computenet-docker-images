@@ -435,6 +435,285 @@ test_terminate_workers_is_bounded() {
     assert_eq "deaf worker is gone" "" "$(ps -o pid= -p "${deaf_pid}" 2>/dev/null | tr -d ' ')"
 }
 
+# ------------------------------------------------------------- HF hub offline mode (DAH-2743)
+# 2026-08-20 prod: seven 8x5090 machines behind ONE NAT IP crash-looped their engines for 13 h.
+# vLLM resolves the UNPINNED revision `main` through the Hub API on every engine start, the farm
+# blew the anonymous 500-req/5-min per-IP quota, hf_hub slept ~200 s on the 429 and the worker's
+# own startup timeout killed the engine first — a livelock the cached weights could not prevent.
+hf_repo_cache_dir() {
+    # The path the CLOSED worker uses, read off a live prod container
+    # (HF_HOME=/root/.cache/dolphinpod-worker/cache) — NOT the HF_HOME this entrypoint exports.
+    # The two differ, and a check pointed at ours finds an empty cache on every real node.
+    echo "${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${MODEL}")"
+}
+
+hf_snapshot_dir() {
+    echo "$(hf_repo_cache_dir)/snapshots/${1:-deadbeef}"
+}
+
+point_hf_ref_main_at() {
+    # hf_hub writes the sha into refs/main as soon as it resolves the revision, BEFORE it fetches
+    # one byte. That is how a ref comes to name a snapshot that is still half on disk.
+    mkdir -p "$(hf_repo_cache_dir)/refs"
+    # NO trailing newline — that is exactly how huggingface_hub writes the file, and `read` would
+    # report EOF on it.
+    printf '%s' "$1" >"$(hf_repo_cache_dir)/refs/main"
+}
+
+seed_hf_cache_revision() {
+    # Args: <revision> then the shard file names to actually create. The index always lists all
+    # three shards, so leaving one out is how a half-downloaded cache is expressed.
+    local revision="$1"
+    shift
+    local snapshot
+    snapshot="$(hf_snapshot_dir "${revision}")"
+    mkdir -p "${snapshot}"
+    printf '%s' '{"weight_map":{"a":"model-00001-of-00003.safetensors","b":"model-00002-of-00003.safetensors","c":"model-00003-of-00003.safetensors"}}' \
+        >"${snapshot}/model.safetensors.index.json"
+    touch "${snapshot}/config.json" "${snapshot}/tokenizer.json"
+    local shard
+    for shard in "$@"; do
+        touch "${snapshot}/${shard}"
+    done
+}
+
+seed_hf_cache() {
+    seed_hf_cache_revision deadbeef "$@"
+    point_hf_ref_main_at deadbeef
+    # hf_hub leaves a lock directory of the SAME name beside the cache on every download, and it
+    # holds no refs. Every fixture carries it, so no check may trip over it.
+    mkdir -p "${SHARED_CACHE}/dolphinpod-worker/cache/hub/.locks/$(hf_cache_dir_name "${MODEL}")"
+    touch "${SHARED_CACHE}/dolphinpod-worker/cache/hub/.locks/$(hf_cache_dir_name "${MODEL}")/e7.lock"
+}
+
+test_model_cache_is_complete() {
+    make_sandbox
+    load_entrypoint
+
+    assert_eq "empty cache is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors"
+    assert_eq "half-downloaded cache is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "every shard present means complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # A shard listed in the index but missing on disk is the seeder-died-midway case: it must
+    # stay online and resume, never go offline against an unusable cache.
+    rm "$(hf_snapshot_dir)/model-00002-of-00003.safetensors"
+    assert_eq "a shard deleted after the fact reopens the network" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # A half-written index lists nothing; treating "no shard is missing" as complete would
+    # take the node offline against a cache the engine cannot load.
+    : >"$(hf_snapshot_dir)/model.safetensors.index.json"
+    assert_eq "a truncated index is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # A cache for a DIFFERENT model must not license going offline for this one.
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    MODEL="nvidia/SomeOtherModel"
+    assert_eq "another model's cache does not count" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+}
+
+test_enable_hf_offline() {
+    make_sandbox
+    load_entrypoint
+    local site_packages="${SANDBOX}/dolphinpod/runtimes/text-v/lib/python3.12/site-packages"
+    mkdir -p "${site_packages}"
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+
+    enable_hf_offline
+    assert_eq "the offline switch lands in site-packages" "1" \
+        "$(ls "${site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null | wc -l | tr -d ' ')"
+    assert_eq "the switch sets HF_HUB_OFFLINE" "1" \
+        "$(grep -c 'HF_HUB_OFFLINE' "${site_packages}/zz-dolphin-hf-offline.pth")"
+
+    # A .pth file, not sitecustomize.py: the runtime belongs to the closed worker, and a file of
+    # our own name can never overwrite one of theirs.
+    assert_eq "no sitecustomize.py is written" "0" \
+        "$(ls "${site_packages}/sitecustomize.py" 2>/dev/null | wc -l | tr -d ' ')"
+
+    # The supervisor calls this every 30 s. It must not rewrite the file each time.
+    local before after
+    before=$(stat -f %m "${site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null || stat -c %Y "${site_packages}/zz-dolphin-hf-offline.pth")
+    enable_hf_offline
+    after=$(stat -f %m "${site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null || stat -c %Y "${site_packages}/zz-dolphin-hf-offline.pth")
+    assert_eq "a second call leaves the file alone" "${before}" "${after}"
+
+    # A worker that updates its runtime brings a new site-packages. The next call must arm it too.
+    local second_site_packages="${SANDBOX}/dolphinpod/runtimes/text-v2/lib/python3.13/site-packages"
+    mkdir -p "${second_site_packages}"
+    enable_hf_offline
+    assert_eq "a new runtime gets the switch as well" "1" \
+        "$(ls "${second_site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null | wc -l | tr -d ' ')"
+
+    # No runtime yet (cold container): must not fail under `set -e`. The harness puts errexit back
+    # OFF after sourcing, so the claim is only worth anything inside a subshell that turns it on —
+    # which is how the real entrypoint runs.
+    DOLPHIN_HOME="${SANDBOX}/empty"
+    assert_eq "no runtime directory is survivable under set -e" "ok" \
+        "$(set -euo pipefail; enable_hf_offline 2>/dev/null && echo ok)"
+}
+
+test_hf_offline_wiring() {
+    make_sandbox
+    load_entrypoint
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+
+    offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
+
+    # Cold node: the cache must be seeded from the Hub, so the Hub stays reachable.
+    sync_hf_offline_with_cache
+    assert_eq "cold cache keeps the Hub reachable" "no" "$(offline_mode_on)"
+
+    # Warm node (the shared cache volume already holds the weights) — no worker needs the Hub.
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    sync_hf_offline_with_cache
+    assert_eq "complete cache turns offline mode on" "yes" "$(offline_mode_on)"
+}
+
+test_hf_offline_is_re_evaluated_later() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
+
+    # Measured on a real cold node 2026-08-21: the worker opens its engine socket about 30 s after
+    # start, while the download of the weights continues for minutes. The seed wait therefore ends
+    # too early, and a check that runs one time only leaves the container online for its full life.
+    seed_hf_cache "model-00001-of-00003.safetensors"
+    sync_hf_offline_with_cache
+    assert_eq "an early check with a partial cache stays online" "no" "$(offline_mode_on)"
+
+    # The download completes some minutes later. The supervisor calls the same function again.
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    sync_hf_offline_with_cache
+    assert_eq "a later check turns offline mode on" "yes" "$(offline_mode_on)"
+
+    # DOLPHIN_MODEL changes to a model this node has never held. The switch must come OFF again,
+    # or offline mode forbids the very download the new model needs and the node never mines.
+    MODEL="nvidia/SomeNewModel"
+    sync_hf_offline_with_cache
+    assert_eq "a new model re-opens the Hub" "no" "$(offline_mode_on)"
+
+    # The two calls above drive the function directly, so they would still pass if someone deleted
+    # the supervisor's call. Guard the wiring itself.
+    assert_eq "the supervisor re-checks it every cycle" "1" \
+        "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
+            | grep -c 'sync_hf_offline_with_cache_and_engines')"
+}
+
+test_only_the_snapshot_under_the_ref_counts() {
+    make_sandbox
+    load_entrypoint
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "the snapshot the ref names is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # Upstream published a new commit. hf_hub moved refs/main to it and began the download, so a
+    # half-filled snapshot now sits beside the complete old one. vLLM resolves `main` through the
+    # same ref, so the old snapshot must NOT license offline mode — the engine would look into the
+    # new one, find no shards, and never start again.
+    seed_hf_cache_revision cafebabe "model-00001-of-00003.safetensors"
+    point_hf_ref_main_at cafebabe
+    assert_eq "a partial snapshot under the ref is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache_revision cafebabe "model-00001-of-00003.safetensors" \
+        "model-00002-of-00003.safetensors" "model-00003-of-00003.safetensors"
+    assert_eq "the finished new snapshot is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # No ref at all: the revision has never been resolved on this node, so the Hub is still needed.
+    rm "$(hf_repo_cache_dir)/refs/main"
+    assert_eq "a cache with no ref is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+}
+
+test_a_stale_copy_under_another_root_does_not_count() {
+    make_sandbox
+    load_entrypoint
+
+    # The worker has moved its cache directory once already, so the volume can hold the model twice:
+    # a complete copy under the root an older image used, and the copy the engine reads now, still
+    # downloading. Going offline on the strength of the stale one strands the real download.
+    local stale="${SHARED_CACHE}/huggingface/hub/$(hf_cache_dir_name "${MODEL}")"
+    mkdir -p "${stale}/refs" "${stale}/snapshots/deadbeef"
+    printf '%s' deadbeef >"${stale}/refs/main"
+    printf '%s' '{"weight_map":{"a":"model-00001-of-00001.safetensors"}}' \
+        >"${stale}/snapshots/deadbeef/model.safetensors.index.json"
+    touch "${stale}/snapshots/deadbeef/config.json" "${stale}/snapshots/deadbeef/tokenizer.json" \
+        "${stale}/snapshots/deadbeef/model-00001-of-00001.safetensors"
+    assert_eq "one complete copy on its own is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache "model-00001-of-00003.safetensors"
+    assert_eq "a half-downloaded second copy keeps the Hub reachable" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "both copies complete is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+}
+
+test_hf_offline_self_heals_when_no_engine_serves() {
+    make_sandbox
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
+    run_cycles() { local n="$1" i; for (( i = 0; i < n; i++ )); do sync_hf_offline_with_cache_and_engines; done; }
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # An engine is serving, so the cache the check read is the cache the engine can load.
+    mkdir -p "${SANDBOX}/dp-abc"
+    touch "${SANDBOX}/dp-abc/v.sock"
+    run_cycles $(( HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE + 3 ))
+    assert_eq "a serving engine keeps offline mode on" "yes" "$(offline_mode_on)"
+
+    # The engine goes away. Below the limit the switch must not move: engines take a while to
+    # come up, and dropping the switch on the first quiet cycle would re-open the Hub for nothing.
+    rm "${SANDBOX}/dp-abc/v.sock"
+    run_cycles $(( HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE - 1 ))
+    assert_eq "a short quiet spell does not drop the switch" "yes" "$(offline_mode_on)"
+
+    # Still nothing at the limit. The completeness check said "complete" and no engine ever served,
+    # so the check is the suspect: take the switch off rather than sit at zero tokens forever.
+    run_cycles 1
+    assert_eq "no engine for the full limit takes the switch off" "no" "$(offline_mode_on)"
+
+    # And it must LATCH. The cache still reads complete, so a plain re-sync would arm it again on
+    # the very next cycle and the node would stay dark.
+    run_cycles 5
+    assert_eq "the switch stays off while no engine serves" "no" "$(offline_mode_on)"
+
+    # An engine finally serves: the cache is provably usable, so offline mode is safe again.
+    touch "${SANDBOX}/dp-abc/v.sock"
+    run_cycles 1
+    assert_eq "a serving engine arms it again" "yes" "$(offline_mode_on)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -444,6 +723,13 @@ test_single_engine_watchdog
 test_split_sidecar_and_watchdog_wiring
 test_spawn_smoke
 test_terminate_workers_is_bounded
+test_model_cache_is_complete
+test_only_the_snapshot_under_the_ref_counts
+test_a_stale_copy_under_another_root_does_not_count
+test_enable_hf_offline
+test_hf_offline_wiring
+test_hf_offline_is_re_evaluated_later
+test_hf_offline_self_heals_when_no_engine_serves
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"

@@ -1,5 +1,5 @@
 variable "VERSION" {
-    default = "0.0.19"
+    default = "0.0.20"
 }
 
 variable "BASE_IMAGE" {

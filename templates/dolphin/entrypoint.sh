@@ -67,6 +67,15 @@ SEED_WAIT_SECONDS="${DOLPHIN_SEED_WAIT_SECONDS:-5400}"
 # The worker opens this socket once its engine is up; same path the metrics sidecar scrapes.
 ENGINE_SOCKET_GLOB="${METRICS_SOCKET_GLOB:-/tmp/dp-*/v.sock}"
 
+# DAH-2743: the name of the .pth file that turns on the offline mode of the HF library, written
+# into the site-packages of every worker runtime. A .pth file, because Python runs it at startup
+# even when the closed worker gives its child a clean environment.
+HF_OFFLINE_PTH_NAME="zz-dolphin-hf-offline.pth"
+# How many supervisor cycles offline mode may stay on while NO engine serves, before the switch
+# itself is treated as the cause and taken off. 10 cycles is 5 minutes at LIVENESS_INTERVAL — well
+# past a normal engine start (measured 2 min on a warm 8xH100 node) and far short of a shift.
+HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE=10
+
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
 # every worker instance inside this one, so the binary download and the worker's self-update are
 # cross-process critical sections — two cold workers writing the same path at once produce a
@@ -324,6 +333,10 @@ INSTANCE_HOMES=()
 WORKER_PIDS=()
 WATCHDOG_PIDS=()
 SIDECAR_PID=""
+# Self-heal state for the offline switch: how many cycles have passed with the switch on and no
+# engine serving, and whether the switch is being held off until an engine proves the cache good.
+HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
+HF_OFFLINE_HELD_OFF=0
 BASE_HOME="${HOME:-/root}"
 SHARED_CACHE="${BASE_HOME}/.cache"
 
@@ -423,6 +436,173 @@ start_engine_watchdogs() {
     fi
 }
 
+# DAH-2743: vLLM resolves the model's UNPINNED revision (`main`) through the Hub API on EVERY
+# engine start, because the HF cache is keyed by commit sha — cached weights do not spare it.
+# HuggingFace allows 500 API requests per 5 minutes PER IP for anonymous callers, and a farm of
+# 13 machines behind one NAT IP (2 workers, 8 processes each) blows that on a simultaneous cold
+# start. hf_hub then sleeps ~200 s on the 429 while the worker's own startup timeout kills the
+# engine first, and the restart spends another burst of calls: on 2026-08-20 that livelock held
+# seven prod machines at zero tokens for 13 h while their weights sat complete on disk.
+#
+# So once the cache is complete we turn the HF library to offline mode, and it reads the local
+# snapshot without one network call. The switch is a .pth file in the runtime's site-packages,
+# because the env var CANNOT be used here: the closed worker binary rebuilds its child's
+# environment from a fixed whitelist (CUDA_*, HF_HOME, HOME, LD_LIBRARY_PATH, PATH, PWD,
+# PYTHONNOUSERSITE, SHLVL, TMPDIR, XDG_CACHE_HOME) and drops the rest. Nothing else on the network
+# changes, so the worker still updates its own binary from updates.dphn.ai.
+hf_cache_dir_name() {
+    # "nvidia/Qwen3.6-35B-A3B-NVFP4" -> "models--nvidia--Qwen3.6-35B-A3B-NVFP4", the HF cache layout.
+    echo "models--${1//\//--}"
+}
+
+snapshot_under_ref_is_complete() {
+    # Complete = the snapshot that `refs/main` NAMES holds the index, every shard the index names,
+    # and the two files the tokenizer/config load needs.
+    #
+    # The ref decides, never "some complete snapshot on disk". The cache is keyed by commit sha, so
+    # a new commit upstream gives the model a SECOND, half-downloaded snapshot beside the complete
+    # old one — and hf_hub writes the new sha into refs/main BEFORE it fetches one byte (verified in
+    # file_download.py). vLLM resolves `main` through that same ref, so a check that accepted the
+    # old snapshot would take the node offline against a snapshot the engine never opens.
+    local repo_dir="$1"
+    local ref_file="${repo_dir}/refs/main"
+    local revision snapshot index shard missing=0 listed=0
+    # `$(<file)`, not `read`: hf_hub writes the sha with NO trailing newline, and `read` then
+    # returns non-zero at EOF, which would reject every real cache on a real node.
+    [[ -f "${ref_file}" ]] || return 1
+    revision="$(<"${ref_file}")"
+    [[ -n "${revision}" ]] || return 1
+    snapshot="${repo_dir}/snapshots/${revision}/"
+    index="${snapshot}model.safetensors.index.json"
+    [[ -f "${index}" && -f "${snapshot}config.json" && -f "${snapshot}tokenizer.json" ]] || return 1
+    while read -r shard; do
+        listed=$((listed + 1))
+        [[ -f "${snapshot}${shard}" ]] || missing=1
+    done < <(grep -oE '"model-[^"]+\.safetensors"' "${index}" | tr -d '"' | sort -u)
+    # A truncated index names no shard at all. Counting it as complete would take the node offline
+    # against a cache the engine cannot load, so an empty list is a NO like any gap.
+    (( listed > 0 && ! missing ))
+}
+
+model_cache_is_complete() {
+    # EVERY copy of this model under the shared volume must be complete, not merely one of them.
+    # The worker has moved its cache directory before (this entrypoint exports
+    # <home>/.cache/huggingface, the worker uses <home>/.cache/dolphinpod-worker/cache), so a stale
+    # complete copy under the old root can sit beside the half-downloaded copy the engine actually
+    # reads. Accepting the stale one takes the node offline and the real download can never finish.
+    # Demanding all of them only ever errs towards staying online, which is what the node did
+    # before DAH-2743.
+    #
+    # The copies are SEARCHED rather than read from a fixed path, so the next move survives too.
+    # `.locks` is PRUNED: hf_hub puts its download locks in `<cache>/.locks/models--<repo>/`, which
+    # carries the very same directory name and holds no refs at all. Left in, that lock directory
+    # reads as a forever-incomplete copy and the node never goes offline.
+    local repo_dir found=0
+    while read -r repo_dir; do
+        found=1
+        snapshot_under_ref_is_complete "${repo_dir}" || return 1
+    done < <(find "${SHARED_CACHE}" -maxdepth 5 -name .locks -prune -o \
+        -type d -name "$(hf_cache_dir_name "${MODEL}")" -print 2>/dev/null)
+    (( found ))
+}
+
+worker_runtime_site_packages_dirs() {
+    # Every runtime the worker downloaded under DOLPHIN_HOME. The glob covers the worker type and
+    # the Python version, both of which can change under us when the worker updates itself.
+    find "${DOLPHIN_HOME}/runtimes" -maxdepth 4 -type d -name site-packages 2>/dev/null
+}
+
+enable_hf_offline() {
+    # Python runs every `import` line of a .pth file in site-packages at interpreter startup, so
+    # the switch reaches a child whose environment the worker rebuilt without it.
+    #
+    # Do NOT block the Hub at the network level instead. Measured on 2026-08-21: with
+    # `127.0.0.1 huggingface.co` in /etc/hosts the library raises on the connection error rather
+    # than falling back to the cache, and every engine dies with "inference backend exited".
+    # Offline mode is the path the library supports: a file that is absent from the repo reads as
+    # absent instead of as an error.
+    local site_dir target staged wrote=0
+    while read -r site_dir; do
+        target="${site_dir}/${HF_OFFLINE_PTH_NAME}"
+        [[ -f "${target}" ]] && continue
+        # Staged and renamed, like every other write to the shared DOLPHIN_HOME volume (DAH-2475).
+        # A plain redirect truncates the file before it writes it, and a sibling container reads
+        # this same path at every interpreter start, so it can get an empty file and call the Hub.
+        if staged="$(mktemp "${site_dir}/.${HF_OFFLINE_PTH_NAME}.XXXXXX" 2>/dev/null)" \
+            && printf 'import os; os.environ.setdefault("HF_HUB_OFFLINE", "1")\n' >"${staged}" \
+            && mv -f "${staged}" "${target}"; then
+            wrote=1
+        else
+            [[ -n "${staged}" ]] && rm -f "${staged}"
+            echo "[dolphin] WARNING: cannot write ${target}; engine starts still depend on the Hub" >&2
+        fi
+    done < <(worker_runtime_site_packages_dirs)
+    (( wrote )) && echo "[dolphin] model cache is complete; HF offline mode is on, so engine starts never wait on a Hub rate limit" >&2
+    return 0
+}
+
+disable_hf_offline() {
+    # The counterpart of enable_hf_offline, and the reason the switch is SYNCED rather than only
+    # armed: DOLPHIN_MODEL can change under a container whose runtime still carries the .pth from
+    # the previous model. Offline mode would then forbid the download the new model needs, and the
+    # node could never mine again. An incomplete cache therefore always re-opens the Hub.
+    local site_dir target removed=0
+    while read -r site_dir; do
+        target="${site_dir}/${HF_OFFLINE_PTH_NAME}"
+        [[ -f "${target}" ]] || continue
+        rm -f "${target}" 2>/dev/null && removed=1
+    done < <(worker_runtime_site_packages_dirs)
+    (( removed )) && echo "[dolphin] HF offline mode is off; the Hub is reachable again so the weights can be downloaded" >&2
+    return 0
+}
+
+sync_hf_offline_with_cache() {
+    if model_cache_is_complete; then
+        enable_hf_offline
+    else
+        disable_hf_offline
+    fi
+}
+
+hf_offline_is_armed() {
+    local site_dir
+    while read -r site_dir; do
+        [[ -f "${site_dir}/${HF_OFFLINE_PTH_NAME}" ]] && return 0
+    done < <(worker_runtime_site_packages_dirs)
+    return 1
+}
+
+# The cache check is one opinion about whether this node can run offline. A serving engine is the
+# other, and it is the only one that cannot be wrong: it proves the local files are the files the
+# engine needs. So when the switch is on and NO engine has served for
+# HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE cycles, the switch is the suspect and comes off — whatever
+# the cache check believes, and including reasons we have not thought of. Without this, one wrong
+# "complete" leaves the node at zero tokens for as long as the container lives, which is the very
+# outage DAH-2743 is about.
+#
+# It has to LATCH: the cache still reads complete, so a plain re-sync would arm it again on the next
+# cycle and nothing would change. Only an engine socket clears the hold.
+sync_hf_offline_with_cache_and_engines() {
+    if (( HF_OFFLINE_HELD_OFF )); then
+        engine_socket_present || return 0
+        echo "[dolphin] an engine serves again; HF offline mode may arm" >&2
+        HF_OFFLINE_HELD_OFF=0
+        HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
+    fi
+    sync_hf_offline_with_cache
+    if ! hf_offline_is_armed || engine_socket_present; then
+        HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
+        return 0
+    fi
+    HF_OFFLINE_CYCLES_WITHOUT_ENGINE=$((HF_OFFLINE_CYCLES_WITHOUT_ENGINE + 1))
+    if (( HF_OFFLINE_CYCLES_WITHOUT_ENGINE >= HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE )); then
+        echo "[dolphin] no engine has served for ${HF_OFFLINE_CYCLES_WITHOUT_ENGINE} cycles with HF offline mode on; taking it off so the node can fetch whatever it is missing" >&2
+        disable_hf_offline
+        HF_OFFLINE_HELD_OFF=1
+        HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
+    fi
+}
+
 spawn_instance() {
     local idx="$1"
     (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) &
@@ -480,11 +660,17 @@ on_term() {
 spawn_all_instances() {
     local i
     WORKER_PIDS=()
+    # A warm node — the shared cache volume already holds the weights from an earlier container —
+    # needs no Hub at all, not even for instance 0.
+    sync_hf_offline_with_cache
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
             # Only before the SECOND instance: once instance 0 serves, the runtime and the weights
             # are on disk, so 2..N all start warm and need no further wait.
             wait_for_cache_seed
+            # Instance 0 has just seeded the cache, so it was the only process that ever needed the
+            # Hub: close it for the siblings before they can spend the shared per-IP quota.
+            sync_hf_offline_with_cache
         fi
         if (( i > 0 && SPLIT_STAGGER_SECONDS > 0 )); then
             interruptible_sleep "${SPLIT_STAGGER_SECONDS}"
@@ -500,6 +686,12 @@ supervise_running_workers_until_new_binary_published() {
     local elapsed=0 i latest_etag
     while true; do
         interruptible_sleep "${LIVENESS_INTERVAL}"
+        # Every cycle, because the seed wait ends when the first worker opens its engine socket,
+        # about 30 s after start — minutes BEFORE the download of the weights completes (measured
+        # on a cold 8xH100 node, 2026-08-21). A check at spawn time alone sees a partial cache and
+        # leaves the container on the Hub for the rest of its life. The same call takes the switch
+        # off again when it is on and no engine serves.
+        sync_hf_offline_with_cache_and_engines
         for i in "${!WORKER_PIDS[@]}"; do
             if ! kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
                 wait "${WORKER_PIDS[$i]}" 2>/dev/null || true
