@@ -71,6 +71,10 @@ ENGINE_SOCKET_GLOB="${METRICS_SOCKET_GLOB:-/tmp/dp-*/v.sock}"
 # into the site-packages of every worker runtime. A .pth file, because Python runs it at startup
 # even when the closed worker gives its child a clean environment.
 HF_OFFLINE_PTH_NAME="zz-dolphin-hf-offline.pth"
+# How many supervisor cycles offline mode may stay on while NO engine serves, before the switch
+# itself is treated as the cause and taken off. 10 cycles is 5 minutes at LIVENESS_INTERVAL — well
+# past a normal engine start (measured 2 min on a warm 8xH100 node) and far short of a shift.
+HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE=10
 
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
 # every worker instance inside this one, so the binary download and the worker's self-update are
@@ -329,6 +333,10 @@ INSTANCE_HOMES=()
 WORKER_PIDS=()
 WATCHDOG_PIDS=()
 SIDECAR_PID=""
+# Self-heal state for the offline switch: how many cycles have passed with the switch on and no
+# engine serving, and whether the switch is being held off until an engine proves the cache good.
+HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
+HF_OFFLINE_HELD_OFF=0
 BASE_HOME="${HOME:-/root}"
 SHARED_CACHE="${BASE_HOME}/.cache"
 
@@ -544,7 +552,7 @@ disable_hf_offline() {
         [[ -f "${target}" ]] || continue
         rm -f "${target}" 2>/dev/null && removed=1
     done < <(worker_runtime_site_packages_dirs)
-    (( removed )) && echo "[dolphin] model cache is not complete; HF offline mode is off so the weights can be downloaded" >&2
+    (( removed )) && echo "[dolphin] HF offline mode is off; the Hub is reachable again so the weights can be downloaded" >&2
     return 0
 }
 
@@ -553,6 +561,45 @@ sync_hf_offline_with_cache() {
         enable_hf_offline
     else
         disable_hf_offline
+    fi
+}
+
+hf_offline_is_armed() {
+    local site_dir
+    while read -r site_dir; do
+        [[ -f "${site_dir}/${HF_OFFLINE_PTH_NAME}" ]] && return 0
+    done < <(worker_runtime_site_packages_dirs)
+    return 1
+}
+
+# The cache check is one opinion about whether this node can run offline. A serving engine is the
+# other, and it is the only one that cannot be wrong: it proves the local files are the files the
+# engine needs. So when the switch is on and NO engine has served for
+# HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE cycles, the switch is the suspect and comes off — whatever
+# the cache check believes, and including reasons we have not thought of. Without this, one wrong
+# "complete" leaves the node at zero tokens for as long as the container lives, which is the very
+# outage DAH-2743 is about.
+#
+# It has to LATCH: the cache still reads complete, so a plain re-sync would arm it again on the next
+# cycle and nothing would change. Only an engine socket clears the hold.
+sync_hf_offline_with_cache_and_engines() {
+    if (( HF_OFFLINE_HELD_OFF )); then
+        engine_socket_present || return 0
+        echo "[dolphin] an engine serves again; HF offline mode may arm" >&2
+        HF_OFFLINE_HELD_OFF=0
+        HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
+    fi
+    sync_hf_offline_with_cache
+    if ! hf_offline_is_armed || engine_socket_present; then
+        HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
+        return 0
+    fi
+    HF_OFFLINE_CYCLES_WITHOUT_ENGINE=$((HF_OFFLINE_CYCLES_WITHOUT_ENGINE + 1))
+    if (( HF_OFFLINE_CYCLES_WITHOUT_ENGINE >= HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE )); then
+        echo "[dolphin] no engine has served for ${HF_OFFLINE_CYCLES_WITHOUT_ENGINE} cycles with HF offline mode on; taking it off so the node can fetch whatever it is missing" >&2
+        disable_hf_offline
+        HF_OFFLINE_HELD_OFF=1
+        HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
     fi
 }
 
@@ -642,8 +689,9 @@ supervise_running_workers_until_new_binary_published() {
         # Every cycle, because the seed wait ends when the first worker opens its engine socket,
         # about 30 s after start — minutes BEFORE the download of the weights completes (measured
         # on a cold 8xH100 node, 2026-08-21). A check at spawn time alone sees a partial cache and
-        # leaves the container on the Hub for the rest of its life.
-        sync_hf_offline_with_cache
+        # leaves the container on the Hub for the rest of its life. The same call takes the switch
+        # off again when it is on and no engine serves.
+        sync_hf_offline_with_cache_and_engines
         for i in "${!WORKER_PIDS[@]}"; do
             if ! kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
                 wait "${WORKER_PIDS[$i]}" 2>/dev/null || true

@@ -614,7 +614,7 @@ test_hf_offline_is_re_evaluated_later() {
     # the supervisor's call. Guard the wiring itself.
     assert_eq "the supervisor re-checks it every cycle" "1" \
         "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
-            | grep -c 'sync_hf_offline_with_cache')"
+            | grep -c 'sync_hf_offline_with_cache_and_engines')"
 }
 
 test_only_the_snapshot_under_the_ref_counts() {
@@ -673,6 +673,47 @@ test_a_stale_copy_under_another_root_does_not_count() {
         "$(model_cache_is_complete && echo yes || echo no)"
 }
 
+test_hf_offline_self_heals_when_no_engine_serves() {
+    make_sandbox
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
+    run_cycles() { local n="$1" i; for (( i = 0; i < n; i++ )); do sync_hf_offline_with_cache_and_engines; done; }
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # An engine is serving, so the cache the check read is the cache the engine can load.
+    mkdir -p "${SANDBOX}/dp-abc"
+    touch "${SANDBOX}/dp-abc/v.sock"
+    run_cycles $(( HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE + 3 ))
+    assert_eq "a serving engine keeps offline mode on" "yes" "$(offline_mode_on)"
+
+    # The engine goes away. Below the limit the switch must not move: engines take a while to
+    # come up, and dropping the switch on the first quiet cycle would re-open the Hub for nothing.
+    rm "${SANDBOX}/dp-abc/v.sock"
+    run_cycles $(( HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE - 1 ))
+    assert_eq "a short quiet spell does not drop the switch" "yes" "$(offline_mode_on)"
+
+    # Still nothing at the limit. The completeness check said "complete" and no engine ever served,
+    # so the check is the suspect: take the switch off rather than sit at zero tokens forever.
+    run_cycles 1
+    assert_eq "no engine for the full limit takes the switch off" "no" "$(offline_mode_on)"
+
+    # And it must LATCH. The cache still reads complete, so a plain re-sync would arm it again on
+    # the very next cycle and the node would stay dark.
+    run_cycles 5
+    assert_eq "the switch stays off while no engine serves" "no" "$(offline_mode_on)"
+
+    # An engine finally serves: the cache is provably usable, so offline mode is safe again.
+    touch "${SANDBOX}/dp-abc/v.sock"
+    run_cycles 1
+    assert_eq "a serving engine arms it again" "yes" "$(offline_mode_on)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -688,6 +729,7 @@ test_a_stale_copy_under_another_root_does_not_count
 test_enable_hf_offline
 test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later
+test_hf_offline_self_heals_when_no_engine_serves
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"
