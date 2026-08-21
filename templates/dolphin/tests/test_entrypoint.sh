@@ -493,70 +493,85 @@ test_cache_is_complete() {
         "$(cache_is_complete && echo yes || echo no)"
 }
 
-test_block_hf_hub() {
+test_enable_hf_offline() {
     make_sandbox
     load_entrypoint
-    export HOSTS_FILE="${SANDBOX}/hosts"
-    printf '127.0.0.1\tlocalhost\n' >"${HOSTS_FILE}"
+    local site="${SANDBOX}/dolphinpod/runtimes/text-v/lib/python3.12/site-packages"
+    mkdir -p "${site}"
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
 
-    block_hf_hub
-    assert_eq "huggingface.co is blackholed" "1" \
-        "$(grep -c '^127.0.0.1[[:space:]]*huggingface.co$' "${HOSTS_FILE}")"
-    assert_eq "the pre-existing hosts content survives" "1" \
-        "$(grep -c 'localhost' "${HOSTS_FILE}")"
+    enable_hf_offline
+    assert_eq "the offline switch lands in site-packages" "1" \
+        "$(ls "${site}/zz-dolphin-hf-offline.pth" 2>/dev/null | wc -l | tr -d ' ')"
+    assert_eq "the switch sets HF_HUB_OFFLINE" "1" \
+        "$(grep -c 'HF_HUB_OFFLINE' "${site}/zz-dolphin-hf-offline.pth")"
 
-    # The supervisor re-enters this path on every worker restart; a growing hosts file is a leak.
-    block_hf_hub
-    block_hf_hub
-    assert_eq "blocking is idempotent" "1" \
-        "$(grep -c '^127.0.0.1[[:space:]]*huggingface.co$' "${HOSTS_FILE}")"
+    # A .pth file, not sitecustomize.py: the runtime belongs to the closed worker, and a file of
+    # our own name can never overwrite one of theirs.
+    assert_eq "no sitecustomize.py is written" "0" \
+        "$(ls "${site}/sitecustomize.py" 2>/dev/null | wc -l | tr -d ' ')"
 
-    # An unwritable /etc/hosts must not take the container down: without the block the engine is
-    # merely back to the rate-limit risk, with a failed `set -e` it never starts at all.
-    export HOSTS_FILE="${SANDBOX}/nope/hosts"
-    block_hf_hub
-    assert_eq "an unwritable hosts file is survivable" "yes" "yes"
+    # The supervisor calls this every 30 s. It must not rewrite the file each time.
+    local before after
+    before=$(stat -f %m "${site}/zz-dolphin-hf-offline.pth" 2>/dev/null || stat -c %Y "${site}/zz-dolphin-hf-offline.pth")
+    enable_hf_offline
+    after=$(stat -f %m "${site}/zz-dolphin-hf-offline.pth" 2>/dev/null || stat -c %Y "${site}/zz-dolphin-hf-offline.pth")
+    assert_eq "a second call leaves the file alone" "${before}" "${after}"
+
+    # A worker that updates its runtime brings a new site-packages. The next call must arm it too.
+    local second="${SANDBOX}/dolphinpod/runtimes/text-v2/lib/python3.13/site-packages"
+    mkdir -p "${second}"
+    enable_hf_offline
+    assert_eq "a new runtime gets the switch as well" "1" \
+        "$(ls "${second}/zz-dolphin-hf-offline.pth" 2>/dev/null | wc -l | tr -d ' ')"
+
+    # No runtime yet (cold container): must not fail under `set -e`.
+    DOLPHIN_HOME="${SANDBOX}/empty"
+    enable_hf_offline
+    assert_eq "no runtime directory is survivable" "yes" "yes"
 }
 
-test_hf_blackhole_wiring() {
+test_hf_offline_wiring() {
     make_sandbox
     load_entrypoint
-    export HOSTS_FILE="${SANDBOX}/hosts"
     export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
-    : >"${HOSTS_FILE}"
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
 
-    blocked() { grep -qc '^127.0.0.1[[:space:]]*huggingface.co$' "${HOSTS_FILE}" && echo yes || echo no; }
+    blocked() { [[ -f "${pth}" ]] && echo yes || echo no; }
 
-    # Cold node: the cache must be seeded from the Hub, so the network stays open.
-    block_hf_hub_when_cache_is_complete
+    # Cold node: the cache must be seeded from the Hub, so the Hub stays reachable.
+    enable_hf_offline_when_cache_is_complete
     assert_eq "cold cache keeps the Hub reachable" "no" "$(blocked)"
 
     # Warm node (the shared cache volume already holds the weights) — no worker needs the Hub.
     seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
         "model-00003-of-00003.safetensors"
-    block_hf_hub_when_cache_is_complete
-    assert_eq "complete cache blackholes the Hub" "yes" "$(blocked)"
+    enable_hf_offline_when_cache_is_complete
+    assert_eq "complete cache turns offline mode on" "yes" "$(blocked)"
 }
 
-test_hf_block_is_re_evaluated_later() {
+test_hf_offline_is_re_evaluated_later() {
     make_sandbox
     load_entrypoint
-    export HOSTS_FILE="${SANDBOX}/hosts"
-    : >"${HOSTS_FILE}"
-    blocked() { grep -qc '^127.0.0.1[[:space:]]*huggingface.co$' "${HOSTS_FILE}" && echo yes || echo no; }
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    blocked() { [[ -f "${pth}" ]] && echo yes || echo no; }
 
     # Measured on a real cold node 2026-08-21: the worker opens its engine socket about 30 s after
     # start, while the download of the weights continues for minutes. The seed wait therefore ends
     # too early, and a check that runs one time only leaves the container online for its full life.
     seed_hf_cache "model-00001-of-00003.safetensors"
-    block_hf_hub_when_cache_is_complete
-    assert_eq "an early check with a partial cache does not block" "no" "$(blocked)"
+    enable_hf_offline_when_cache_is_complete
+    assert_eq "an early check with a partial cache stays online" "no" "$(blocked)"
 
     # The download completes some minutes later. The supervisor calls the same function again.
     seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
         "model-00003-of-00003.safetensors"
-    maintain_hf_block
-    assert_eq "a later check blocks the Hub" "yes" "$(blocked)"
+    maintain_hf_offline
+    assert_eq "a later check turns offline mode on" "yes" "$(blocked)"
 }
 
 test_plan
@@ -569,9 +584,9 @@ test_split_sidecar_and_watchdog_wiring
 test_spawn_smoke
 test_terminate_workers_is_bounded
 test_cache_is_complete
-test_block_hf_hub
-test_hf_blackhole_wiring
-test_hf_block_is_re_evaluated_later
+test_enable_hf_offline
+test_hf_offline_wiring
+test_hf_offline_is_re_evaluated_later
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"

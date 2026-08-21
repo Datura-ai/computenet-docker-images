@@ -67,10 +67,10 @@ SEED_WAIT_SECONDS="${DOLPHIN_SEED_WAIT_SECONDS:-5400}"
 # The worker opens this socket once its engine is up; same path the metrics sidecar scrapes.
 ENGINE_SOCKET_GLOB="${METRICS_SOCKET_GLOB:-/tmp/dp-*/v.sock}"
 
-# DAH-2743: where the Hub blackhole is written. A variable only so the tests can point it at a
-# sandbox file — in the container this is always the real /etc/hosts.
-HOSTS_FILE="${HOSTS_FILE:-/etc/hosts}"
-HF_HUB_HOST="huggingface.co"
+# DAH-2743: the name of the .pth file that turns on the offline mode of the HF library, written
+# into the site-packages of every worker runtime. A .pth file, because Python runs it at startup
+# even when the closed worker gives its child a clean environment.
+HF_OFFLINE_PTH_NAME="zz-dolphin-hf-offline.pth"
 
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
 # every worker instance inside this one, so the binary download and the worker's self-update are
@@ -436,12 +436,12 @@ start_engine_watchdogs() {
 # engine first, and the restart spends another burst of calls: on 2026-08-20 that livelock held
 # seven prod machines at zero tokens for 13 h while their weights sat complete on disk.
 #
-# So once the cache is complete we take the Hub off the container's map. Every call then fails
-# instantly with ECONNREFUSED and hf_hub falls back to the local snapshot — the same path
-# HF_HUB_OFFLINE=1 takes, chosen because that env var CANNOT be used here: the closed worker
-# binary rebuilds its child's environment from a fixed whitelist (CUDA_*, HF_HOME, HOME,
-# LD_LIBRARY_PATH, PATH, PWD, PYTHONNOUSERSITE, SHLVL, TMPDIR, XDG_CACHE_HOME) and drops the rest.
-# Only updates.dphn.ai is left reachable, so the worker's own self-update still lands.
+# So once the cache is complete we turn the HF library to offline mode, and it reads the local
+# snapshot without one network call. The switch is a .pth file in the runtime's site-packages,
+# because the env var CANNOT be used here: the closed worker binary rebuilds its child's
+# environment from a fixed whitelist (CUDA_*, HF_HOME, HOME, LD_LIBRARY_PATH, PATH, PWD,
+# PYTHONNOUSERSITE, SHLVL, TMPDIR, XDG_CACHE_HOME) and drops the rest. Nothing else on the network
+# changes, so the worker still updates its own binary from updates.dphn.ai.
 hf_repo_dirname() {
     # "nvidia/Qwen3.6-35B-A3B-NVFP4" -> "nvidia--Qwen3.6-35B-A3B-NVFP4", the HF cache layout.
     echo "${1//\//--}"
@@ -473,23 +473,40 @@ cache_is_complete() {
     return 1
 }
 
-block_hf_hub() {
-    # Idempotent: the supervisor re-enters this path on every worker restart, and a hosts file
-    # that grows a line each time is a leak. A read-only /etc/hosts is survivable — the engine is
-    # then merely back to the rate-limit risk, which beats failing the container under `set -e`.
-    if grep -qE "^127\.0\.0\.1[[:space:]]+${HF_HUB_HOST}$" "${HOSTS_FILE}" 2>/dev/null; then
-        return 0
-    fi
-    if printf '127.0.0.1\t%s\n' "${HF_HUB_HOST}" >>"${HOSTS_FILE}" 2>/dev/null; then
-        echo "[dolphin] model cache is complete; ${HF_HUB_HOST} blackholed so engine starts never wait on a Hub rate limit" >&2
-    else
-        echo "[dolphin] WARNING: cannot write ${HOSTS_FILE}; engine starts still depend on the Hub" >&2
-    fi
+hf_offline_site_dirs() {
+    # Every runtime the worker downloaded under DOLPHIN_HOME. The glob covers the worker type and
+    # the Python version, both of which can change under us when the worker updates itself.
+    find "${DOLPHIN_HOME}/runtimes" -maxdepth 4 -type d -name site-packages 2>/dev/null
 }
 
-block_hf_hub_when_cache_is_complete() {
+enable_hf_offline() {
+    # `HF_HUB_OFFLINE=1` cannot be exported: the closed worker rebuilds the environment of its child
+    # from a fixed list and drops everything else (measured on a prod container). Python, however,
+    # runs every `import` line of a .pth file in site-packages at interpreter startup, before the HF
+    # library reads the variable. So the switch travels in the filesystem, which the worker keeps.
+    #
+    # Do NOT block the Hub at the network level instead. Measured on 2026-08-21: with
+    # `127.0.0.1 huggingface.co` in /etc/hosts the library raises on the connection error rather
+    # than falling back to the cache, and every engine dies with "inference backend exited".
+    # Offline mode is the path the library supports: a file that is absent from the repo reads as
+    # absent instead of as an error.
+    local site_dir target wrote=0
+    while read -r site_dir; do
+        target="${site_dir}/${HF_OFFLINE_PTH_NAME}"
+        [[ -f "${target}" ]] && continue
+        if printf 'import os; os.environ.setdefault("HF_HUB_OFFLINE", "1")\n' >"${target}" 2>/dev/null; then
+            wrote=1
+        else
+            echo "[dolphin] WARNING: cannot write ${target}; engine starts still depend on the Hub" >&2
+        fi
+    done < <(hf_offline_site_dirs)
+    (( wrote )) && echo "[dolphin] model cache is complete; HF offline mode is on, so engine starts never wait on a Hub rate limit" >&2
+    return 0
+}
+
+enable_hf_offline_when_cache_is_complete() {
     cache_is_complete || return 0
-    block_hf_hub
+    enable_hf_offline
 }
 
 # The seed wait ends when the first worker opens its engine socket, and the worker opens it about
@@ -497,8 +514,8 @@ block_hf_hub_when_cache_is_complete() {
 # 8xH100 node, 2026-08-21). A check that runs only at spawn time therefore sees a partial cache and
 # leaves the container online for the rest of its life. The supervisor calls this every
 # LIVENESS_INTERVAL, so the Hub goes off the map in the first minute after the cache completes.
-maintain_hf_block() {
-    block_hf_hub_when_cache_is_complete
+maintain_hf_offline() {
+    enable_hf_offline_when_cache_is_complete
 }
 
 spawn_instance() {
@@ -560,7 +577,7 @@ spawn_all_instances() {
     WORKER_PIDS=()
     # A warm node — the shared cache volume already holds the weights from an earlier container —
     # needs no Hub at all, not even for instance 0.
-    block_hf_hub_when_cache_is_complete
+    enable_hf_offline_when_cache_is_complete
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
             # Only before the SECOND instance: once instance 0 serves, the runtime and the weights
@@ -568,7 +585,7 @@ spawn_all_instances() {
             wait_for_cache_seed
             # Instance 0 has just seeded the cache, so it was the only process that ever needed the
             # Hub: close it for the siblings before they can spend the shared per-IP quota.
-            block_hf_hub_when_cache_is_complete
+            enable_hf_offline_when_cache_is_complete
         fi
         if (( i > 0 && SPLIT_STAGGER_SECONDS > 0 )); then
             interruptible_sleep "${SPLIT_STAGGER_SECONDS}"
@@ -584,7 +601,7 @@ supervise_running_workers_until_new_binary_published() {
     local elapsed=0 i latest_etag
     while true; do
         interruptible_sleep "${LIVENESS_INTERVAL}"
-        maintain_hf_block
+        maintain_hf_offline
         for i in "${!WORKER_PIDS[@]}"; do
             if ! kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
                 wait "${WORKER_PIDS[$i]}" 2>/dev/null || true
