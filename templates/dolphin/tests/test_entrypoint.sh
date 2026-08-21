@@ -435,6 +435,109 @@ test_terminate_workers_is_bounded() {
     assert_eq "deaf worker is gone" "" "$(ps -o pid= -p "${deaf_pid}" 2>/dev/null | tr -d ' ')"
 }
 
+# ---------------------------------------------------------------- HF hub blackhole (DAH-2743)
+# 2026-08-20 prod: seven 8x5090 machines behind ONE NAT IP crash-looped their engines for 13 h.
+# vLLM resolves the UNPINNED revision `main` through the Hub API on every engine start, the farm
+# blew the anonymous 500-req/5-min per-IP quota, hf_hub slept ~200 s on the 429 and the worker's
+# own startup timeout killed the engine first — a livelock the cached weights could not prevent.
+seed_hf_cache() {
+    # Args: shard file names to actually create. The index always lists all three shards, so
+    # leaving one out is how a half-downloaded cache is expressed.
+    # The path is the one the CLOSED worker actually uses, read off a live prod container
+    # (HF_HOME=/root/.cache/dolphinpod-worker/cache) — NOT the HF_HOME this entrypoint exports.
+    # The two differ, and a check pointed at ours finds an empty cache on every real node.
+    local snapshot="${SHARED_CACHE}/dolphinpod-worker/cache/hub/models--$(hf_repo_dirname "${MODEL}")/snapshots/deadbeef"
+    mkdir -p "${snapshot}"
+    printf '%s' '{"weight_map":{"a":"model-00001-of-00003.safetensors","b":"model-00002-of-00003.safetensors","c":"model-00003-of-00003.safetensors"}}' \
+        >"${snapshot}/model.safetensors.index.json"
+    touch "${snapshot}/config.json" "${snapshot}/tokenizer.json"
+    local shard
+    for shard in "$@"; do
+        touch "${snapshot}/${shard}"
+    done
+}
+
+test_cache_is_complete() {
+    make_sandbox
+    load_entrypoint
+
+    assert_eq "empty cache is not complete" "no" \
+        "$(cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors"
+    assert_eq "half-downloaded cache is not complete" "no" \
+        "$(cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "every shard present means complete" "yes" \
+        "$(cache_is_complete && echo yes || echo no)"
+
+    # A shard listed in the index but missing on disk is the seeder-died-midway case: it must
+    # stay online and resume, never go offline against an unusable cache.
+    rm "${SHARED_CACHE}/dolphinpod-worker/cache/hub/models--$(hf_repo_dirname "${MODEL}")/snapshots/deadbeef/model-00002-of-00003.safetensors"
+    assert_eq "a shard deleted after the fact reopens the network" "no" \
+        "$(cache_is_complete && echo yes || echo no)"
+
+    # A half-written index lists nothing; treating "no shard is missing" as complete would
+    # blackhole the node against a cache the engine cannot load.
+    : >"${SHARED_CACHE}/dolphinpod-worker/cache/hub/models--$(hf_repo_dirname "${MODEL}")/snapshots/deadbeef/model.safetensors.index.json"
+    assert_eq "a truncated index is not complete" "no" \
+        "$(cache_is_complete && echo yes || echo no)"
+
+    # A cache for a DIFFERENT model must not license going offline for this one.
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    MODEL="nvidia/SomeOtherModel"
+    assert_eq "another model's cache does not count" "no" \
+        "$(cache_is_complete && echo yes || echo no)"
+}
+
+test_block_hf_hub() {
+    make_sandbox
+    load_entrypoint
+    export HOSTS_FILE="${SANDBOX}/hosts"
+    printf '127.0.0.1\tlocalhost\n' >"${HOSTS_FILE}"
+
+    block_hf_hub
+    assert_eq "huggingface.co is blackholed" "1" \
+        "$(grep -c '^127.0.0.1[[:space:]]*huggingface.co$' "${HOSTS_FILE}")"
+    assert_eq "the pre-existing hosts content survives" "1" \
+        "$(grep -c 'localhost' "${HOSTS_FILE}")"
+
+    # The supervisor re-enters this path on every worker restart; a growing hosts file is a leak.
+    block_hf_hub
+    block_hf_hub
+    assert_eq "blocking is idempotent" "1" \
+        "$(grep -c '^127.0.0.1[[:space:]]*huggingface.co$' "${HOSTS_FILE}")"
+
+    # An unwritable /etc/hosts must not take the container down: without the block the engine is
+    # merely back to the rate-limit risk, with a failed `set -e` it never starts at all.
+    export HOSTS_FILE="${SANDBOX}/nope/hosts"
+    block_hf_hub
+    assert_eq "an unwritable hosts file is survivable" "yes" "yes"
+}
+
+test_hf_blackhole_wiring() {
+    make_sandbox
+    load_entrypoint
+    export HOSTS_FILE="${SANDBOX}/hosts"
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    : >"${HOSTS_FILE}"
+
+    blocked() { grep -qc '^127.0.0.1[[:space:]]*huggingface.co$' "${HOSTS_FILE}" && echo yes || echo no; }
+
+    # Cold node: the cache must be seeded from the Hub, so the network stays open.
+    block_hf_hub_when_cache_is_complete
+    assert_eq "cold cache keeps the Hub reachable" "no" "$(blocked)"
+
+    # Warm node (the common case: the model ships in the image) — no worker ever needs the Hub.
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    block_hf_hub_when_cache_is_complete
+    assert_eq "complete cache blackholes the Hub" "yes" "$(blocked)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -444,6 +547,9 @@ test_single_engine_watchdog
 test_split_sidecar_and_watchdog_wiring
 test_spawn_smoke
 test_terminate_workers_is_bounded
+test_cache_is_complete
+test_block_hf_hub
+test_hf_blackhole_wiring
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"

@@ -67,6 +67,11 @@ SEED_WAIT_SECONDS="${DOLPHIN_SEED_WAIT_SECONDS:-5400}"
 # The worker opens this socket once its engine is up; same path the metrics sidecar scrapes.
 ENGINE_SOCKET_GLOB="${METRICS_SOCKET_GLOB:-/tmp/dp-*/v.sock}"
 
+# DAH-2743: where the Hub blackhole is written. A variable only so the tests can point it at a
+# sandbox file — in the container this is always the real /etc/hosts.
+HOSTS_FILE="${HOSTS_FILE:-/etc/hosts}"
+HF_HUB_HOST="huggingface.co"
+
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
 # every worker instance inside this one, so the binary download and the worker's self-update are
 # cross-process critical sections — two cold workers writing the same path at once produce a
@@ -423,6 +428,70 @@ start_engine_watchdogs() {
     fi
 }
 
+# DAH-2743: vLLM resolves the model's UNPINNED revision (`main`) through the Hub API on EVERY
+# engine start, because the HF cache is keyed by commit sha — cached weights do not spare it.
+# HuggingFace allows 500 API requests per 5 minutes PER IP for anonymous callers, and a farm of
+# 13 machines behind one NAT IP (2 workers, 8 processes each) blows that on a simultaneous cold
+# start. hf_hub then sleeps ~200 s on the 429 while the worker's own startup timeout kills the
+# engine first, and the restart spends another burst of calls: on 2026-08-20 that livelock held
+# seven prod machines at zero tokens for 13 h while their weights sat complete on disk.
+#
+# So once the cache is complete we take the Hub off the container's map. Every call then fails
+# instantly with ECONNREFUSED and hf_hub falls back to the local snapshot — the same path
+# HF_HUB_OFFLINE=1 takes, chosen because that env var CANNOT be used here: the closed worker
+# binary rebuilds its child's environment from a fixed whitelist (CUDA_*, HF_HOME, HOME,
+# LD_LIBRARY_PATH, PATH, PWD, PYTHONNOUSERSITE, SHLVL, TMPDIR, XDG_CACHE_HOME) and drops the rest.
+# Only updates.dphn.ai is left reachable, so the worker's own self-update still lands.
+hf_repo_dirname() {
+    # "nvidia/Qwen3.6-35B-A3B-NVFP4" -> "nvidia--Qwen3.6-35B-A3B-NVFP4", the HF cache layout.
+    echo "${1//\//--}"
+}
+
+cache_is_complete() {
+    # Complete = the snapshot holds the index, every shard the index names, and the two files the
+    # tokenizer/config load needs. A partial cache (seeder died mid-download) must read as
+    # incomplete, or blackholing would strand this node offline against weights it cannot use.
+    #
+    # The snapshot is SEARCHED under the shared cache instead of read from this script's HF_HOME:
+    # the closed worker sets its own (measured on a prod container: HF_HOME=<home>/.cache/
+    # dolphinpod-worker/cache, while this entrypoint exports <home>/.cache/huggingface, which does
+    # not even exist there). Searching survives the worker moving that directory again.
+    local snapshot index shard repo_dir
+    repo_dir="models--$(hf_repo_dirname "${MODEL}")"
+    while read -r snapshot; do
+        index="${snapshot}model.safetensors.index.json"
+        [[ -f "${index}" && -f "${snapshot}config.json" && -f "${snapshot}tokenizer.json" ]] || continue
+        local missing=0 listed=0
+        while read -r shard; do
+            listed=$((listed + 1))
+            [[ -f "${snapshot}${shard}" ]] || missing=1
+        done < <(grep -oE '"model-[^"]+\.safetensors"' "${index}" | tr -d '"' | sort -u)
+        # A truncated index names no shard at all. Counting it as complete would blackhole the
+        # node against a cache the engine cannot load, so an empty list is a NO like any gap.
+        (( listed > 0 && ! missing )) && return 0
+    done < <(find "${SHARED_CACHE}" -maxdepth 6 -type d -path "*/${repo_dir}/snapshots/*" 2>/dev/null | sed 's:$:/:')
+    return 1
+}
+
+block_hf_hub() {
+    # Idempotent: the supervisor re-enters this path on every worker restart, and a hosts file
+    # that grows a line each time is a leak. A read-only /etc/hosts is survivable — the engine is
+    # then merely back to the rate-limit risk, which beats failing the container under `set -e`.
+    if grep -qE "^127\.0\.0\.1[[:space:]]+${HF_HUB_HOST}$" "${HOSTS_FILE}" 2>/dev/null; then
+        return 0
+    fi
+    if printf '127.0.0.1\t%s\n' "${HF_HUB_HOST}" >>"${HOSTS_FILE}" 2>/dev/null; then
+        echo "[dolphin] model cache is complete; ${HF_HUB_HOST} blackholed so engine starts never wait on a Hub rate limit" >&2
+    else
+        echo "[dolphin] WARNING: cannot write ${HOSTS_FILE}; engine starts still depend on the Hub" >&2
+    fi
+}
+
+block_hf_hub_when_cache_is_complete() {
+    cache_is_complete || return 0
+    block_hf_hub
+}
+
 spawn_instance() {
     local idx="$1"
     (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) &
@@ -480,11 +549,16 @@ on_term() {
 spawn_all_instances() {
     local i
     WORKER_PIDS=()
+    # A warm node (the model ships in the image) needs no Hub at all, not even for instance 0.
+    block_hf_hub_when_cache_is_complete
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
             # Only before the SECOND instance: once instance 0 serves, the runtime and the weights
             # are on disk, so 2..N all start warm and need no further wait.
             wait_for_cache_seed
+            # Instance 0 has just seeded the cache, so it was the only process that ever needed the
+            # Hub: close it for the siblings before they can spend the shared per-IP quota.
+            block_hf_hub_when_cache_is_complete
         fi
         if (( i > 0 && SPLIT_STAGGER_SECONDS > 0 )); then
             interruptible_sleep "${SPLIT_STAGGER_SECONDS}"
