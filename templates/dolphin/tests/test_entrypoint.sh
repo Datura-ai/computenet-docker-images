@@ -440,18 +440,31 @@ test_terminate_workers_is_bounded() {
 # vLLM resolves the UNPINNED revision `main` through the Hub API on every engine start, the farm
 # blew the anonymous 500-req/5-min per-IP quota, hf_hub slept ~200 s on the 429 and the worker's
 # own startup timeout killed the engine first — a livelock the cached weights could not prevent.
-hf_snapshot_dir() {
+hf_repo_cache_dir() {
     # The path the CLOSED worker uses, read off a live prod container
     # (HF_HOME=/root/.cache/dolphinpod-worker/cache) — NOT the HF_HOME this entrypoint exports.
     # The two differ, and a check pointed at ours finds an empty cache on every real node.
-    echo "${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${MODEL}")/snapshots/deadbeef"
+    echo "${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${MODEL}")"
 }
 
-seed_hf_cache() {
-    # Args: shard file names to actually create. The index always lists all three shards, so
-    # leaving one out is how a half-downloaded cache is expressed.
+hf_snapshot_dir() {
+    echo "$(hf_repo_cache_dir)/snapshots/${1:-deadbeef}"
+}
+
+point_hf_ref_main_at() {
+    # hf_hub writes the sha into refs/main as soon as it resolves the revision, BEFORE it fetches
+    # one byte. That is how a ref comes to name a snapshot that is still half on disk.
+    mkdir -p "$(hf_repo_cache_dir)/refs"
+    echo "$1" >"$(hf_repo_cache_dir)/refs/main"
+}
+
+seed_hf_cache_revision() {
+    # Args: <revision> then the shard file names to actually create. The index always lists all
+    # three shards, so leaving one out is how a half-downloaded cache is expressed.
+    local revision="$1"
+    shift
     local snapshot
-    snapshot="$(hf_snapshot_dir)"
+    snapshot="$(hf_snapshot_dir "${revision}")"
     mkdir -p "${snapshot}"
     printf '%s' '{"weight_map":{"a":"model-00001-of-00003.safetensors","b":"model-00002-of-00003.safetensors","c":"model-00003-of-00003.safetensors"}}' \
         >"${snapshot}/model.safetensors.index.json"
@@ -460,6 +473,11 @@ seed_hf_cache() {
     for shard in "$@"; do
         touch "${snapshot}/${shard}"
     done
+}
+
+seed_hf_cache() {
+    seed_hf_cache_revision deadbeef "$@"
+    point_hf_ref_main_at deadbeef
 }
 
 test_model_cache_is_complete() {
@@ -585,6 +603,35 @@ test_hf_offline_is_re_evaluated_later() {
     assert_eq "a new model re-opens the Hub" "no" "$(offline_mode_on)"
 }
 
+test_only_the_snapshot_under_the_ref_counts() {
+    make_sandbox
+    load_entrypoint
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "the snapshot the ref names is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # Upstream published a new commit. hf_hub moved refs/main to it and began the download, so a
+    # half-filled snapshot now sits beside the complete old one. vLLM resolves `main` through the
+    # same ref, so the old snapshot must NOT license offline mode — the engine would look into the
+    # new one, find no shards, and never start again.
+    seed_hf_cache_revision cafebabe "model-00001-of-00003.safetensors"
+    point_hf_ref_main_at cafebabe
+    assert_eq "a partial snapshot under the ref is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache_revision cafebabe "model-00001-of-00003.safetensors" \
+        "model-00002-of-00003.safetensors" "model-00003-of-00003.safetensors"
+    assert_eq "the finished new snapshot is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # No ref at all: the revision has never been resolved on this node, so the Hub is still needed.
+    rm "$(hf_repo_cache_dir)/refs/main"
+    assert_eq "a cache with no ref is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -595,6 +642,7 @@ test_split_sidecar_and_watchdog_wiring
 test_spawn_smoke
 test_terminate_workers_is_bounded
 test_model_cache_is_complete
+test_only_the_snapshot_under_the_ref_counts
 test_enable_hf_offline
 test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later

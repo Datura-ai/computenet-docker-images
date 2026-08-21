@@ -448,17 +448,27 @@ hf_cache_dir_name() {
 }
 
 model_cache_is_complete() {
-    # Complete = the snapshot holds the index, every shard the index names, and the two files the
-    # tokenizer/config load needs. A partial cache (seeder died mid-download) must read as
-    # incomplete, or offline mode would strand this node against weights it cannot use.
+    # Complete = the snapshot that `refs/main` NAMES holds the index, every shard the index names,
+    # and the two files the tokenizer/config load needs. A partial cache (the seeder died
+    # mid-download) must read as incomplete, or offline mode strands this node against weights it
+    # cannot use.
     #
-    # The snapshot is SEARCHED under the shared cache instead of read from this script's HF_HOME:
-    # the closed worker sets its own (measured on a prod container: HF_HOME=<home>/.cache/
+    # The ref decides, never "some complete snapshot on disk". The cache is keyed by commit sha, so
+    # a new commit upstream gives the model a SECOND, half-downloaded snapshot beside the complete
+    # old one — and hf_hub writes the new sha into refs/main before it fetches a single byte. vLLM
+    # resolves `main` through that same ref, so a check that accepts the old snapshot would take
+    # the node offline against a snapshot the engine never opens, and no engine would start again.
+    #
+    # The cache is SEARCHED under the shared volume instead of read from this script's HF_HOME: the
+    # closed worker sets its own (measured on a prod container: HF_HOME=<home>/.cache/
     # dolphinpod-worker/cache, while this entrypoint exports <home>/.cache/huggingface, which does
     # not even exist there). Searching survives the worker moving that directory again.
-    local snapshot index shard cache_dir_name
-    cache_dir_name="$(hf_cache_dir_name "${MODEL}")"
-    while read -r snapshot; do
+    local repo_dir ref_file revision snapshot index shard
+    while read -r repo_dir; do
+        ref_file="${repo_dir}/refs/main"
+        [[ -f "${ref_file}" ]] || continue
+        read -r revision <"${ref_file}" || continue
+        snapshot="${repo_dir}/snapshots/${revision}/"
         index="${snapshot}model.safetensors.index.json"
         [[ -f "${index}" && -f "${snapshot}config.json" && -f "${snapshot}tokenizer.json" ]] || continue
         local missing=0 listed=0
@@ -469,7 +479,7 @@ model_cache_is_complete() {
         # A truncated index names no shard at all. Counting it as complete would take the node
         # offline against a cache the engine cannot load, so an empty list is a NO like any gap.
         (( listed > 0 && ! missing )) && return 0
-    done < <(find "${SHARED_CACHE}" -maxdepth 6 -type d -path "*/${cache_dir_name}/snapshots/*" 2>/dev/null | sed 's:$:/:')
+    done < <(find "${SHARED_CACHE}" -maxdepth 5 -type d -name "$(hf_cache_dir_name "${MODEL}")" 2>/dev/null)
     return 1
 }
 
