@@ -486,11 +486,15 @@ model_cache_is_complete() {
     # before DAH-2743.
     #
     # The copies are SEARCHED rather than read from a fixed path, so the next move survives too.
+    # `.locks` is PRUNED: hf_hub puts its download locks in `<cache>/.locks/models--<repo>/`, which
+    # carries the very same directory name and holds no refs at all. Left in, that lock directory
+    # reads as a forever-incomplete copy and the node never goes offline.
     local repo_dir found=0
     while read -r repo_dir; do
         found=1
         snapshot_under_ref_is_complete "${repo_dir}" || return 1
-    done < <(find "${SHARED_CACHE}" -maxdepth 5 -type d -name "$(hf_cache_dir_name "${MODEL}")" 2>/dev/null)
+    done < <(find "${SHARED_CACHE}" -maxdepth 5 -name .locks -prune -o \
+        -type d -name "$(hf_cache_dir_name "${MODEL}")" -print 2>/dev/null)
     (( found ))
 }
 

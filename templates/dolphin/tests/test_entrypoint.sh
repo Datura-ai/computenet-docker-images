@@ -480,6 +480,10 @@ seed_hf_cache_revision() {
 seed_hf_cache() {
     seed_hf_cache_revision deadbeef "$@"
     point_hf_ref_main_at deadbeef
+    # hf_hub leaves a lock directory of the SAME name beside the cache on every download, and it
+    # holds no refs. Every fixture carries it, so no check may trip over it.
+    mkdir -p "${SHARED_CACHE}/dolphinpod-worker/cache/hub/.locks/$(hf_cache_dir_name "${MODEL}")"
+    touch "${SHARED_CACHE}/dolphinpod-worker/cache/hub/.locks/$(hf_cache_dir_name "${MODEL}")/e7.lock"
 }
 
 test_model_cache_is_complete() {
