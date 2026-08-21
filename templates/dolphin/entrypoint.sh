@@ -492,6 +492,15 @@ block_hf_hub_when_cache_is_complete() {
     block_hf_hub
 }
 
+# The seed wait ends when the first worker opens its engine socket, and the worker opens it about
+# 30 s after start — minutes BEFORE the download of the weights completes (measured on a cold
+# 8xH100 node, 2026-08-21). A check that runs only at spawn time therefore sees a partial cache and
+# leaves the container online for the rest of its life. The supervisor calls this every
+# LIVENESS_INTERVAL, so the Hub goes off the map in the first minute after the cache completes.
+maintain_hf_block() {
+    block_hf_hub_when_cache_is_complete
+}
+
 spawn_instance() {
     local idx="$1"
     (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) &
@@ -575,6 +584,7 @@ supervise_running_workers_until_new_binary_published() {
     local elapsed=0 i latest_etag
     while true; do
         interruptible_sleep "${LIVENESS_INTERVAL}"
+        maintain_hf_block
         for i in "${!WORKER_PIDS[@]}"; do
             if ! kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
                 wait "${WORKER_PIDS[$i]}" 2>/dev/null || true

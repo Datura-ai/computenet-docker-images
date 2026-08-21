@@ -531,11 +531,32 @@ test_hf_blackhole_wiring() {
     block_hf_hub_when_cache_is_complete
     assert_eq "cold cache keeps the Hub reachable" "no" "$(blocked)"
 
-    # Warm node (the common case: the model ships in the image) — no worker ever needs the Hub.
+    # Warm node (the shared cache volume already holds the weights) — no worker needs the Hub.
     seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
         "model-00003-of-00003.safetensors"
     block_hf_hub_when_cache_is_complete
     assert_eq "complete cache blackholes the Hub" "yes" "$(blocked)"
+}
+
+test_hf_block_is_re_evaluated_later() {
+    make_sandbox
+    load_entrypoint
+    export HOSTS_FILE="${SANDBOX}/hosts"
+    : >"${HOSTS_FILE}"
+    blocked() { grep -qc '^127.0.0.1[[:space:]]*huggingface.co$' "${HOSTS_FILE}" && echo yes || echo no; }
+
+    # Measured on a real cold node 2026-08-21: the worker opens its engine socket about 30 s after
+    # start, while the download of the weights continues for minutes. The seed wait therefore ends
+    # too early, and a check that runs one time only leaves the container online for its full life.
+    seed_hf_cache "model-00001-of-00003.safetensors"
+    block_hf_hub_when_cache_is_complete
+    assert_eq "an early check with a partial cache does not block" "no" "$(blocked)"
+
+    # The download completes some minutes later. The supervisor calls the same function again.
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    maintain_hf_block
+    assert_eq "a later check blocks the Hub" "yes" "$(blocked)"
 }
 
 test_plan
@@ -550,6 +571,7 @@ test_terminate_workers_is_bounded
 test_cache_is_complete
 test_block_hf_hub
 test_hf_blackhole_wiring
+test_hf_block_is_re_evaluated_later
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"
