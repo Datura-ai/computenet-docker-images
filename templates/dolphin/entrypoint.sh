@@ -504,9 +504,27 @@ enable_hf_offline() {
     return 0
 }
 
-enable_hf_offline_when_cache_is_complete() {
-    cache_is_complete || return 0
-    enable_hf_offline
+disable_hf_offline() {
+    # The counterpart of enable_hf_offline, and the reason the switch is SYNCED rather than only
+    # armed: DOLPHIN_MODEL can change under a container whose runtime still carries the .pth from
+    # the previous model. Offline mode would then forbid the download the new model needs, and the
+    # node could never mine again. An incomplete cache therefore always re-opens the Hub.
+    local site_dir target removed=0
+    while read -r site_dir; do
+        target="${site_dir}/${HF_OFFLINE_PTH_NAME}"
+        [[ -f "${target}" ]] || continue
+        rm -f "${target}" 2>/dev/null && removed=1
+    done < <(hf_offline_site_dirs)
+    (( removed )) && echo "[dolphin] model cache is not complete; HF offline mode is off so the weights can be downloaded" >&2
+    return 0
+}
+
+sync_hf_offline_with_cache() {
+    if cache_is_complete; then
+        enable_hf_offline
+    else
+        disable_hf_offline
+    fi
 }
 
 # The seed wait ends when the first worker opens its engine socket, and the worker opens it about
@@ -515,7 +533,7 @@ enable_hf_offline_when_cache_is_complete() {
 # leaves the container online for the rest of its life. The supervisor calls this every
 # LIVENESS_INTERVAL, so the Hub goes off the map in the first minute after the cache completes.
 maintain_hf_offline() {
-    enable_hf_offline_when_cache_is_complete
+    sync_hf_offline_with_cache
 }
 
 spawn_instance() {
@@ -577,7 +595,7 @@ spawn_all_instances() {
     WORKER_PIDS=()
     # A warm node — the shared cache volume already holds the weights from an earlier container —
     # needs no Hub at all, not even for instance 0.
-    enable_hf_offline_when_cache_is_complete
+    sync_hf_offline_with_cache
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
             # Only before the SECOND instance: once instance 0 serves, the runtime and the weights
@@ -585,7 +603,7 @@ spawn_all_instances() {
             wait_for_cache_seed
             # Instance 0 has just seeded the cache, so it was the only process that ever needed the
             # Hub: close it for the siblings before they can spend the shared per-IP quota.
-            enable_hf_offline_when_cache_is_complete
+            sync_hf_offline_with_cache
         fi
         if (( i > 0 && SPLIT_STAGGER_SECONDS > 0 )); then
             interruptible_sleep "${SPLIT_STAGGER_SECONDS}"

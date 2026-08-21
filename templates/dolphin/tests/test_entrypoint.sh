@@ -542,13 +542,13 @@ test_hf_offline_wiring() {
     blocked() { [[ -f "${pth}" ]] && echo yes || echo no; }
 
     # Cold node: the cache must be seeded from the Hub, so the Hub stays reachable.
-    enable_hf_offline_when_cache_is_complete
+    sync_hf_offline_with_cache
     assert_eq "cold cache keeps the Hub reachable" "no" "$(blocked)"
 
     # Warm node (the shared cache volume already holds the weights) — no worker needs the Hub.
     seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
         "model-00003-of-00003.safetensors"
-    enable_hf_offline_when_cache_is_complete
+    sync_hf_offline_with_cache
     assert_eq "complete cache turns offline mode on" "yes" "$(blocked)"
 }
 
@@ -564,7 +564,7 @@ test_hf_offline_is_re_evaluated_later() {
     # start, while the download of the weights continues for minutes. The seed wait therefore ends
     # too early, and a check that runs one time only leaves the container online for its full life.
     seed_hf_cache "model-00001-of-00003.safetensors"
-    enable_hf_offline_when_cache_is_complete
+    sync_hf_offline_with_cache
     assert_eq "an early check with a partial cache stays online" "no" "$(blocked)"
 
     # The download completes some minutes later. The supervisor calls the same function again.
@@ -572,6 +572,12 @@ test_hf_offline_is_re_evaluated_later() {
         "model-00003-of-00003.safetensors"
     maintain_hf_offline
     assert_eq "a later check turns offline mode on" "yes" "$(blocked)"
+
+    # DOLPHIN_MODEL changes to a model this node has never held. The switch must come OFF again,
+    # or offline mode forbids the very download the new model needs and the node never mines.
+    MODEL="nvidia/SomeNewModel"
+    maintain_hf_offline
+    assert_eq "a new model re-opens the Hub" "no" "$(blocked)"
 }
 
 test_plan
