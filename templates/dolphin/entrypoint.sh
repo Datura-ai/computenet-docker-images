@@ -549,7 +549,8 @@ on_term() {
 spawn_all_instances() {
     local i
     WORKER_PIDS=()
-    # A warm node (the model ships in the image) needs no Hub at all, not even for instance 0.
+    # A warm node — the shared cache volume already holds the weights from an earlier container —
+    # needs no Hub at all, not even for instance 0.
     block_hf_hub_when_cache_is_complete
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
