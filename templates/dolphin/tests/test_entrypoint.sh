@@ -455,7 +455,9 @@ point_hf_ref_main_at() {
     # hf_hub writes the sha into refs/main as soon as it resolves the revision, BEFORE it fetches
     # one byte. That is how a ref comes to name a snapshot that is still half on disk.
     mkdir -p "$(hf_repo_cache_dir)/refs"
-    echo "$1" >"$(hf_repo_cache_dir)/refs/main"
+    # NO trailing newline — that is exactly how huggingface_hub writes the file, and `read` would
+    # report EOF on it.
+    printf '%s' "$1" >"$(hf_repo_cache_dir)/refs/main"
 }
 
 seed_hf_cache_revision() {
@@ -548,10 +550,12 @@ test_enable_hf_offline() {
     assert_eq "a new runtime gets the switch as well" "1" \
         "$(ls "${second_site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null | wc -l | tr -d ' ')"
 
-    # No runtime yet (cold container): must not fail under `set -e`.
+    # No runtime yet (cold container): must not fail under `set -e`. The harness puts errexit back
+    # OFF after sourcing, so the claim is only worth anything inside a subshell that turns it on —
+    # which is how the real entrypoint runs.
     DOLPHIN_HOME="${SANDBOX}/empty"
-    enable_hf_offline
-    assert_eq "no runtime directory is survivable" "yes" "yes"
+    assert_eq "no runtime directory is survivable under set -e" "ok" \
+        "$(set -euo pipefail; enable_hf_offline 2>/dev/null && echo ok)"
 }
 
 test_hf_offline_wiring() {
@@ -601,6 +605,12 @@ test_hf_offline_is_re_evaluated_later() {
     MODEL="nvidia/SomeNewModel"
     sync_hf_offline_with_cache
     assert_eq "a new model re-opens the Hub" "no" "$(offline_mode_on)"
+
+    # The two calls above drive the function directly, so they would still pass if someone deleted
+    # the supervisor's call. Guard the wiring itself.
+    assert_eq "the supervisor re-checks it every cycle" "1" \
+        "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
+            | grep -c 'sync_hf_offline_with_cache')"
 }
 
 test_only_the_snapshot_under_the_ref_counts() {
@@ -632,6 +642,33 @@ test_only_the_snapshot_under_the_ref_counts() {
         "$(model_cache_is_complete && echo yes || echo no)"
 }
 
+test_a_stale_copy_under_another_root_does_not_count() {
+    make_sandbox
+    load_entrypoint
+
+    # The worker has moved its cache directory once already, so the volume can hold the model twice:
+    # a complete copy under the root an older image used, and the copy the engine reads now, still
+    # downloading. Going offline on the strength of the stale one strands the real download.
+    local stale="${SHARED_CACHE}/huggingface/hub/$(hf_cache_dir_name "${MODEL}")"
+    mkdir -p "${stale}/refs" "${stale}/snapshots/deadbeef"
+    printf '%s' deadbeef >"${stale}/refs/main"
+    printf '%s' '{"weight_map":{"a":"model-00001-of-00001.safetensors"}}' \
+        >"${stale}/snapshots/deadbeef/model.safetensors.index.json"
+    touch "${stale}/snapshots/deadbeef/config.json" "${stale}/snapshots/deadbeef/tokenizer.json" \
+        "${stale}/snapshots/deadbeef/model-00001-of-00001.safetensors"
+    assert_eq "one complete copy on its own is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache "model-00001-of-00003.safetensors"
+    assert_eq "a half-downloaded second copy keeps the Hub reachable" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "both copies complete is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -643,6 +680,7 @@ test_spawn_smoke
 test_terminate_workers_is_bounded
 test_model_cache_is_complete
 test_only_the_snapshot_under_the_ref_counts
+test_a_stale_copy_under_another_root_does_not_count
 test_enable_hf_offline
 test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later
