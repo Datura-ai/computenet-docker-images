@@ -2,8 +2,10 @@
 #
 # Boot engy (Bittensor SN53) workers inside a Lium filler container.
 #
-# Shape: ENGY_ENGINES_PER_GPU sglang engines PER GPU (each --tp-size 1, its own port) and ONE
-# engy_miner PER ENGINE. The default of one engine per card is the shape this image has always run.
+# Shape: ENGY_ENGINES_PER_GPU sglang engines PER GPU (each --tp-size ENGY_TP_SIZE, its own port) and
+# ONE engy_miner PER ENGINE. The default of one engine per card at tp 1 is the shape this image has
+# always run; ENGY_TP_SIZE above 1 spans ONE engine across a GROUP of cards instead, which is the
+# only way to serve a checkpoint that fits on no single card.
 # The reasoning behind every decision here, with the measurements, is in ARCHITECTURE.md next to
 # this file — read that before changing anything below.
 set -euo pipefail
@@ -56,9 +58,47 @@ if [[ ! "${ENGINES_PER_GPU}" =~ ^[0-9]+$ ]] || (( ENGINES_PER_GPU < 1 )); then
     echo "[engy] ENGY_ENGINES_PER_GPU='${ENGINES_PER_GPU}' is not a positive number; using 1." >&2
     ENGINES_PER_GPU=1
 fi
-# What one engine must be able to hold: ~35GB of FP8 weights plus enough KV cache to serve. Engines
-# sharing a card split its VRAM, so this is also the ceiling on how many fit — see size_engines_to_the_card.
-MIN_ENGINE_VRAM_MB=49152
+# How many CARDS one engine spans, passed straight to sglang's --tp-size. One is the measured shape
+# and stays the default: per-card engines served 564 tok/s against 329 for a single --tp-size 2
+# engine over the same 2xH100 (2026-07-27), because qwen fits on one card and tensor parallelism
+# then only costs the interconnect on every token. This knob is for the case that measurement does
+# not cover — a checkpoint that fits on NO single card, like zai-org/GLM-5.2-FP8 at 755.7GB of
+# weights, which needs every card of an 8xB300 node as one engine or it cannot be served at all.
+# See ARCHITECTURE.md, "Why one engine per GPU, not one tensor-parallel engine".
+TP_SIZE="${ENGY_TP_SIZE:-1}"
+# Text first, arithmetic after, for the same reason ENGY_REQUESTS_PER_GATEWAY_LEG is checked that
+# way: under `set -u` a non-numeric value makes (( )) treat it as an unset variable NAME and kill
+# the script here. A group that the node cannot actually form is a different failure and is refused
+# once the card count is known — see refuse_tensor_parallel_shapes_the_node_cannot_run.
+if [[ ! "${TP_SIZE}" =~ ^[0-9]+$ ]] || (( TP_SIZE < 1 )); then
+    echo "[engy] ENGY_TP_SIZE='${TP_SIZE}' is not a positive number; using 1." >&2
+    TP_SIZE=1
+fi
+# What one engine must be able to hold: its weights plus enough KV cache to serve. 49152 is the
+# QWEN number (~35GB of FP8 weights plus KV), so a different checkpoint has to be told its own or
+# the clamp below is sizing against the wrong model. Engines sharing a card split the VRAM of their
+# group, so this is also the ceiling on how many fit — see size_engines_to_the_card.
+QWEN_MIN_ENGINE_VRAM_MB=49152
+MIN_ENGINE_VRAM_MB="${ENGY_MIN_ENGINE_VRAM_MB:-${QWEN_MIN_ENGINE_VRAM_MB}}"
+if [[ ! "${MIN_ENGINE_VRAM_MB}" =~ ^[0-9]+$ ]] || (( MIN_ENGINE_VRAM_MB < 1 )); then
+    echo "[engy] ENGY_MIN_ENGINE_VRAM_MB='${MIN_ENGINE_VRAM_MB}' is not a positive number;" \
+         "using ${QWEN_MIN_ENGINE_VRAM_MB}." >&2
+    MIN_ENGINE_VRAM_MB="${QWEN_MIN_ENGINE_VRAM_MB}"
+fi
+# The tool-call and reasoning parsers sglang runs on its OpenAI routes. Blank by default, and blank
+# means the flag is left OFF the command line entirely, so the default shape is byte-identical to
+# what this image has always launched.
+#
+# Upstream's MINER.md calls them required for agentic buyers and measured 0 of 100 tool-call
+# requests succeeding without them — but that is about the OpenAI routes. Our miner drives sglang's
+# NATIVE /generate, which does not run these parsers at all, and vendor/engy_miner.py says so and
+# reproduces qwen's tool-call and reasoning parsing itself ("/generate returns hidden states (which
+# the proof needs) but doesn't run sglang's tool/reasoning parsers, so we reproduce them here").
+# So turning them on by default would change nothing we serve, while handing a non-qwen checkpoint a
+# parser named for the wrong model. They exist for a checkpoint whose markup the vendored miner
+# cannot parse, which then needs the right names without an image rebuild.
+TOOL_CALL_PARSER="${ENGY_TOOL_CALL_PARSER:-}"
+REASONING_PARSER="${ENGY_REASONING_PARSER:-}"
 FIRST_PORT="${ENGY_FIRST_PORT:-8000}"
 # The gateway's own model spec forces this; sglang refuses a shorter context for it.
 CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
@@ -66,17 +106,32 @@ CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
 # producing a token before it counts as wedged.
 LIVENESS_INTERVAL_SECONDS="${ENGY_LIVENESS_INTERVAL_SECONDS:-60}"
 ENGINE_STALL_SECONDS="${ENGY_ENGINE_STALL_SECONDS:-300}"
-# After a kill, an engine reloads ~35GB of weights and re-JITs its kernels, and it answers /metrics
-# with requests still attributed to it long before it generates again. Without this grace the
-# supervisor reads that reload as a fresh wedge and kills the engine it is waiting for, forever.
+# After a kill, an engine reloads its whole checkpoint and re-JITs its kernels, and it answers
+# /metrics with requests still attributed to it long before it generates again. Without this grace
+# the supervisor reads that reload as a fresh wedge and kills the engine it is waiting for, forever.
 # Borrowed from templates/dolphin's watchdog (DOLPHIN_WATCHDOG_GRACE_SECONDS).
+# Deliberately NOT grown with the checkpoint: a loading engine serves no /metrics at all, so
+# engine_is_wedged reads no counters and returns false anyway — the grace covers the window AFTER
+# the reload, which is the same length whatever the model weighs.
 ENGINE_RESTART_GRACE_SECONDS="${ENGY_ENGINE_RESTART_GRACE_SECONDS:-900}"
 # How long a cold start may take before an engine is left to the supervisor instead of held for.
-# A 35GB load plus ~16k JIT-compiled FP8 kernels is 10-20 minutes on an empty cache.
-ENGINE_READY_TIMEOUT_SECONDS="${ENGY_ENGINE_READY_TIMEOUT_SECONDS:-2400}"
+# A 35GB load plus ~16k JIT-compiled FP8 kernels is 10-20 minutes on an empty cache, and 2400 is the
+# budget that covers it.
+MEASURED_ENGINE_READY_TIMEOUT_SECONDS=2400
+ENGINE_READY_TIMEOUT_SECONDS="${ENGY_ENGINE_READY_TIMEOUT_SECONDS:-${MEASURED_ENGINE_READY_TIMEOUT_SECONDS}}"
 # How long the first engine gets to seed the shared DeepGEMM cache before the rest are started.
 # See start_engines_seeding_the_kernel_cache_first.
-CACHE_SEED_WAIT_SECONDS="${ENGY_CACHE_SEED_WAIT_SECONDS:-1500}"
+MEASURED_CACHE_SEED_WAIT_SECONDS=1500
+CACHE_SEED_WAIT_SECONDS="${ENGY_CACHE_SEED_WAIT_SECONDS:-${MEASURED_CACHE_SEED_WAIT_SECONDS}}"
+# The checkpoint both budgets above were measured on, and what a GB past it is worth. Both windows
+# are the same event — weights off the shared volume into VRAM, then the JIT — and only the JIT half
+# is a constant, so it is the extra weights that are added. 6s/GB is deliberately generous, because
+# the two errors are not symmetric: too large only leaves a genuinely dead engine idle a while
+# longer before the supervisor restarts it, while too small restarts an engine that was still
+# loading and buys a crash-loop that can never finish. At 756GB (GLM-5.2-FP8) it makes the readiness
+# budget ~1h52m instead of 40 minutes. See size_the_cold_start_budgets_to_the_checkpoint.
+MEASURED_CHECKPOINT_GB=35
+SECONDS_PER_EXTRA_CHECKPOINT_GB=6
 # A miner exiting means something is genuinely wrong (it has its own websocket reconnect loop), so
 # back off before respawning rather than spinning against the gateway.
 MINER_RESTART_BACKOFF_SECONDS="${ENGY_MINER_RESTART_BACKOFF_SECONDS:-60}"
@@ -138,7 +193,8 @@ start_capturing_output() {
 # keeps it from draining, so every child goes first; at the early call sites they are all empty and
 # that loop is a no-op. Then closing our end lets the pipe reach EOF and we wait for it to flush.
 refuse_to_start() {
-    echo "[engy] $1" >&2
+    # "$*", so a long reason can be written across continued lines like every echo in this file.
+    echo "[engy] $*" >&2
     local children=(${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"})
     local pid
     for pid in ${children[@]+"${children[@]}"}; do
@@ -243,14 +299,20 @@ interruptible_sleep() {
 # number, and restart_engine used to hand its engine index straight to CUDA_VISIBLE_DEVICES.
 start_engine() {
     local index="$1" port="${engine_ports[$1]}"
+    # A blank parser is DROPPED rather than passed empty, so the unconfigured command line is the
+    # exact one this image has always launched. `if`, never `[[ … ]] && …`: a false test is the
+    # status this function would then return, and under `set -e` that kills the container.
+    local optional_flags=()
+    if [[ -n "${TOOL_CALL_PARSER}" ]]; then optional_flags+=(--tool-call-parser "${TOOL_CALL_PARSER}"); fi
+    if [[ -n "${REASONING_PARSER}" ]]; then optional_flags+=(--reasoning-parser "${REASONING_PARSER}"); fi
     CUDA_VISIBLE_DEVICES="${engine_gpus[$index]}" python3 -m sglang.launch_server \
         --model-path "${CKPT_DIR}" \
-        --served-model-name "${SERVED_MODEL_NAME}" --tp-size 1 --trust-remote-code \
+        --served-model-name "${SERVED_MODEL_NAME}" --tp-size "${TP_SIZE}" --trust-remote-code \
         --kv-cache-dtype fp8_e4m3 \
         --mem-fraction-static "$(engine_mem_fraction "$(( index % ENGINES_PER_GPU ))")" \
         --chunked-prefill-size 8192 --max-running-requests "${ENGINE_SLOTS}" \
         --context-length "${CONTEXT_LENGTH}" --enable-return-hidden-states --enable-cache-report \
-        --enable-metrics \
+        --enable-metrics ${optional_flags[@]+"${optional_flags[@]}"} \
         --host 127.0.0.1 --port "${port}" &
     engine_pids[index]=$!
     # Every start earns the reload grace, first one included: a cold start JITs ~16k FP8 kernels and
@@ -259,30 +321,105 @@ start_engine() {
     engine_started_at[index]="${SECONDS}"
 }
 
-# Two engines on one card means two copies of the 35GB checkpoint in VRAM, so the knob is capped by
-# the hardware rather than trusted: the value comes from platform config and a wrong one costs a
-# crash-loop of 35GB loads, not a clean refusal. A card whose size nvidia-smi will not report is
-# taken at the operator's word — an unreadable card must not silently halve a healthy node.
+# Two engines on one card means two copies of the checkpoint in VRAM, so the knob is capped by the
+# hardware rather than trusted: the value comes from platform config and a wrong one costs a
+# crash-loop of full checkpoint loads, not a clean refusal. A card whose size nvidia-smi will not
+# report is taken at the operator's word — an unreadable card must not silently halve a healthy node.
+#
+# The budget is the ENGINE's, not the card's: at tp 1 they are the same number, and above it an
+# engine spans TP_SIZE cards and has all of their VRAM to hold one copy of the weights in.
 size_engines_to_the_card() {
-    local smallest_card_mb engines_that_fit
+    local smallest_card_mb engine_vram_mb engines_that_fit group="card"
     # `|| true` for the same reason as the GPU count below: grep exits 1 when nothing matches, and
     # under `set -e` + pipefail that would kill the script at this assignment, with nothing logged.
     smallest_card_mb="$( { nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null |
         tr -d ' ' | grep -E '^[0-9]+$' | sort -n | head -1; } || true)"
     if [[ -n "${smallest_card_mb}" ]]; then
+        engine_vram_mb=$(( smallest_card_mb * TP_SIZE ))
+        # `if`, never `(( … )) && …` — the file's standing rule: a false arithmetic test becomes
+        # this function's return status and `set -e` kills the container at the call site.
+        if (( TP_SIZE > 1 )); then group="${TP_SIZE}-card group"; fi
         # Against the 85% the engines actually get, not the whole card: sizing the count on total
         # VRAM and the allocation on 0.85/N lets a card pass the clamp and still hand each engine
         # less than one needs — the crash-loop this clamp exists to prevent.
-        engines_that_fit=$(( smallest_card_mb * 85 / 100 / MIN_ENGINE_VRAM_MB ))
-        (( engines_that_fit < 1 )) && engines_that_fit=1
+        engines_that_fit=$(( engine_vram_mb * 85 / 100 / MIN_ENGINE_VRAM_MB ))
+        if (( engines_that_fit < 1 )); then
+            # Not fatal, because MIN_ENGINE_VRAM_MB is an estimate and the hardware is not: a node
+            # the operator sized deliberately must not be refused on our arithmetic. But this is the
+            # only warning a mis-sized tensor-parallel group ever gets before sglang OOMs on it.
+            echo "[engy] ${engine_vram_mb}MB of ${group} VRAM is below the ${MIN_ENGINE_VRAM_MB}MB one engine" \
+                 "is declared to need; starting one anyway" >&2
+            engines_that_fit=1
+        fi
         if (( ENGINES_PER_GPU > engines_that_fit )); then
-            echo "[engy] ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} does not fit a ${smallest_card_mb}MB card at" \
+            echo "[engy] ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} does not fit a ${engine_vram_mb}MB ${group} at" \
                  "${MIN_ENGINE_VRAM_MB}MB usable per engine; using ${engines_that_fit}." >&2
             ENGINES_PER_GPU="${engines_that_fit}"
         fi
     else
         echo "[engy] could not read card size; keeping ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} as given" >&2
     fi
+}
+
+# Refuse a tensor-parallel shape this node cannot form, rather than quietly running a smaller one.
+#
+# Clamping is right for ENGY_ENGINES_PER_GPU, where a lower count is simply less of the same thing
+# that still serves. It is wrong here: TP_SIZE is chosen because the checkpoint does not fit on
+# fewer cards, so a silently reduced group does not serve at all — it buys a crash-loop of
+# three-quarter-terabyte loads, each of them ending in an OOM the log has to be dug out of.
+#
+# Refused rather than clamped for the same reason a missing MINER_KEY is: the operator asked for a
+# shape, the node cannot give it, and the only useful thing this container can do is say so once.
+refuse_tensor_parallel_shapes_the_node_cannot_run() {
+    (( TP_SIZE > 1 )) || return 0
+    if (( TP_SIZE > gpu_count )); then
+        refuse_to_start "ENGY_TP_SIZE=${TP_SIZE} needs ${TP_SIZE} cards and this node has ${gpu_count}."
+    fi
+    if (( gpu_count % TP_SIZE != 0 )); then
+        refuse_to_start "ENGY_TP_SIZE=${TP_SIZE} does not divide the node's ${gpu_count} cards;" \
+            "the leftover $(( gpu_count % TP_SIZE )) could not form a group and would earn nothing."
+    fi
+    # Two engines on one card exists to buy routing share on hardware with VRAM to spare (prod
+    # measured 2 concurrent requests across eight engines, so the card was never the constraint).
+    # A checkpoint that needs every card of a group has no spare by definition, and the split's own
+    # memory arithmetic (engine_mem_fraction) was solved for engines measuring one shared card, not
+    # a group. Nothing about that combination has been measured, so it is not run.
+    if (( ENGINES_PER_GPU > 1 )); then
+        refuse_to_start "ENGY_TP_SIZE=${TP_SIZE} and ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} cannot" \
+            "be combined: a tensor-parallel engine already spans its whole group, and a second one" \
+            "on the same cards is a shape nothing has measured. Set ENGY_ENGINES_PER_GPU=1."
+    fi
+}
+
+# Grow the cold-start budgets with the checkpoint actually on disk, unless they were set explicitly.
+#
+# Both defaults were measured on the 35GB qwen load (see MEASURED_CHECKPOINT_GB). A 756GB checkpoint
+# is ~20x that, and the readiness timeout is the dangerous one: supervise_forever restarts an engine
+# that has not become ready within it, so a load that legitimately takes longer than 40 minutes is
+# killed mid-load and restarted forever, with nothing in the log but "never became ready". The seed
+# wait is the cheaper failure — it expires and the siblings each pay their own JIT — but it is the
+# same load window, so it moves with it.
+#
+# Read from the checkpoint on disk rather than from a configured number, because that is the thing
+# that actually has to be loaded and it is already local by the time this runs.
+size_the_cold_start_budgets_to_the_checkpoint() {
+    local checkpoint_gb extra_seconds
+    # `|| true` and a text check before the arithmetic, like everywhere else here: a du that fails
+    # on a half-written cache volume must not kill the container at this assignment.
+    checkpoint_gb="$( { du -sm "${CKPT_DIR}" 2>/dev/null | awk '{ printf "%d", $1 / 1024 }'; } || true)"
+    if [[ ! "${checkpoint_gb}" =~ ^[0-9]+$ ]] || (( checkpoint_gb <= MEASURED_CHECKPOINT_GB )); then
+        return 0
+    fi
+    extra_seconds=$(( (checkpoint_gb - MEASURED_CHECKPOINT_GB) * SECONDS_PER_EXTRA_CHECKPOINT_GB ))
+    if [[ -z "${ENGY_ENGINE_READY_TIMEOUT_SECONDS:-}" ]]; then
+        ENGINE_READY_TIMEOUT_SECONDS=$(( MEASURED_ENGINE_READY_TIMEOUT_SECONDS + extra_seconds ))
+    fi
+    if [[ -z "${ENGY_CACHE_SEED_WAIT_SECONDS:-}" ]]; then
+        CACHE_SEED_WAIT_SECONDS=$(( MEASURED_CACHE_SEED_WAIT_SECONDS + extra_seconds ))
+    fi
+    echo "[engy] the checkpoint is ${checkpoint_gb}GB against the ${MEASURED_CHECKPOINT_GB}GB the" \
+         "cold-start budgets were measured on; an engine gets ${ENGINE_READY_TIMEOUT_SECONDS}s to" \
+         "become ready and the kernel cache ${CACHE_SEED_WAIT_SECONDS}s to seed"
 }
 
 # What ONE engine passes to --mem-fraction-static, given its slot on the card it shares.
@@ -300,13 +437,26 @@ engine_mem_fraction() {
         'BEGIN { share = 0.85 / engines; printf "%.4g", share / (1 - slot * share) }'
 }
 
+# The cards ONE engine owns, in the form CUDA_VISIBLE_DEVICES wants: a single id at tp 1, and the
+# whole comma-separated group above it. Groups are contiguous and in card order, so group g is cards
+# g*TP_SIZE … g*TP_SIZE+TP_SIZE-1 — which keeps NVLink neighbours together on a node whose topology
+# pairs adjacent cards, and keeps card 0 in group 0.
+cards_of_one_engine() {
+    local group="$1" offset cards=""
+    for offset in $(seq 0 $(( TP_SIZE - 1 ))); do
+        cards+="${cards:+,}$(( group * TP_SIZE + offset ))"
+    done
+    echo "${cards}"
+}
+
 # Engines sharing a card get adjacent indexes, and card 0 keeps engine 0 — the one that seeds the
-# kernel cache.
+# kernel cache. A tensor-parallel engine consumes TP_SIZE cards, so the node fits that many fewer
+# of them; at tp 1 this is the plain one-engine-per-card-per-slot layout it has always been.
 assign_engines_to_ports_and_cards() {
     local index
-    for index in $(seq 0 $(( gpu_count * ENGINES_PER_GPU - 1 ))); do
+    for index in $(seq 0 $(( gpu_count / TP_SIZE * ENGINES_PER_GPU - 1 ))); do
         engine_ports[index]=$((FIRST_PORT + index))
-        engine_gpus[index]=$((index / ENGINES_PER_GPU))
+        engine_gpus[index]="$(cards_of_one_engine $(( index / ENGINES_PER_GPU )))"
     done
 }
 
@@ -432,10 +582,15 @@ start_miners_as_engines_become_ready() {
 # `engy_worker` metric label, so it has to say which CARD went quiet. One engine per card keeps the
 # plain `-g<card>` every existing worker is already known by; engines sharing a card add the slot,
 # because `-g<engine>` alone would leave the card unknowable from any metric.
+#
+# It is the engine's FIRST card, not its index: at tp 1 those are the same number and the name is
+# unchanged, and above it the index counts groups, so `-g1` would name card 1 while running on cards
+# 2 and 3. A tensor-parallel worker is therefore `-g<first card of its group>`, and the group is the
+# TP_SIZE cards from there.
 miner_worker_name() {
     local index="$1" prefix="${ENGY_WORKER_NAME:-$(hostname)}"
     if (( ENGINES_PER_GPU == 1 )); then
-        echo "${prefix}-g${index}"
+        echo "${prefix}-g${engine_gpus[$index]%%,*}"
     else
         echo "${prefix}-g${engine_gpus[$index]}e$(( index % ENGINES_PER_GPU ))"
     fi
@@ -443,9 +598,17 @@ miner_worker_name() {
 
 # The hardware summary a miner sends the gateway comes from `nvidia-smi`, which lists the whole node
 # and ignores CUDA_VISIBLE_DEVICES. Every miner here fronts ONE engine, so without this all eight of
-# ours announce the node's eight cards each. HW_GPUS is upstream's own override for it. Engines
+# ours announce the node's eight cards each. HW_GPUS is upstream's own override for it, and the count
+# beside it is corrected in engy_launch.py, because overriding only the string leaves the frame
+# contradicting itself.
+#
+# What a miner announces is TP_SIZE cards, which is exactly what its engine holds: "1x <card>" per
+# card at tp 1, and "8x <card>" for an engine spanning eight — the same string the real tensor-
+# parallel workers report (`GET /v1/network`: "8x NVIDIA B300 SXM6 AC", parallelism "tp"). Engines
 # sharing a card each still say "1x", because there is no fractional form and the gateway sizes a
 # worker by the capacity probe it runs, not by this string.
+#
+# This reads the card NAME only; how many of them are announced is TP_SIZE, at the call site.
 one_gpu_name() {
     local name
     name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^ *//;s/ *$//')"
@@ -453,7 +616,8 @@ one_gpu_name() {
 }
 
 # Read once at startup rather than per miner: the value is a constant, and every read is an
-# nvidia-smi driver round trip issued while N engines are loading 35GB apiece.
+# nvidia-smi driver round trip issued while N engines are each loading their own copy of the
+# weights.
 read_gpu_name_once() {
     GPU_NAME="$(one_gpu_name)"
 }
@@ -505,7 +669,8 @@ start_miner() {
     GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
     MAX_INFLIGHT="${DECLARED_INFLIGHT}" \
     ENGY_GW_WORKERS="${GATEWAY_WORKERS}" \
-    HW_GPUS="1x ${GPU_NAME}" \
+    HW_GPUS="${TP_SIZE}x ${GPU_NAME}" \
+    ENGY_WORKER_GPU_COUNT="${TP_SIZE}" \
     ENGY_WORKER_NAME="${name}" \
     ENGY_PROBE_DIR="${PROBE_DIR}" \
         python3 "${ENGY_MINER_DIR}/engy_launch.py" \
@@ -565,8 +730,8 @@ refresh_vendored_miner() {
 }
 
 # Token counters for the platform scraper, and the log. Started BEFORE the readiness wait: a cold
-# start is a 35GB download plus warmup, and that whole window is when someone wants to see why the
-# node is quiet. /metrics degrades to 503 meanwhile, which the sidecar already handles. Restarted
+# start is a checkpoint download plus warmup, and that whole window is when someone wants to see
+# why the node is quiet. /metrics degrades to 503 meanwhile, which the sidecar already handles. Restarted
 # with backoff like templates/dolphin, since a dead sidecar costs us the only remote read of this
 # container. TERM kills the subshell and orphans its python; container teardown reaps it, because
 # this script is PID 1.
@@ -621,8 +786,8 @@ engine_running_and_tokens() {
 # A wedged engine is the one failure nothing else notices: requests sit in flight, the process is
 # alive, /health answers, and the token counter simply stops. Dolphin measured twelve of these on
 # vLLM (1.6-23.5h each, invisible to every other check) and cures them the same way — kill the
-# engine, not the container, because recreating the container costs a 35GB cold start for a fault a
-# restart fixes in minutes.
+# engine, not the container, because recreating the container costs a full checkpoint cold start
+# for a fault a restart fixes in minutes.
 #
 # Deliberately NOT a fault here, both borrowed from templates/dolphin/watchdog.py: an engine that
 # never came up (a cold start legitimately produces nothing for tens of minutes) and an idle queue
@@ -769,6 +934,9 @@ main() {
     if [[ "${gpu_count}" -lt 1 ]]; then
         refuse_to_start "no GPUs visible to the container."
     fi
+    # Before size_engines_to_the_card, which sizes an engine against its whole group: a group the
+    # node cannot form has no size to be measured against.
+    refuse_tensor_parallel_shapes_the_node_cannot_run
     size_engines_to_the_card
     assign_engines_to_ports_and_cards
     read_gpu_name_once
@@ -779,8 +947,8 @@ main() {
     # and against a gateway there would be nothing to onboard to anyway.
     resolve_gateway_worker_count
     size_declaration_and_engine_to_the_gateway
-    echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) x" \
-         "${ENGINE_SLOTS} slots at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
+    echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) of" \
+         "${TP_SIZE} card(s) x ${ENGINE_SLOTS} slots at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
          "of a card each, one miner per engine declaring ${DECLARED_INFLIGHT}"
 
     export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
@@ -791,9 +959,14 @@ main() {
     # would keep publishing frozen lag series for GPUs it no longer has.
     rm -f "${PROBE_DIR}"/*.prom "${PROBE_DIR}"/*.prom.tmp
     if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
-        echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
+        # No size in this line any more: it used to say ~35GB, which stopped being true the day the
+        # repo became configurable — GLM-5.2-FP8 is 755.7GB through the same call.
+        echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} into the shared cache volume"
         HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
     fi
+    # After the download and before the first engine: the budgets are read from the checkpoint on
+    # disk, and every wait they cap starts below.
+    size_the_cold_start_budgets_to_the_checkpoint
 
     trap shutdown TERM INT
 

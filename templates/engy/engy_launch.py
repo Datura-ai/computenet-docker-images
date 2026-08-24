@@ -75,17 +75,31 @@ def take_worker_singleton(worker_name: str) -> None:
     _singleton_file = lock_file
 
 
-def announce_only_this_workers_card() -> None:
-    """Report ONE card, because this miner fronts one engine on one card.
+def cards_this_worker_fronts() -> int:
+    """How many cards this miner's engine actually holds — the entrypoint's `--tp-size`.
+
+    Validated here because the environment is a boundary: an unset, empty or nonsense value means
+    the single-card shape the image has always run, never a crash on the way to the HELLO.
+    """
+    declared: str = os.environ.get("ENGY_WORKER_GPU_COUNT", "")
+    return int(declared) if declared.isdigit() and int(declared) >= 1 else 1
+
+
+def announce_only_this_workers_cards() -> None:
+    """Report the cards THIS miner's engine spans, not the node's.
 
     Upstream builds the HELLO hardware summary from `nvidia-smi`, which lists the whole node and
     ignores CUDA_VISIBLE_DEVICES, so all eight of our miners announced the node's eight cards each.
     `HW_GPUS` (set by the entrypoint) only overrides the human-readable string; the count beside it
     has to be corrected here or the frame contradicts itself.
+
+    One per card at `--tp-size 1`, and the whole group above it: a tensor-parallel engine really is
+    backed by all of them, and that is what the network's own tensor-parallel workers report
+    (`GET /v1/network`: `"gpus": "8x NVIDIA B300 SXM6 AC"` with `"gpu_count": 8`).
     """
     hardware: dict[str, Any] = require("HW")
     if hardware.get("gpu_count"):
-        hardware["gpu_count"] = 1
+        hardware["gpu_count"] = cards_this_worker_fronts()
 
 
 def install_loop_probe() -> None:
@@ -124,7 +138,7 @@ def main() -> None:
     # None until upstream's main() runs — after we need the lock.
     worker_name: str = require("_worker_name")()
     take_worker_singleton(worker_name)
-    announce_only_this_workers_card()
+    announce_only_this_workers_cards()
     install_loop_probe()
     print(f"[engy-launch] upstream miner with Lium modifications, worker={worker_name}", flush=True)
     require("main")()

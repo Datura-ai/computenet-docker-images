@@ -12,7 +12,7 @@ container at any minute, and everything below is about making that cheap instead
 
 ```
 container
-├── sglang engine  :8000  (GPU 0, --tp-size 1)  ←  engy_miner  worker <name>-g0
+├── sglang engine  :8000  (GPU 0, --tp-size ENGY_TP_SIZE)  ←  engy_miner  worker <name>-g0
 ├── sglang engine  :8001  (GPU 1)               ←  engy_miner  worker <name>-g1
 │   …one engine and one miner per card, or ENGY_ENGINES_PER_GPU of them sharing each card…
 ├── metrics sidecar :9101   /metrics + /logs, bearer token
@@ -24,6 +24,31 @@ container
 Measured on 2xH100, 2026-07-27: per-card engines served **564 tok/s** against **329 tok/s** for a
 single `--tp-size 2` engine over the same cards. 1.72x, at better p99 TTFT. Tensor parallelism buys
 nothing here because the model fits on one card, and it costs the interconnect on every token.
+
+**Where that measurement does not apply.** Every word of it depends on the last clause — the model
+fits on one card. `ENGY_TP_SIZE` above 1 spans one engine across a GROUP of cards for the case where
+no single card can hold the weights at all, and there the comparison above has no second term: the
+per-card shape does not serve more slowly, it does not start. `zai-org/GLM-5.2-FP8` is 755.7GB of
+weights against a B300's 268.6GB, so it is one engine over all eight cards of a node or nothing.
+Tensor parallelism is still the more expensive way to serve a model that fits, and qwen still runs
+one engine per card — the default is unchanged.
+
+The group is contiguous and in card order (`cards_of_one_engine`), which keeps NVLink neighbours
+together, and the node fits `gpu_count / ENGY_TP_SIZE` engines, each with its own miner. Two things
+follow and are enforced rather than documented: a group the node cannot form is **refused**, not
+quietly shrunk (`refuse_tensor_parallel_shapes_the_node_cannot_run`) — a smaller group does not
+serve a checkpoint chosen because it needs the bigger one, it crash-loops on OOM — and
+`ENGY_ENGINES_PER_GPU > 1` cannot be combined with it, because the split exists to spend VRAM a
+group-sized checkpoint does not have spare, and its memory arithmetic was solved for engines
+measuring one shared card.
+
+Two consequences reach the gateway rather than the engine. A tensor-parallel worker announces
+`ENGY_TP_SIZE`x the card, not `1x` — the same string the network's own tensor-parallel workers
+report (`GET /v1/network`: `"gpus": "8x NVIDIA B300 SXM6 AC"`, `"parallelism": "tp"`) — and the
+count in the HELLO frame is corrected alongside the string in `engy_launch.py`, or the frame
+contradicts itself. And the node now offers ONE gateway worker where it offered eight, because
+routing share is handed out per worker: fewer, larger workers is the price of serving the model at
+all.
 
 ## Why one miner per engine
 
@@ -68,9 +93,11 @@ Three things follow from engines sharing a card:
   s+1 must not start until slot s has loaded — otherwise both plan against the same empty card. The
   wait is capped and never fatal (`wait_for_slot_to_load`).
 - **The knob is clamped by the hardware, not trusted.** It arrives from platform config, each engine
-  holds its own 35GB copy of the checkpoint, and a value the card cannot hold buys a crash-loop of
-  35GB loads rather than a clean failure. `size_engines_to_the_card` reads the smallest card and caps
-  the count at 48GB per engine **of the 0.85 the engines actually get** — so an H200 tops out at 2
+  holds its own copy of the checkpoint, and a value the card cannot hold buys a crash-loop of full
+  checkpoint loads rather than a clean failure. `size_engines_to_the_card` reads the smallest card,
+  multiplies by `ENGY_TP_SIZE` because the budget is the engine's rather than the card's, and caps
+  the count at `ENGY_MIN_ENGINE_VRAM_MB` per engine (48GB by default, the qwen number)
+  **of the 0.85 the engines actually get** — so an H200 tops out at 2
   and a B200 at 3. Sizing the count on the whole card while allocating 0.85 of it would let a card
   pass the clamp and still hand each engine less than one needs. A card whose size `nvidia-smi` will
   not report is taken at the operator's word: an unreadable card must not silently halve a healthy
@@ -332,6 +359,16 @@ clock never arms and it is excluded by the same rule that protects a cold start.
 idle for the life of the container. After `ENGY_ENGINE_READY_TIMEOUT_SECONDS` from its own start it
 is restarted like any other fault — the cold-start exclusion is a grace, not a permanent pass.
 
+That budget is the one number a big checkpoint can turn from a cure into the disease: at its
+measured default of 2400s, weights that legitimately take longer than 40 minutes to load are killed
+mid-load and restarted forever, and the log says only "never became ready". So unless it was set
+explicitly, `size_the_cold_start_budgets_to_the_checkpoint` grows it with the checkpoint actually on
+disk — 6s per GB past the 35GB it was measured on, which puts GLM-5.2-FP8 at ~1h52m. Generous on
+purpose: too large only leaves a dead engine idle a while longer, too small is unrecoverable. The
+restart grace (`ENGY_ENGINE_RESTART_GRACE_SECONDS`) deliberately does NOT move, because a loading
+engine serves no `/metrics` for the wedge detector to read — that grace covers the window after the
+load, which is the same length whatever the model weighs.
+
 ## Why one dead card costs one card
 
 The readiness loop used to refuse the whole container when any engine failed to come up. That was
@@ -427,10 +464,12 @@ dolphin's fleet totals ~2.8x.
 than summarised. lium-stats compares it between consecutive scrapes and books 0 when it moves. It is
 NULL on images without the gauge, where the count comparison is still used.
 
-## Why each miner announces one card
+## Why each miner announces only its own cards
 
 The HELLO frame's hardware summary comes from `nvidia-smi`, which lists the whole node and ignores
-CUDA_VISIBLE_DEVICES, so all eight miners announced the node's eight cards each. The entrypoint sets
+CUDA_VISIBLE_DEVICES, so all eight miners announced the node's eight cards each. What a miner
+announces is `ENGY_TP_SIZE` cards — one per card in the default shape, and the whole group for a
+tensor-parallel engine, which really is backed by all of them. The entrypoint sets
 `HW_GPUS` — upstream's own override — and `engy_launch.py` corrects `HW["gpu_count"]` beside it,
 because overriding only the string leaves the frame contradicting itself. It costs nothing in routing
 or scoring (legs and per-worker acceptance decide those); it is about not appearing to claim hardware

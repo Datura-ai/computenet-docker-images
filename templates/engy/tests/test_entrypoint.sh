@@ -43,6 +43,7 @@ new_sandbox() {
     # Answers the two queries the entrypoint makes: the card list, and how big those cards are.
     { echo '#!/usr/bin/env bash'
       echo "case \"\$*\" in *memory.total*) for _ in \$(seq 1 ${gpu_count}); do echo ${card_mb}; done ;;"
+      echo "                *query-gpu=name*) for _ in \$(seq 1 ${gpu_count}); do echo 'NVIDIA H200'; done ;;"
       echo "                *) seq 0 $((gpu_count - 1)) ;; esac"
     } >"${SANDBOX}/bin/nvidia-smi"
     # Every engine reports ready immediately; the supervisor loop then sees them healthy.
@@ -51,7 +52,7 @@ new_sandbox() {
     # python3 records how it was invoked and, for the miner, blocks so the loop does not spin.
     cat >"${SANDBOX}/bin/python3" <<'STUB'
 #!/usr/bin/env bash
-echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_GW_WORKERS=${ENGY_GW_WORKERS:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
+echo "python3 $* | MAX_INFLIGHT=${MAX_INFLIGHT:-} ENGY_GW_WORKERS=${ENGY_GW_WORKERS:-} ENGY_WORKER_NAME=${ENGY_WORKER_NAME:-} ENGY_WORKER_ID=${ENGY_WORKER_ID:-} ENGY_PROBE_DIR=${ENGY_PROBE_DIR:-} ENGY_WORKER_GPU_COUNT=${ENGY_WORKER_GPU_COUNT:-} HW_GPUS=[${HW_GPUS:-}] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}" >>"${CALLS_LOG}"
 case "$*" in
     *engy_launch.py*) echo "[engy-miner] stub speaking on stdout"; sleep 30 ;;
     # Faithful to the image: PYTHONPATH points at sitecustomize.py, which prints an "armed" banner
@@ -317,6 +318,195 @@ engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
 [[ "${engines}" -eq 1 ]] && pass "a non-numeric value runs the default shape" || fail "started ${engines} engines"
 grep -q "is not a positive number" "${SANDBOX}/out.log" \
     && pass "and the fallback is logged" || fail "fell back silently"
+rm -rf "${SANDBOX}"
+
+echo "== with ENGY_TP_SIZE unset the engine command line is byte-identical =="
+# Tensor parallelism is an option, not a migration: the shape this image was measured on has to
+# survive the knob existing. Asserted as the WHOLE argv rather than flag by flag, because the way
+# this regresses is a flag nobody meant to add — a parser defaulted on, an empty --tool-call-parser
+# passed as "" — and only an exact comparison catches that.
+new_sandbox 1
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+engine_argv="$(grep "sglang.launch_server" "${SANDBOX}/calls.log" | head -1 | sed 's/ | .*//')"
+expected_argv="python3 -m sglang.launch_server --model-path ${SANDBOX}/home/models/Qwen/Qwen3.6-35B-A3B-FP8 --served-model-name Qwen3.6 --tp-size 1 --trust-remote-code --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --chunked-prefill-size 8192 --max-running-requests 26 --context-length 262144 --enable-return-hidden-states --enable-cache-report --enable-metrics --host 127.0.0.1 --port 8000"
+if [[ "${engine_argv}" == "${expected_argv}" ]]; then
+    pass "the unconfigured engine command line is exactly the one this image has always launched"
+else
+    fail "the default command line changed: ${engine_argv}"
+fi
+# The miner's HELLO must keep saying one card, which is what every existing prod worker reports.
+grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -q "HW_GPUS=\[1x NVIDIA H200\]" \
+    && pass "and its miner still announces 1x the card" \
+    || fail "the announced hardware changed: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+rm -rf "${SANDBOX}"
+
+echo "== ENGY_TP_SIZE=8 on an 8-card node is ONE engine holding every card =="
+# The whole point of the knob: zai-org/GLM-5.2-FP8 is 755.7GB of weights and fits on no single card,
+# so the node has to be one tensor-parallel engine or it cannot serve that model at all.
+new_sandbox 8
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_TP_SIZE=8
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 1 ]] && pass "8 cards at tp 8 -> 1 engine" || fail "8 cards at tp 8 -> ${engines} engines"
+grep -q -- "--tp-size 8" "${SANDBOX}/calls.log" && pass "and it is launched with --tp-size 8" \
+    || fail "tp size did not reach sglang: $(grep -o -- '--tp-size [0-9]*' "${SANDBOX}/calls.log" | head -1)"
+# CUDA_VISIBLE_DEVICES has to be the whole group. One card id here is the failure that looks fine:
+# sglang would try to shard 756GB across a single visible card and die on the load.
+grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -q "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7$" \
+    && pass "every card is visible to that engine" \
+    || fail "the engine does not see the whole group: $(grep -o 'CUDA_VISIBLE_DEVICES=.*' "${SANDBOX}/calls.log" | head -1)"
+miners="$(grep -c "engy_launch.py" "${SANDBOX}/calls.log")"
+[[ "${miners}" -eq 1 ]] && pass "and it gets exactly one miner" || fail "expected 1 miner, got ${miners}"
+# A tensor-parallel worker is backed by all eight cards and must say so, like the network's own
+# tp workers do (GET /v1/network: "8x NVIDIA B300 SXM6 AC"). Hard-coding 1x here understates the
+# only hardware statement a worker ever makes.
+grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -q "HW_GPUS=\[8x NVIDIA H200\]" \
+    && pass "the miner announces 8x the card, not 1x" \
+    || fail "the miner still announces one card: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+grep "engy_launch.py" "${SANDBOX}/calls.log" | grep -q "ENGY_WORKER_GPU_COUNT=8" \
+    && pass "and the count beside the string agrees with it" \
+    || fail "the announced gpu_count contradicts HW_GPUS: $(grep 'engy_launch.py' "${SANDBOX}/calls.log" | head -1)"
+rm -rf "${SANDBOX}"
+
+echo "== a tp group smaller than the node splits it into whole groups =="
+# 4 cards at tp 2 is two engines of two cards, contiguous and in card order, so NVLink neighbours
+# stay together and card 0 keeps engine 0 — which is the one that seeds the kernel cache.
+new_sandbox 4
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_TP_SIZE=2
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 2 ]] && pass "4 cards at tp 2 -> 2 engines" || fail "4 cards at tp 2 -> ${engines} engines"
+for cards in 0,1 2,3; do
+    grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -q "CUDA_VISIBLE_DEVICES=${cards}$" \
+        || fail "no engine on cards ${cards}"
+done
+pass "the groups are contiguous and cover every card"
+# The worker name is the only handle on a worker in the dashboard and the metric labels, so it has
+# to name a real card: at tp 2 the engine index counts GROUPS, and -g1 would mean cards 2 and 3.
+if [[ "$(worker_names | tr '\n' ' ')" == "ENGY_WORKER_NAME=$(hostname)-g0 ENGY_WORKER_NAME=$(hostname)-g2 " ]]; then
+    pass "worker names are the first card of each group, not the group index"
+else
+    fail "worker names do not name a real card: $(worker_names | tr '\n' ' ')"
+fi
+rm -rf "${SANDBOX}"
+
+echo "== a tp group the node cannot form is refused, never quietly shrunk =="
+# Clamping is right for ENGY_ENGINES_PER_GPU, where less is still a shape that serves. It is wrong
+# here: the group size was chosen because the checkpoint does not fit on fewer cards, so a reduced
+# one buys a crash-loop of three-quarter-terabyte loads instead of a single readable line.
+assert_refused_shape() {
+    local description="$1" expected_reason="$2" gpu_count="$3"
+    shift 3
+    new_sandbox "${gpu_count}"
+    PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" ENGY_MINER_DIR="${SANDBOX}/miner" \
+        CALLS_LOG="${SANDBOX}/calls.log" env MINER_KEY=mk-test "$@" \
+        bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
+    local status=$?
+    sleep 1                   # the reason reaches disk through a process substitution, not directly
+    if [[ ${status} -ne 0 ]] && grep -q "${expected_reason}" "${SANDBOX}/out.log"; then
+        pass "${description}"
+    else
+        fail "${description} (exit ${status}): $(tail -2 "${SANDBOX}/out.log")"
+    fi
+    grep -q "sglang.launch_server" "${SANDBOX}/calls.log" \
+        && fail "${description}: an engine was started anyway"
+    rm -rf "${SANDBOX}"
+}
+
+assert_refused_shape "tp larger than the node is refused" "needs 4 cards and this node has 2" \
+    2 ENGY_TP_SIZE=4
+assert_refused_shape "a tp size that does not divide the node is refused" "does not divide the node's 4 cards" \
+    4 ENGY_TP_SIZE=3
+# A tensor-parallel engine already spans its whole group, and a checkpoint that needs every card of
+# it has no VRAM to spare for a second one. Nothing has measured that shape, so it is not run.
+assert_refused_shape "tp together with several engines per card is refused" "cannot be combined" \
+    4 ENGY_TP_SIZE=2 ENGY_ENGINES_PER_GPU=2
+
+echo "== a nonsense tp size falls back to one, like every other knob here =="
+new_sandbox 2
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_TP_SIZE=abc
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 2 ]] && pass "a non-numeric value runs the default shape" || fail "started ${engines} engines"
+grep -q "ENGY_TP_SIZE='abc' is not a positive number" "${SANDBOX}/out.log" \
+    && pass "and the fallback is logged" || fail "fell back silently"
+rm -rf "${SANDBOX}"
+
+echo "== the parsers are omitted when blank and passed when named =="
+# Upstream's MINER.md calls --tool-call-parser and --reasoning-parser required for agentic buyers,
+# and they are — on the OpenAI routes. Our miner drives sglang's native /generate, which runs no
+# parser at all (vendor/engy_miner.py reproduces qwen's markup parsing itself), so defaulting them
+# on would change nothing we serve and would name the wrong model's parser for a new checkpoint.
+new_sandbox 1
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 \
+    ENGY_TOOL_CALL_PARSER=qwen3_coder ENGY_REASONING_PARSER=qwen3
+grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -q -- "--tool-call-parser qwen3_coder --reasoning-parser qwen3" \
+    && pass "both parsers reach sglang when they are named" \
+    || fail "the parsers did not reach sglang: $(grep 'sglang.launch_server' "${SANDBOX}/calls.log" | head -1)"
+rm -rf "${SANDBOX}"
+
+new_sandbox 1
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_REASONING_PARSER=qwen3
+if grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -q -- "--tool-call-parser"; then
+    fail "a blank tool-call parser was passed as an empty argument"
+else
+    pass "the blank one is left off the command line entirely"
+fi
+grep "sglang.launch_server" "${SANDBOX}/calls.log" | grep -q -- "--reasoning-parser qwen3" \
+    && pass "while the named one is still passed" || fail "the named parser was dropped with the blank one"
+rm -rf "${SANDBOX}"
+
+echo "== the per-engine VRAM floor is the qwen number, and it is configurable =="
+# 49152MB is ~35GB of qwen FP8 weights plus KV. It is the wrong number for any other checkpoint, and
+# it is the number the engines-per-card clamp divides by, so it has to be sayable.
+new_sandbox 1 49152
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_ENGINES_PER_GPU=2 \
+    ENGY_MIN_ENGINE_VRAM_MB=20480
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 2 ]] && pass "a smaller floor lets both engines onto the card" \
+    || fail "expected 2 engines under a 20480MB floor, got ${engines}"
+rm -rf "${SANDBOX}"
+
+echo "== under tp the floor is checked against the GROUP's VRAM, not one card =="
+# An engine that spans four cards has four cards' worth of memory to hold one copy of the weights
+# in, so clamping it against a single card would refuse a split the hardware can actually take.
+new_sandbox 4 49152
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_TP_SIZE=4 \
+    ENGY_MIN_ENGINE_VRAM_MB=131072
+engines="$(grep -c "sglang.launch_server" "${SANDBOX}/calls.log")"
+[[ "${engines}" -eq 1 ]] && pass "the group is sized as one engine's budget" || fail "started ${engines} engines"
+grep -q "below the 131072MB one engine" "${SANDBOX}/out.log" \
+    && fail "a 196608MB group was judged too small for 131072MB" \
+    || pass "and 4x49152MB clears a 131072MB engine"
+rm -rf "${SANDBOX}"
+
+echo "== a checkpoint far bigger than qwen gets a bigger cold-start budget =="
+# ENGINE_READY_TIMEOUT_SECONDS is what supervise_forever restarts an engine on, and its 2400s was
+# measured on the 35GB qwen load. A 756GB load legitimately takes longer than that, so left alone it
+# would be killed mid-load and restarted forever with nothing in the log but "never became ready".
+new_sandbox 1
+# du is what the entrypoint reads the checkpoint's size with; the sandbox has no 756GB to walk.
+{ echo '#!/usr/bin/env bash'; echo "echo \"$(( 756 * 1024 ))	\$2\""; } >"${SANDBOX}/bin/du"
+chmod +x "${SANDBOX}/bin/du"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+# 2400 + (756 - 35) * 6
+grep -q "an engine gets 6726s to become ready" "${SANDBOX}/out.log" \
+    && pass "the readiness budget grows with the weights" \
+    || fail "the budget was not raised: $(grep 'cold-start budgets' "${SANDBOX}/out.log" | head -1)"
+rm -rf "${SANDBOX}"
+
+echo "== the qwen checkpoint keeps the measured budgets, and an explicit one always wins =="
+new_sandbox 1
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
+grep -q "cold-start budgets were measured on" "${SANDBOX}/out.log" \
+    && fail "a 35GB checkpoint had its budgets rewritten" \
+    || pass "a checkpoint no bigger than the measured one changes nothing"
+rm -rf "${SANDBOX}"
+
+new_sandbox 1
+{ echo '#!/usr/bin/env bash'; echo "echo \"$(( 756 * 1024 ))	\$2\""; } >"${SANDBOX}/bin/du"
+chmod +x "${SANDBOX}/bin/du"
+run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1 ENGY_ENGINE_READY_TIMEOUT_SECONDS=99
+grep -q "an engine gets 99s to become ready" "${SANDBOX}/out.log" \
+    && pass "an explicitly configured budget is left alone" \
+    || fail "the configured budget was overwritten: $(grep 'cold-start budgets' "${SANDBOX}/out.log" | head -1)"
 rm -rf "${SANDBOX}"
 
 echo "== a miner declares three inflight per gateway leg, and the engine holds more =="
