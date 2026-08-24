@@ -224,6 +224,34 @@ test_prepare_instance_home() {
 }
 
 # ---------------------------------------------------------------- cold-cache seed gate
+# ------------------------------------------------- worker log capture + spawn counters
+test_worker_log_and_spawn_counters() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export DOLPHIN_WORKER_SPAWN_STATE="${SANDBOX}/spawns.json"
+    mkdir -p "${DOLPHIN_HOME}"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<'STUB'
+#!/usr/bin/env bash
+echo "boom from worker"
+exit 7
+STUB
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+    load_entrypoint
+
+    GPU_SETS=("0,1")
+    INSTANCE_HOMES=("${SANDBOX}/home")
+    spawn_instance 0
+    wait "${WORKER_PIDS[0]}" 2>/dev/null
+    spawn_instance 0
+    wait "${WORKER_PIDS[0]}" 2>/dev/null
+
+    assert_eq "worker stdout lands in the shared-volume log" "boom from worker" \
+        "$(head -1 "${DOLPHIN_HOME}/logs/worker-0.log" 2>/dev/null)"
+    # grep, not python3: an earlier test's sandbox may have left a python3 stub on PATH.
+    assert_eq "spawn counter counts respawns" '"spawns":2' \
+        "$(grep -o '"spawns":[0-9]*' "${DOLPHIN_WORKER_SPAWN_STATE}" 2>/dev/null | head -1)"
+}
+
 test_wait_for_cache_seed() {
     make_sandbox
     export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
@@ -730,6 +758,7 @@ test_enable_hf_offline
 test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later
 test_hf_offline_self_heals_when_no_engine_serves
+test_worker_log_and_spawn_counters
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"

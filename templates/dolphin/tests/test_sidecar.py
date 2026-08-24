@@ -474,6 +474,19 @@ def test_scrape_budget_grows_with_engine_count_but_stays_under_the_client_timeou
     assert budgets["64"] <= 7.0, budgets
 
 
+def test_worker_spawn_counters_are_published() -> None:
+    # A respawn loop (the runtime download dying over and over) is invisible in every other
+    # series — engines_up sits at 0 exactly like a patient cold start. The spawn counters
+    # from the entrypoint are what tell the two apart.
+    with tempfile.TemporaryDirectory() as tmp:
+        state = pathlib.Path(tmp) / "spawns.json"
+        state.write_text(json.dumps({"updated": 0, "workers": {"0": {"spawns": 7, "fast_exits": 3}}}))
+        with sidecar(f"{tmp}/dp-*/v.sock", TOKEN, {"DOLPHIN_WORKER_SPAWN_STATE": str(state)}) as base:
+            _, body, _ = get(f"{base}/metrics")
+    assert b'dolphin_worker_spawns_total{dolphin_worker="0"} 7' in body, body
+    assert b'dolphin_worker_fast_exits{dolphin_worker="0"} 3' in body, body
+
+
 def main() -> None:
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")]
     failed = 0
