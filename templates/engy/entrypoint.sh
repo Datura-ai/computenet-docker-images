@@ -17,6 +17,9 @@ MODEL="${MODEL:-qwen3.6-35b-a3b}"
 CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
 CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
+# The name the engine answers under. The miner drives sglang's native /generate, which carries
+# no model field, so this is a label only — the default is the name this image has always served.
+SERVED_MODEL_NAME="${ENGY_SERVED_MODEL_NAME:-Qwen3.6}"
 # The gateway's worker count when GW/meta cannot be read. Every miner must hold one leg per gateway
 # worker or it is refused onboarding, so this stands in for the live count everywhere the live count
 # is not available yet — the real one (resolve_gateway_worker_count) always wins over it.
@@ -242,7 +245,7 @@ start_engine() {
     local index="$1" port="${engine_ports[$1]}"
     CUDA_VISIBLE_DEVICES="${engine_gpus[$index]}" python3 -m sglang.launch_server \
         --model-path "${CKPT_DIR}" \
-        --served-model-name Qwen3.6 --tp-size 1 --trust-remote-code \
+        --served-model-name "${SERVED_MODEL_NAME}" --tp-size 1 --trust-remote-code \
         --kv-cache-dtype fp8_e4m3 \
         --mem-fraction-static "$(engine_mem_fraction "$(( index % ENGINES_PER_GPU ))")" \
         --chunked-prefill-size 8192 --max-running-requests "${ENGINE_SLOTS}" \
