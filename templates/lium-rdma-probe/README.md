@@ -11,12 +11,18 @@ The validator runs it on both hosts of a candidate pair while both are free:
 
 ```bash
 # on the host that listens
-docker run --rm --network host --device /dev/infiniband daturaai/lium-rdma-probe:0.0.1 \
+docker run --rm --network host --device /dev/infiniband \
+    --cap-add IPC_LOCK --ulimit memlock=-1:-1 daturaai/lium-rdma-probe:0.0.1 \
     server 18515 1000
 # on the other host
-docker run --rm --network host --device /dev/infiniband daturaai/lium-rdma-probe:0.0.1 \
+docker run --rm --network host --device /dev/infiniband \
+    --cap-add IPC_LOCK --ulimit memlock=-1:-1 daturaai/lium-rdma-probe:0.0.1 \
     client 18515 1000 172.16.5.6
 ```
+
+`IPC_LOCK` and an unlimited memlock are not optional on a real card: `ibv_reg_mr` pins the buffer it
+registers, and without them the registration fails and the pair never measures (DAH-2571). Soft-RoCE
+does not need them, which is exactly why the gap survives a test on an emulated device.
 
 The third argument is a write count, not a duration — the probe proves the wire carries RDMA at
 all, in well under a second, because a validator cycle has seconds for it. The client prints
