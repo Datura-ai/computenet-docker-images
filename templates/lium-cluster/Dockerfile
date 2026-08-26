@@ -33,7 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY entrypoint.sh /usr/local/bin/lium-cluster-entrypoint
 COPY lium-rdma-runc.py /usr/local/bin/lium-rdma-runc
-RUN chmod +x /usr/local/bin/lium-cluster-entrypoint /usr/local/bin/lium-rdma-runc
+COPY lium-fabric-env.py /usr/local/bin/lium-fabric-env
+RUN chmod +x /usr/local/bin/lium-cluster-entrypoint /usr/local/bin/lium-rdma-runc \
+    /usr/local/bin/lium-fabric-env
 
 # The base image starts the inner Docker daemon only when asked. A cluster pod always wants it: the
 # renter's job usually runs in their own image, and that is where the fabric has to reach.
