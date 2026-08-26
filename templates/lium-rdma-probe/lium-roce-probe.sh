@@ -34,4 +34,4 @@ arguments=(-d "$device" -i "$device_port" -x "$gid_index" -p "$tcp_port" -n "$it
 if [[ "$role" == "server" ]]; then
     exec ib_write_bw "${arguments[@]}"
 fi
-exec ib_write_bw "${arguments[@]}" "${server_address:?the client needs the server's RoCE address}"
+exec ib_write_bw "${arguments[@]}" "${server_address:?a client needs the RoCE address of the server}"
