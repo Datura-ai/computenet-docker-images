@@ -79,12 +79,21 @@ HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE=10
 # miner's host, which the platform cannot read, so a failed cold start used to leave no evidence
 # at all (2026-08-24: two prod nodes redownloaded the runtime in a respawn loop for 110 minutes
 # and the reason was unrecoverable). One rotated generation per worker bounds the disk cost.
-WORKER_LOG_DIR="${DOLPHIN_WORKER_LOG_DIR:-${DOLPHIN_HOME}/logs}"
+# Keyed on the container, because DOLPHIN_HOME is shared by every filler container on the node
+# (see the lock below): a single logs/worker-0.log would have two containers writing one file and
+# each one's cap_worker_logs truncating the other mid-write.
+WORKER_LOG_DIR="${DOLPHIN_WORKER_LOG_DIR:-${DOLPHIN_HOME}/logs/${HOSTNAME:-$(hostname)}}"
 WORKER_LOG_MAX_BYTES="${DOLPHIN_WORKER_LOG_MAX_BYTES:-52428800}"
-# A worker that exits this soon after spawn never served (runtime download died, engine crashed
-# on boot). Consecutive fast exits back the respawn off, so a throttling download source is not
-# hammered every 30 seconds — the hammering itself extends a rate-limit ban.
-WORKER_HEALTHY_AFTER_SECONDS="${DOLPHIN_WORKER_HEALTHY_AFTER_SECONDS:-300}"
+# Per-container directories accumulate on a volume that outlives them, so a node that recreates
+# fillers for weeks would keep every generation. Old ones are pruned at boot.
+WORKER_LOG_RETENTION_DAYS="${DOLPHIN_WORKER_LOG_RETENTION_DAYS:-7}"
+# A worker that exits WITHOUT ever having served backs the respawn off, so a throttling download
+# source is not hammered every 30 seconds — the hammering itself extends a rate-limit ban.
+#
+# "Served", not "lived long enough": the download this exists for takes 15-27 min per attempt
+# (2026-08-24, 86 GB pulled for a 12 GB runtime), so ANY wall-clock threshold short enough to
+# catch a crash loop would call those attempts healthy and leave the backoff at zero in the very
+# incident it was written for. An engine socket is the one signal that cannot be wrong about it.
 WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS:-600}"
 # Spawn counters for the metrics sidecar: a node redownloading in a loop must stop looking
 # identical (engines_up 0) to a node patiently loading.
@@ -349,7 +358,7 @@ GPU_SETS=()
 INSTANCE_HOMES=()
 WORKER_PIDS=()
 WORKER_SPAWNS=()
-WORKER_SPAWNED_AT=()
+WORKER_SERVED=()
 WORKER_FAST_EXITS=()
 WORKER_NEXT_SPAWN_AT=()
 WORKER_EXITED_AT=()
@@ -637,6 +646,15 @@ write_spawn_state() {
         && mv "${WORKER_SPAWN_STATE}.tmp" "${WORKER_SPAWN_STATE}"
 }
 
+# Log directories of containers that are gone. Only whole per-container directories are removed,
+# and only under our own logs root, so a live container's files are never a candidate.
+prune_stale_worker_logs() {
+    local root="${WORKER_LOG_DIR%/*}"
+    [[ -d "${root}" && "${root}" != "${WORKER_LOG_DIR}" ]] || return 0
+    find "${root}" -mindepth 1 -maxdepth 1 -type d ! -name "$(basename "${WORKER_LOG_DIR}")" \
+        -mtime "+${WORKER_LOG_RETENTION_DAYS}" -exec rm -rf {} + 2>/dev/null || true
+}
+
 # copytruncate, not mv: the worker keeps its fd, so the file must stay in place. The few lines
 # written between cp and truncate are lost, which logrotate accepts for the same reason we do.
 cap_worker_logs() {
@@ -655,7 +673,7 @@ spawn_instance() {
     local log="${WORKER_LOG_DIR}/worker-${idx}.log"
     mkdir -p "${WORKER_LOG_DIR}"
     WORKER_SPAWNS[idx]=$(( ${WORKER_SPAWNS[$idx]:-0} + 1 ))
-    WORKER_SPAWNED_AT[idx]=${SECONDS}
+    WORKER_SERVED[idx]=0
     write_spawn_state
     echo "[dolphin] worker [${GPU_SETS[$idx]}] spawn #${WORKER_SPAWNS[$idx]}, log ${log}" >&2
     (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) >>"${log}" 2>&1 &
@@ -740,9 +758,21 @@ spawn_all_instances() {
 # on their own meanwhile. Returns only when the whole set has to be restarted for an update.
 supervise_running_workers_until_new_binary_published() {
     local running_etag="$1"
-    local elapsed=0 i latest_etag lived backoff
+    local elapsed=0 i latest_etag backoff engine_serving
     while true; do
         interruptible_sleep "${LIVENESS_INTERVAL}"
+        # An engine socket proves a worker got all the way to serving, which is what separates a
+        # crash loop from a slow but healthy start. Read once per cycle and credited to every
+        # live worker: in split mode the glob cannot say WHICH instance owns the socket, and
+        # crediting all of them only ever errs towards respawning at once, never towards backing
+        # off a worker that is fine.
+        engine_serving=0
+        engine_socket_present && engine_serving=1
+        for i in "${!WORKER_PIDS[@]}"; do
+            if (( engine_serving )) && kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
+                WORKER_SERVED[i]=1
+            fi
+        done
         # Every cycle, because the seed wait ends when the first worker opens its engine socket,
         # about 30 s after start — minutes BEFORE the download of the weights completes (measured
         # on a cold 8xH100 node, 2026-08-21). A check at spawn time alone sees a partial cache and
@@ -756,15 +786,14 @@ supervise_running_workers_until_new_binary_published() {
             if [[ -z "${WORKER_EXITED_AT[$i]:-}" ]]; then
                 wait "${WORKER_PIDS[$i]}" 2>/dev/null || true
                 WORKER_EXITED_AT[i]=${SECONDS}
-                lived=$(( SECONDS - ${WORKER_SPAWNED_AT[$i]:-0} ))
-                if (( lived >= WORKER_HEALTHY_AFTER_SECONDS )); then
+                if (( ${WORKER_SERVED[$i]:-0} )); then
                     WORKER_FAST_EXITS[i]=0
                 else
                     WORKER_FAST_EXITS[i]=$(( ${WORKER_FAST_EXITS[$i]:-0} + 1 ))
                 fi
-                # First fast exit respawns immediately (the shipped behavior — a self-update
+                # The first failed exit respawns immediately (the shipped behavior — a self-update
                 # exits on purpose). From the second in a row the delay doubles, capped: a
-                # download that dies at once otherwise restarts from byte zero every 30s.
+                # download that dies otherwise restarts from byte zero every 30s.
                 backoff=0
                 if (( WORKER_FAST_EXITS[i] > 1 )); then
                     backoff=$(( LIVENESS_INTERVAL * (1 << (WORKER_FAST_EXITS[i] - 1)) ))
@@ -773,8 +802,9 @@ supervise_running_workers_until_new_binary_published() {
                 fi
                 WORKER_NEXT_SPAWN_AT[i]=$(( SECONDS + backoff ))
                 write_spawn_state
-                echo "[dolphin] worker [${GPU_SETS[$i]}] exited after ${lived}s" \
-                    "(fast exits in a row: ${WORKER_FAST_EXITS[$i]}); respawn in ${backoff}s" >&2
+                echo "[dolphin] worker [${GPU_SETS[$i]}] exited" \
+                    "(served: ${WORKER_SERVED[$i]:-0}, failed exits in a row:" \
+                    "${WORKER_FAST_EXITS[$i]}); respawn in ${backoff}s" >&2
             fi
             # The gate is a timestamp, not a sleep: a backed-off worker must not delay the
             # liveness checks and respawns of its siblings.
@@ -827,6 +857,7 @@ main() {
     export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
 
     ensure_worker_binary
+    prune_stale_worker_logs
     plan_worker_instances
     start_metrics_sidecar
     start_engine_watchdogs
