@@ -523,25 +523,27 @@ snapshot_under_ref_is_complete() {
     (( listed > 0 && ! missing ))
 }
 
+# Every copy of this model under the shared cache. `.locks` is PRUNED: hf_hub puts its download locks
+# in `<cache>/.locks/models--<repo>/`, which carries the very same directory name and holds no refs at
+# all — left in, that lock directory reads as a forever-incomplete copy.
+# The copies are SEARCHED rather than read from a fixed path: the worker has moved its cache directory
+# before (this entrypoint exports <home>/.cache/huggingface, the worker uses
+# <home>/.cache/dolphinpod-worker/cache), so the next move survives too.
+model_cache_repo_dirs() {
+    find "${SHARED_CACHE}" -maxdepth 5 -name .locks -prune -o \
+        -type d -name "$(hf_cache_dir_name "${MODEL}")" -print 2>/dev/null
+}
+
 model_cache_is_complete() {
-    # EVERY copy of this model under the shared volume must be complete, not merely one of them.
-    # The worker has moved its cache directory before (this entrypoint exports
-    # <home>/.cache/huggingface, the worker uses <home>/.cache/dolphinpod-worker/cache), so a stale
-    # complete copy under the old root can sit beside the half-downloaded copy the engine actually
-    # reads. Accepting the stale one takes the node offline and the real download can never finish.
-    # Demanding all of them only ever errs towards staying online, which is what the node did
-    # before DAH-2743.
-    #
-    # The copies are SEARCHED rather than read from a fixed path, so the next move survives too.
-    # `.locks` is PRUNED: hf_hub puts its download locks in `<cache>/.locks/models--<repo>/`, which
-    # carries the very same directory name and holds no refs at all. Left in, that lock directory
-    # reads as a forever-incomplete copy and the node never goes offline.
+    # EVERY copy must be complete, not merely one of them: a stale complete copy under an old cache
+    # root can sit beside the half-downloaded copy the engine actually reads, and accepting the stale
+    # one takes the node offline while the real download can never finish. Demanding all of them only
+    # ever errs towards staying online, which is what the node did before DAH-2743.
     local repo_dir found=0
     while read -r repo_dir; do
         found=1
         snapshot_under_ref_is_complete "${repo_dir}" || return 1
-    done < <(find "${SHARED_CACHE}" -maxdepth 5 -name .locks -prune -o \
-        -type d -name "$(hf_cache_dir_name "${MODEL}")" -print 2>/dev/null)
+    done < <(model_cache_repo_dirs)
     (( found ))
 }
 
@@ -692,13 +694,12 @@ model_cache_has_a_complete_copy() {
     local repo_dir
     while read -r repo_dir; do
         snapshot_under_ref_is_complete "${repo_dir}" && return 0
-    done < <(find "${SHARED_CACHE}" -maxdepth 5 -name .locks -prune -o \
-        -type d -name "$(hf_cache_dir_name "${MODEL}")" -print 2>/dev/null)
+    done < <(model_cache_repo_dirs)
     return 1
 }
 
 # True when spawning a worker now would fill the disk. The cheap question comes first: on a node with
-# room the answer is the df alone, and the cache walk behind model_cache_is_complete is never paid.
+# room the answer is the df alone, and the cache walk behind the copy check is never paid.
 # A cache that already holds the weights starts no download, so such a node is never held back,
 # and a reading we cannot take never blocks the node — a filler that refuses to run earns nothing,
 # which is a worse failure than one more download attempt.
