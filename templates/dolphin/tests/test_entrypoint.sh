@@ -840,6 +840,12 @@ test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete() {
     assert_eq "a complete cache is never held back" "no" \
         "$(download_floor_blocks_spawn && echo yes || echo no)"
 
+    # A stale half-copy under an old cache root must not park a node whose real cache is complete:
+    # the offline switch demands every copy be complete, this decision must not.
+    mkdir -p "${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${MODEL}")/snapshots/dead"
+    assert_eq "a stale half-copy elsewhere does not park the node" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
     # A reading we cannot take must not park the filler: earning nothing is worse than one more
     # download attempt.
     rm -rf "${SHARED_CACHE}/dolphinpod-worker"

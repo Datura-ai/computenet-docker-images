@@ -678,23 +678,39 @@ cap_worker_logs() {
 
 free_gb_on_shared_cache() {
     # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
-    df -Pk "${SHARED_CACHE}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'
+    # `|| true` inside the pipe: under `set -e` + pipefail a df that fails would otherwise end the
+    # container at the assignment, instead of reading as the "cannot measure" the callers handle.
+    { df -Pk "${SHARED_CACHE}" 2>/dev/null || true; } | awk 'NR == 2 { print int($4 / 1048576) }'
 }
 
 # Set by download_floor_blocks_spawn so a caller can report the reading without measuring the disk a
 # second time. Empty when the disk could not be measured at all.
 LAST_MEASURED_FREE_GB=""
 
+# Whether ANY copy of the model under the shared cache is complete — that is what says no download
+# is coming. Deliberately not model_cache_is_complete, which demands EVERY copy be complete: there a
+# wrong yes takes the node offline against a cache the engine cannot load, so erring costs nothing,
+# while HERE a wrong no parks a healthy node for as long as the disk stays full. One stale half-copy
+# under an old cache root (the worker has moved its cache directory before) would be enough.
+model_cache_has_a_complete_copy() {
+    local repo_dir
+    while read -r repo_dir; do
+        snapshot_under_ref_is_complete "${repo_dir}" && return 0
+    done < <(find "${SHARED_CACHE}" -maxdepth 5 -name .locks -prune -o \
+        -type d -name "$(hf_cache_dir_name "${MODEL}")" -print 2>/dev/null)
+    return 1
+}
+
 # True when spawning a worker now would fill the disk. The cheap question comes first: on a node with
 # room the answer is the df alone, and the cache walk behind model_cache_is_complete is never paid.
-# A complete cache starts no download, so a node that already holds the weights is never held back,
+# A cache that already holds the weights starts no download, so such a node is never held back,
 # and a reading we cannot take never blocks the node — a filler that refuses to run earns nothing,
 # which is a worse failure than one more download attempt.
 download_floor_blocks_spawn() {
     LAST_MEASURED_FREE_GB="$(free_gb_on_shared_cache)"
     [[ -n "${LAST_MEASURED_FREE_GB}" ]] || return 1
     (( LAST_MEASURED_FREE_GB >= DOWNLOAD_FLOOR_GB )) && return 1
-    ! model_cache_is_complete
+    ! model_cache_has_a_complete_copy
 }
 
 spawn_instance() {

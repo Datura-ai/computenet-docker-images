@@ -168,7 +168,9 @@ refuse_to_start() {
 
 free_gb_on_checkpoint_volume() {
     # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
-    df -Pk "${ENGY_HOME}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'
+    # `|| true` inside the pipe: under `set -e` + pipefail a df that fails would otherwise end the
+    # container at the assignment below, killing a node this check exists to keep alive.
+    { df -Pk "${ENGY_HOME}" 2>/dev/null || true; } | awk 'NR == 2 { print int($4 / 1048576) }'
 }
 
 # Start a supervised loop in a session of its own and echo its pid, which `setsid` also makes the
