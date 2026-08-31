@@ -40,6 +40,14 @@ EOF
     chmod +x "${SANDBOX}/bin/df"
 }
 
+mock_df_fails() {
+    cat >"${SANDBOX}/bin/df" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/df"
+}
+
 # touch -d is GNU, touch -v -t is portable; the date flavour differs the same way.
 age_file_by_hours() {
     local file="$1" hours="$2" stamp
@@ -820,7 +828,7 @@ test_hf_offline_self_heals_when_no_engine_serves() {
 
 
 # ---------------------------------------------------------------- DAH-2805 download temporaries
-test_sweep_only_takes_temporaries_nothing_is_writing() {
+test_sweep_removes_only_aged_temporaries() {
     make_sandbox
     load_entrypoint
 
@@ -841,7 +849,7 @@ test_sweep_only_takes_temporaries_nothing_is_writing() {
         "$([[ -e "${blobs}/abc" ]] && echo yes || echo no)"
 }
 
-test_download_floor_only_holds_back_an_incomplete_cache() {
+test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete() {
     make_sandbox
     load_entrypoint
 
@@ -864,11 +872,7 @@ test_download_floor_only_holds_back_an_incomplete_cache() {
     # A reading we cannot take must not park the filler: earning nothing is worse than one more
     # download attempt.
     rm -rf "${SHARED_CACHE}/dolphinpod-worker"
-    cat >"${SANDBOX}/bin/df" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-    chmod +x "${SANDBOX}/bin/df"
+    mock_df_fails
     assert_eq "an unmeasurable disk does not hold anything back" "no" \
         "$(download_floor_blocks_spawn && echo yes || echo no)"
 }
@@ -892,8 +896,8 @@ test_hf_offline_self_heals_when_no_engine_serves
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
 test_worker_logs_are_per_container_and_pruned
-test_sweep_only_takes_temporaries_nothing_is_writing
-test_download_floor_only_holds_back_an_incomplete_cache
+test_sweep_removes_only_aged_temporaries
+test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"

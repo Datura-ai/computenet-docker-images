@@ -145,26 +145,6 @@ start_capturing_output() {
 # Refuse to start, with the reason guaranteed to be ON DISK. Anything still holding the log pipe
 # keeps it from draining, so every child goes first; at the early call sites they are all empty and
 # that loop is a no-op. Then closing our end lets the pipe reach EOF and we wait for it to flush.
-# Abandoned download temporaries under the checkpoint and HF caches. Age is the only signal that
-# works here: the writer can be a sibling container, invisible to any pid or open-fd check.
-sweep_abandoned_download_temporaries() {
-    local removed
-    # `|| true` inside the pipe: under `set -e` + pipefail a find over a directory that does not
-    # exist yet would end the container before the checkpoint is pulled.
-    removed="$({ find "${CKPT_DIR}" "${ENGY_HOME}/hf" -type f -name '*.incomplete' \
-        -mmin "+${INCOMPLETE_MAX_AGE_MINUTES}" -print -delete 2>/dev/null || true; } | wc -l)"
-    if (( removed > 0 )); then
-        echo "[engy] swept ${removed} abandoned download temporaries" \
-            "(untouched for over ${INCOMPLETE_MAX_AGE_MINUTES} min)" >&2
-    fi
-    return 0
-}
-
-free_gb_on_checkpoint_volume() {
-    # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
-    df -Pk "${ENGY_HOME}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'
-}
-
 refuse_to_start() {
     echo "[engy] $1" >&2
     local children=(${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"})
@@ -189,6 +169,33 @@ refuse_to_start() {
     exec 1>&- 2>&-
     wait "${log_pipe_pid}" 2>/dev/null || true
     exit 1
+}
+
+# Age is the only signal that works here: the writer can be a sibling container, invisible to any
+# pid or open-fd check.
+sweep_abandoned_download_temporaries() {
+    local removed
+    # One root: the checkpoint dir and HF_HOME both live under ENGY_HOME, and spelling either path
+    # out again here is a literal that can drift. The walk is bounded because the runtimes and the
+    # kernel cache live under it too; a download temporary sits at depth 7 at most.
+    # `-name` comes before `-type`/`-mmin` so only a name match pays a stat(), and the removal is
+    # `-exec rm`, not `-delete`: `-delete` turns on `-depth`, which silently disables a prune.
+    # `|| true` inside the pipe: under `set -e` + pipefail a find over a directory that does not
+    # exist yet would end the container before the checkpoint is pulled.
+    removed="$({ find "${ENGY_HOME}" -maxdepth 8 \
+        -type d -name xet -prune -o \
+        -name '*.incomplete' -type f -mmin "+${INCOMPLETE_MAX_AGE_MINUTES}" \
+        -print -exec rm -f {} + 2>/dev/null || true; } | wc -l | tr -d '[:space:]')"
+    if (( removed > 0 )); then
+        echo "[engy] swept ${removed} abandoned download temporaries" \
+            "(untouched for over ${INCOMPLETE_MAX_AGE_MINUTES} min)" >&2
+    fi
+    return 0
+}
+
+free_gb_on_checkpoint_volume() {
+    # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
+    df -Pk "${ENGY_HOME}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'
 }
 
 # Start a supervised loop in a session of its own and echo its pid, which `setsid` also makes the

@@ -117,8 +117,7 @@ INCOMPLETE_MAX_AGE_MINUTES="${DOLPHIN_INCOMPLETE_MAX_AGE_MINUTES:-240}"
 # DPHN_CACHE_FREE_MARGIN_GB), so a healthy node never reaches this floor; a leaking one stops here
 # instead of crossing the 100 GB listing floor, below which it can take no rentals at all.
 DOWNLOAD_FLOOR_GB="${DOLPHIN_DOWNLOAD_FLOOR_GB:-150}"
-# How often the floor is re-measured while it holds a cold start back.
-DOWNLOAD_FLOOR_RECHECK_SECONDS="${DOLPHIN_DOWNLOAD_FLOOR_RECHECK_SECONDS:-300}"
+DOWNLOAD_FLOOR_RECHECK_SECONDS=300
 
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
 # every worker instance inside this one, so the binary download and the worker's self-update are
@@ -306,7 +305,6 @@ wait_for_cache_seed() {
         # The supervise loop (and its log cap) is not running yet, and instance 0 already
         # writes its log — cap it here too so the seed wait is not an uncapped stretch.
         cap_worker_logs
-        sweep_abandoned_download_temporaries
         if engine_socket_present; then
             echo "[dolphin] shared cache seeded after ${waited}s; releasing siblings" >&2
             return 0
@@ -690,15 +688,22 @@ cap_worker_logs() {
     done
 }
 
-# Abandoned download temporaries under the shared cache. Age is the only signal available here:
-# the writer can live in a SIBLING container, where no pid or open-fd check can see it, while a live
-# download touches its file at least once per burst.
+# Age is the only signal available here: the writer can live in a SIBLING container, where no pid or
+# open-fd check can see it, while a live download touches its file at least once per burst.
 sweep_abandoned_download_temporaries() {
     local removed
-    # `|| true` inside the pipe: under `set -e` + pipefail a find over a cache directory that
-    # does not exist yet would end the container before a single worker starts.
-    removed="$({ find "${SHARED_CACHE}" -type f -name '*.incomplete' \
-        -mmin "+${INCOMPLETE_MAX_AGE_MINUTES}" -print -delete 2>/dev/null || true; } | wc -l)"
+    # The walk is bounded because SHARED_CACHE is also XDG_CACHE_HOME: pip, uv and the HF xet chunk
+    # cache live under it, and the xet cache alone holds tens of thousands of files and never a
+    # `*.incomplete`. Blobs sit at depth 5-6 (`<cache>/[dolphinpod-worker/cache/]hub/models--*/blobs`),
+    # so 7 keeps a level of slack for a worker that moves its cache root again.
+    # `-name` comes before `-type`/`-mmin` so only a name match pays a stat(), and the removal is
+    # `-exec rm`, not `-delete`: `-delete` turns on `-depth`, which silently disables the prune.
+    # `|| true` inside the pipe: under `set -e` + pipefail a find over a cache directory that does
+    # not exist yet would end the container before a single worker starts.
+    removed="$({ find "${SHARED_CACHE}" -maxdepth 7 \
+        -type d -name xet -prune -o \
+        -name '*.incomplete' -type f -mmin "+${INCOMPLETE_MAX_AGE_MINUTES}" \
+        -print -exec rm -f {} + 2>/dev/null || true; } | wc -l | tr -d '[:space:]')"
     if (( removed > 0 )); then
         echo "[dolphin] swept ${removed} abandoned download temporaries" \
             "(untouched for over ${INCOMPLETE_MAX_AGE_MINUTES} min)" >&2
@@ -711,16 +716,20 @@ free_gb_on_shared_cache() {
     df -Pk "${SHARED_CACHE}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'
 }
 
-# True when spawning a worker now would fill the disk. A complete cache needs no download at all, so
-# a node that already holds the weights is never held back — only one that must still fetch them is
-# measured. A reading we cannot take never blocks the node: a filler that refuses to run earns
-# nothing, which is a worse failure than one more download attempt.
+# Set by download_floor_blocks_spawn so a caller can report the reading without measuring the disk a
+# second time. Empty when the disk could not be measured at all.
+LAST_MEASURED_FREE_GB=""
+
+# True when spawning a worker now would fill the disk. The cheap question comes first: on a node with
+# room the answer is the df alone, and the cache walk behind model_cache_is_complete is never paid.
+# A complete cache starts no download, so a node that already holds the weights is never held back,
+# and a reading we cannot take never blocks the node — a filler that refuses to run earns nothing,
+# which is a worse failure than one more download attempt.
 download_floor_blocks_spawn() {
-    model_cache_is_complete && return 1
-    local free_gb
-    free_gb="$(free_gb_on_shared_cache)"
-    [[ -n "${free_gb}" ]] || return 1
-    (( free_gb < DOWNLOAD_FLOOR_GB ))
+    LAST_MEASURED_FREE_GB="$(free_gb_on_shared_cache)"
+    [[ -n "${LAST_MEASURED_FREE_GB}" ]] || return 1
+    (( LAST_MEASURED_FREE_GB >= DOWNLOAD_FLOOR_GB )) && return 1
+    ! model_cache_is_complete
 }
 
 spawn_instance() {
@@ -797,7 +806,7 @@ spawn_all_instances() {
     # would spend the whole container on a download it cannot land. The sweep runs on every pass, so
     # a node whose garbage ages out starts on its own.
     while download_floor_blocks_spawn; do
-        echo "[dolphin] only $(free_gb_on_shared_cache) GB free and the model cache is incomplete;" \
+        echo "[dolphin] only ${LAST_MEASURED_FREE_GB} GB free and the model cache is incomplete;" \
             "not starting a worker until there is ${DOWNLOAD_FLOOR_GB} GB" >&2
         interruptible_sleep "${DOWNLOAD_FLOOR_RECHECK_SECONDS}"
         sweep_abandoned_download_temporaries
@@ -822,7 +831,7 @@ spawn_all_instances() {
 # on their own meanwhile. Returns only when the whole set has to be restarted for an update.
 supervise_running_workers_until_new_binary_published() {
     local running_etag="$1"
-    local elapsed=0 i latest_etag backoff engine_serving
+    local elapsed=0 i latest_etag backoff engine_serving spawn_is_held_back_by_disk
     while true; do
         interruptible_sleep "${LIVENESS_INTERVAL}"
         # An engine socket proves a worker got all the way to serving, which is what separates a
@@ -843,6 +852,10 @@ supervise_running_workers_until_new_binary_published() {
         # leaves the container on the Hub for the rest of its life. The same call takes the switch
         # off again when it is on and no engine serves.
         sync_hf_offline_with_cache_and_engines
+        # Once per cycle, not once per dead worker: on a crash-looping split node the per-worker form
+        # measured the disk eight times for one answer that cannot change inside a cycle.
+        spawn_is_held_back_by_disk=0
+        download_floor_blocks_spawn && spawn_is_held_back_by_disk=1
         for i in "${!WORKER_PIDS[@]}"; do
             if kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
                 continue
@@ -875,7 +888,7 @@ supervise_running_workers_until_new_binary_published() {
             (( SECONDS >= ${WORKER_NEXT_SPAWN_AT[$i]:-0} )) || continue
             # Non-blocking, unlike the cold start: a full disk must not stop the liveness checks of
             # the siblings, so the respawn is simply left for the next cycle.
-            download_floor_blocks_spawn && continue
+            (( spawn_is_held_back_by_disk )) && continue
             unset "WORKER_EXITED_AT[$i]"
             refresh_binary
             spawn_instance "${i}"
@@ -885,12 +898,14 @@ supervise_running_workers_until_new_binary_published() {
             running_etag="$(published_etag || true)"
         done
         cap_worker_logs
-        sweep_abandoned_download_temporaries
         elapsed=$((elapsed + LIVENESS_INTERVAL))
         if (( elapsed < CHECK_INTERVAL )); then
             continue
         fi
         elapsed=0
+        # Hourly, with the etag poll: a file becomes eligible only INCOMPLETE_MAX_AGE_MINUTES after
+        # its writer died, so sweeping on the 30s liveness tick walked the cache 120x for nothing.
+        sweep_abandoned_download_temporaries
         latest_etag="$(published_etag || true)"
         if [[ -n "${latest_etag}" && -n "${running_etag}" && "${latest_etag}" != "${running_etag}" ]]; then
             echo "[dolphin] new worker binary published; restarting workers to update" >&2

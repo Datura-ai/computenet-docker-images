@@ -33,11 +33,13 @@ no_engine_ever_becomes_ready() {
     chmod +x "${SANDBOX}/bin/curl"
 }
 
-engy_df_reports_free_gb() {
-    { echo '#!/usr/bin/env bash'
-      echo 'echo "Filesystem 1024-blocks Used Available Capacity Mounted on"'
-      echo "echo \"/dev/sda1 100000000 1 $(( $1 * 1048576 )) 1% /\""
-    } >"${SANDBOX}/bin/df"
+mock_df_free_gb() {
+    # df -Pk prints KiB; the entrypoint reads the 4th column of the second line.
+    cat >"${SANDBOX}/bin/df" <<EOF
+#!/usr/bin/env bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/sda1 100000000 1 $(( $1 * 1048576 )) 1% /"
+EOF
     chmod +x "${SANDBOX}/bin/df"
 }
 
@@ -64,7 +66,7 @@ new_sandbox() {
     { echo '#!/usr/bin/env bash'; echo 'exit 0'; } >"${SANDBOX}/bin/hf"
     # A roomy disk by default: the checkpoint pull is gated on free space, and a laptop under the
     # floor would otherwise refuse to start in every case that has no checkpoint yet.
-    engy_df_reports_free_gb 900
+    mock_df_free_gb 900
     gateway_reports_workers 8
     # python3 records how it was invoked and, for the miner, blocks so the loop does not spin.
     cat >"${SANDBOX}/bin/python3" <<'STUB'
@@ -779,7 +781,7 @@ rm -rf "${SANDBOX}"
 # A node this full cannot land 35GB, and filling the host disk costs it every rental too.
 new_sandbox 1
 rm -f "${SANDBOX}/home/models/Qwen/Qwen3.6-35B-A3B-FP8/config.json"
-engy_df_reports_free_gb 20
+mock_df_free_gb 20
 PATH="${SANDBOX}/bin:${PATH}" ENGY_HOME="${SANDBOX}/home" ENGY_MINER_DIR="${SANDBOX}/miner" \
     CALLS_LOG="${SANDBOX}/calls.log" env MINER_KEY=mk-test bash "${ENTRYPOINT}" >"${SANDBOX}/out.log" 2>&1
 floor_status=$?
