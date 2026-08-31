@@ -18,15 +18,10 @@ CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
 CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
 
-# DAH-2805: an abandoned huggingface_hub temporary is deleted once nothing has touched it for this
-# long. hf >= 1.18 writes every attempt to a unique `*.incomplete` and unlinks it in a `finally`, so
-# a file survives only a download whose process was KILLED — here, a container stopped mid-pull.
-# The retry then starts from byte zero under a new name, and the old one is never read again.
-# Age, not "delete every start": the checkpoint volume is shared with the other filler containers on
-# the node, and with xet a live download touches its file only once per 64 MiB burst.
-INCOMPLETE_MAX_AGE_MINUTES="${ENGY_INCOMPLETE_MAX_AGE_MINUTES:-240}"
-# Below this much free space the checkpoint pull is refused instead of filling the host disk. A node
-# under the 100 GB listing floor takes no rentals at all, so stopping above it is the cheaper loss.
+# DAH-2805: below this much free space the checkpoint pull is refused instead of filling the host
+# disk. A node under the 100 GB listing floor takes no rentals at all, so stopping above it is the
+# cheaper loss. The garbage that put a node here is swept by the validator, not from inside the
+# image: it reaches the node on every cycle whatever image runs on it.
 DOWNLOAD_FLOOR_GB="${ENGY_DOWNLOAD_FLOOR_GB:-150}"
 # The gateway's worker count when GW/meta cannot be read. Every miner must hold one leg per gateway
 # worker or it is refused onboarding, so this stands in for the live count everywhere the live count
@@ -169,28 +164,6 @@ refuse_to_start() {
     exec 1>&- 2>&-
     wait "${log_pipe_pid}" 2>/dev/null || true
     exit 1
-}
-
-# Age is the only signal that works here: the writer can be a sibling container, invisible to any
-# pid or open-fd check.
-sweep_abandoned_download_temporaries() {
-    local removed
-    # One root: the checkpoint dir and HF_HOME both live under ENGY_HOME, and spelling either path
-    # out again here is a literal that can drift. The walk is bounded because the runtimes and the
-    # kernel cache live under it too; a download temporary sits at depth 7 at most.
-    # `-name` comes before `-type`/`-mmin` so only a name match pays a stat(), and the removal is
-    # `-exec rm`, not `-delete`: `-delete` turns on `-depth`, which silently disables a prune.
-    # `|| true` inside the pipe: under `set -e` + pipefail a find over a directory that does not
-    # exist yet would end the container before the checkpoint is pulled.
-    removed="$({ find "${ENGY_HOME}" -maxdepth 8 \
-        -type d -name xet -prune -o \
-        -name '*.incomplete' -type f -mmin "+${INCOMPLETE_MAX_AGE_MINUTES}" \
-        -print -exec rm -f {} + 2>/dev/null || true; } | wc -l | tr -d '[:space:]')"
-    if (( removed > 0 )); then
-        echo "[engy] swept ${removed} abandoned download temporaries" \
-            "(untouched for over ${INCOMPLETE_MAX_AGE_MINUTES} min)" >&2
-    fi
-    return 0
 }
 
 free_gb_on_checkpoint_volume() {
@@ -826,7 +799,6 @@ main() {
     # would keep publishing frozen lag series for GPUs it no longer has.
     rm -f "${PROBE_DIR}"/*.prom "${PROBE_DIR}"/*.prom.tmp
     if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
-        sweep_abandoned_download_temporaries
         local free_gb
         free_gb="$(free_gb_on_checkpoint_volume)"
         if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then

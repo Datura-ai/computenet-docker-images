@@ -48,14 +48,6 @@ EOF
     chmod +x "${SANDBOX}/bin/df"
 }
 
-# touch -d is GNU, touch -v -t is portable; the date flavour differs the same way.
-age_file_by_hours() {
-    local file="$1" hours="$2" stamp
-    stamp="$(date -d "${hours} hours ago" +%Y%m%d%H%M 2>/dev/null \
-        || date -v-"${hours}"H +%Y%m%d%H%M)"
-    touch -t "${stamp}" "${file}"
-}
-
 make_sandbox() {
     SANDBOX="$(mktemp -d)"
     mkdir -p "${SANDBOX}/bin"
@@ -828,27 +820,6 @@ test_hf_offline_self_heals_when_no_engine_serves() {
 
 
 # ---------------------------------------------------------------- DAH-2805 download temporaries
-test_sweep_removes_only_aged_temporaries() {
-    make_sandbox
-    load_entrypoint
-
-    local blobs="${SHARED_CACHE}/dolphinpod-worker/cache/hub/models--x/blobs"
-    mkdir -p "${blobs}"
-    touch "${blobs}/abc.11111111.incomplete" "${blobs}/abc.22222222.incomplete" "${blobs}/abc"
-    # Aged past the window, which is what a killed download leaves behind.
-    age_file_by_hours "${blobs}/abc.11111111.incomplete" 5
-
-    sweep_abandoned_download_temporaries >/dev/null 2>&1
-
-    assert_eq "an abandoned temporary is removed" "no" \
-        "$([[ -e "${blobs}/abc.11111111.incomplete" ]] && echo yes || echo no)"
-    # The live one is the whole reason the sweep goes by age: its writer can be another container.
-    assert_eq "a temporary being written is kept" "yes" \
-        "$([[ -e "${blobs}/abc.22222222.incomplete" ]] && echo yes || echo no)"
-    assert_eq "a finished blob is never touched" "yes" \
-        "$([[ -e "${blobs}/abc" ]] && echo yes || echo no)"
-}
-
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete() {
     make_sandbox
     load_entrypoint
@@ -896,7 +867,6 @@ test_hf_offline_self_heals_when_no_engine_serves
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
 test_worker_logs_are_per_container_and_pruned
-test_sweep_removes_only_aged_temporaries
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
 
 if [[ ${FAILURES} -gt 0 ]]; then

@@ -43,13 +43,6 @@ EOF
     chmod +x "${SANDBOX}/bin/df"
 }
 
-# touch -d is GNU-only, touch -t is portable; the date flavour differs the same way.
-age_file_by_hours() {
-    local file="$1" hours="$2" stamp
-    stamp="$(date -d "${hours} hours ago" +%Y%m%d%H%M 2>/dev/null || date -v-"${hours}"H +%Y%m%d%H%M)"
-    touch -t "${stamp}" "${file}"
-}
-
 new_sandbox() {
     local gpu_count="$1" card_mb="${2:-143771}"     # an H200 unless the case says otherwise
     SANDBOX="$(mktemp -d)"
@@ -753,31 +746,7 @@ assert_stops_on_sigterm() {
 assert_stops_on_sigterm "no sidecar"
 assert_stops_on_sigterm "with sidecar" METRICS_TOKEN=tok-test
 
-echo "== DAH-2805: abandoned download temporaries and the disk floor =="
-# hf >= 1.18 gives every attempt a unique name and unlinks it in a `finally`, so a leftover means a
-# pull that was KILLED — a stopped container here. Nothing ever reads it again.
-new_sandbox 1
-rm -f "${SANDBOX}/home/models/Qwen/Qwen3.6-35B-A3B-FP8/config.json"    # nothing cached: a pull is due
-ckpt="${SANDBOX}/home/models/Qwen/Qwen3.6-35B-A3B-FP8"
-mkdir -p "${ckpt}/.cache/huggingface/download"
-touch "${ckpt}/.cache/huggingface/download/shard.aaaaaaaa.incomplete" \
-      "${ckpt}/.cache/huggingface/download/shard.bbbbbbbb.incomplete"
-age_file_by_hours "${ckpt}/.cache/huggingface/download/shard.aaaaaaaa.incomplete" 5
-# The stub `hf` writes the checkpoint the entrypoint is waiting for, so the boot carries on.
-{ echo '#!/usr/bin/env bash'
-  echo "mkdir -p \"${ckpt}\" && echo '{}' > \"${ckpt}/config.json\""
-} >"${SANDBOX}/bin/hf"
-chmod +x "${SANDBOX}/bin/hf"
-run_entrypoint env MINER_KEY=mk-test ENGY_CACHE_SEED_WAIT_SECONDS=1
-[[ -e "${ckpt}/.cache/huggingface/download/shard.aaaaaaaa.incomplete" ]] \
-    && fail "an abandoned temporary survived the pull" \
-    || pass "an abandoned temporary is swept before the pull"
-# The live one is why the sweep goes by age: its writer can be another container on this volume.
-[[ -e "${ckpt}/.cache/huggingface/download/shard.bbbbbbbb.incomplete" ]] \
-    && pass "a temporary being written is kept" \
-    || fail "the sweep took a live download"
-rm -rf "${SANDBOX}"
-
+echo "== DAH-2805: the checkpoint pull is refused on a full disk =="
 # A node this full cannot land 35GB, and filling the host disk costs it every rental too.
 new_sandbox 1
 rm -f "${SANDBOX}/home/models/Qwen/Qwen3.6-35B-A3B-FP8/config.json"

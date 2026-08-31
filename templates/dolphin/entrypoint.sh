@@ -99,18 +99,6 @@ WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS
 # identical (engines_up 0) to a node patiently loading.
 WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.json}"
 
-# DAH-2805: how long an abandoned huggingface_hub temporary may sit before the sweep removes it.
-# hf >= 1.18 writes every attempt to a UNIQUE `blobs/<etag>.<8hex>.incomplete` and unlinks it in a
-# `finally`, so a file only survives a download whose process was KILLED — and the retry then starts
-# from byte zero under a new name. On a link too slow to finish a shard inside the worker's own
-# readiness window that is one 0.2-1.7 GB orphan per kill, forever: 742 files / 741 GB on one prod
-# node, 2026-08-31.
-# By AGE, not "delete every start": this cache volume is shared by every filler container on the
-# node, so a restarting sibling must never delete a download another container is still writing.
-# With xet the file is touched once per 64 MiB burst, which at the slowest rate measured in prod
-# (~50 KB/s per file) is ~22 min of silence on a HEALTHY download, so the window clears that by 10x.
-INCOMPLETE_MAX_AGE_MINUTES="${DOLPHIN_INCOMPLETE_MAX_AGE_MINUTES:-240}"
-
 # DAH-2805: with less free space than this the workers are not spawned while the model cache is
 # still incomplete, because spawning one starts another download. The backend only grants the cache
 # to a node with >= 190 GB free (DPHN_CACHE_SIZE_GB + DPHN_CACHE_LISTING_FLOOR_GB +
@@ -688,29 +676,6 @@ cap_worker_logs() {
     done
 }
 
-# Age is the only signal available here: the writer can live in a SIBLING container, where no pid or
-# open-fd check can see it, while a live download touches its file at least once per burst.
-sweep_abandoned_download_temporaries() {
-    local removed
-    # The walk is bounded because SHARED_CACHE is also XDG_CACHE_HOME: pip, uv and the HF xet chunk
-    # cache live under it, and the xet cache alone holds tens of thousands of files and never a
-    # `*.incomplete`. Blobs sit at depth 5-6 (`<cache>/[dolphinpod-worker/cache/]hub/models--*/blobs`),
-    # so 7 keeps a level of slack for a worker that moves its cache root again.
-    # `-name` comes before `-type`/`-mmin` so only a name match pays a stat(), and the removal is
-    # `-exec rm`, not `-delete`: `-delete` turns on `-depth`, which silently disables the prune.
-    # `|| true` inside the pipe: under `set -e` + pipefail a find over a cache directory that does
-    # not exist yet would end the container before a single worker starts.
-    removed="$({ find "${SHARED_CACHE}" -maxdepth 7 \
-        -type d -name xet -prune -o \
-        -name '*.incomplete' -type f -mmin "+${INCOMPLETE_MAX_AGE_MINUTES}" \
-        -print -exec rm -f {} + 2>/dev/null || true; } | wc -l | tr -d '[:space:]')"
-    if (( removed > 0 )); then
-        echo "[dolphin] swept ${removed} abandoned download temporaries" \
-            "(untouched for over ${INCOMPLETE_MAX_AGE_MINUTES} min)" >&2
-    fi
-    return 0
-}
-
 free_gb_on_shared_cache() {
     # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
     df -Pk "${SHARED_CACHE}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'
@@ -803,13 +768,13 @@ spawn_all_instances() {
     WORKER_EXITED_AT=()
     WORKER_NEXT_SPAWN_AT=()
     # Blocking here is safe and is the point: nothing of ours is running yet, and a node this full
-    # would spend the whole container on a download it cannot land. The sweep runs on every pass, so
-    # a node whose garbage ages out starts on its own.
+    # would spend the whole container on a download it cannot land. The wait is not a dead end — the
+    # validator sweeps abandoned download temporaries out of this volume every cycle (DAH-2805), so a
+    # node whose garbage is collected starts on its own, with no human and no container restart.
     while download_floor_blocks_spawn; do
         echo "[dolphin] only ${LAST_MEASURED_FREE_GB} GB free and the model cache is incomplete;" \
             "not starting a worker until there is ${DOWNLOAD_FLOOR_GB} GB" >&2
         interruptible_sleep "${DOWNLOAD_FLOOR_RECHECK_SECONDS}"
-        sweep_abandoned_download_temporaries
     done
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
@@ -903,9 +868,6 @@ supervise_running_workers_until_new_binary_published() {
             continue
         fi
         elapsed=0
-        # Hourly, with the etag poll: a file becomes eligible only INCOMPLETE_MAX_AGE_MINUTES after
-        # its writer died, so sweeping on the 30s liveness tick walked the cache 120x for nothing.
-        sweep_abandoned_download_temporaries
         latest_etag="$(published_etag || true)"
         if [[ -n "${latest_etag}" && -n "${running_etag}" && "${latest_etag}" != "${running_etag}" ]]; then
             echo "[dolphin] new worker binary published; restarting workers to update" >&2
@@ -941,7 +903,6 @@ main() {
 
     ensure_worker_binary
     prune_stale_worker_logs
-    sweep_abandoned_download_temporaries
     plan_worker_instances
     start_metrics_sidecar
     start_engine_watchdogs
