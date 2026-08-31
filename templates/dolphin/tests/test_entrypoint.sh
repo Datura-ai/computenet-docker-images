@@ -30,10 +30,31 @@ assert_fails() {
     fi
 }
 
+mock_df_free_gb() {
+    # df -Pk prints KiB; the entrypoint reads the 4th column of the second line.
+    cat >"${SANDBOX}/bin/df" <<EOF
+#!/usr/bin/env bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/sda1 100000000 1 $(( $1 * 1048576 )) 1% /"
+EOF
+    chmod +x "${SANDBOX}/bin/df"
+}
+
+# touch -d is GNU, touch -v -t is portable; the date flavour differs the same way.
+age_file_by_hours() {
+    local file="$1" hours="$2" stamp
+    stamp="$(date -d "${hours} hours ago" +%Y%m%d%H%M 2>/dev/null \
+        || date -v-"${hours}"H +%Y%m%d%H%M)"
+    touch -t "${stamp}" "${file}"
+}
+
 make_sandbox() {
     SANDBOX="$(mktemp -d)"
     mkdir -p "${SANDBOX}/bin"
     export PATH="${SANDBOX}/bin:${PATH}"
+    # A roomy disk by default: the download floor reads df, and a laptop under the floor would
+    # otherwise fail every test that spawns a worker.
+    mock_df_free_gb 900
     export HOME="${SANDBOX}/home"
     export DOLPHIN_WATCHDOG_STATE_DIR="${SANDBOX}/state"
     mkdir -p "${HOME}" "${DOLPHIN_WATCHDOG_STATE_DIR}"
@@ -797,6 +818,61 @@ test_hf_offline_self_heals_when_no_engine_serves() {
     assert_eq "a serving engine arms it again" "yes" "$(offline_mode_on)"
 }
 
+
+# ---------------------------------------------------------------- DAH-2805 download temporaries
+test_sweep_only_takes_temporaries_nothing_is_writing() {
+    make_sandbox
+    load_entrypoint
+
+    local blobs="${SHARED_CACHE}/dolphinpod-worker/cache/hub/models--x/blobs"
+    mkdir -p "${blobs}"
+    touch "${blobs}/abc.11111111.incomplete" "${blobs}/abc.22222222.incomplete" "${blobs}/abc"
+    # Aged past the window, which is what a killed download leaves behind.
+    age_file_by_hours "${blobs}/abc.11111111.incomplete" 5
+
+    sweep_abandoned_download_temporaries >/dev/null 2>&1
+
+    assert_eq "an abandoned temporary is removed" "no" \
+        "$([[ -e "${blobs}/abc.11111111.incomplete" ]] && echo yes || echo no)"
+    # The live one is the whole reason the sweep goes by age: its writer can be another container.
+    assert_eq "a temporary being written is kept" "yes" \
+        "$([[ -e "${blobs}/abc.22222222.incomplete" ]] && echo yes || echo no)"
+    assert_eq "a finished blob is never touched" "yes" \
+        "$([[ -e "${blobs}/abc" ]] && echo yes || echo no)"
+}
+
+test_download_floor_only_holds_back_an_incomplete_cache() {
+    make_sandbox
+    load_entrypoint
+
+    mock_df_free_gb 20
+    assert_eq "a full disk holds back a download" "yes" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
+    mock_df_free_gb 900
+    assert_eq "room to download does not hold anything back" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
+    # A node that already holds the weights starts no download at all, so the floor must not
+    # keep it off the network's work over a disk it is not going to fill.
+    mock_df_free_gb 20
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "a complete cache is never held back" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
+    # A reading we cannot take must not park the filler: earning nothing is worse than one more
+    # download attempt.
+    rm -rf "${SHARED_CACHE}/dolphinpod-worker"
+    cat >"${SANDBOX}/bin/df" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/df"
+    assert_eq "an unmeasurable disk does not hold anything back" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -816,6 +892,8 @@ test_hf_offline_self_heals_when_no_engine_serves
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
 test_worker_logs_are_per_container_and_pruned
+test_sweep_only_takes_temporaries_nothing_is_writing
+test_download_floor_only_holds_back_an_incomplete_cache
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"

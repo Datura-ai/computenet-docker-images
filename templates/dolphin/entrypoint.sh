@@ -99,6 +99,27 @@ WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS
 # identical (engines_up 0) to a node patiently loading.
 WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.json}"
 
+# DAH-2805: how long an abandoned huggingface_hub temporary may sit before the sweep removes it.
+# hf >= 1.18 writes every attempt to a UNIQUE `blobs/<etag>.<8hex>.incomplete` and unlinks it in a
+# `finally`, so a file only survives a download whose process was KILLED — and the retry then starts
+# from byte zero under a new name. On a link too slow to finish a shard inside the worker's own
+# readiness window that is one 0.2-1.7 GB orphan per kill, forever: 742 files / 741 GB on one prod
+# node, 2026-08-31.
+# By AGE, not "delete every start": this cache volume is shared by every filler container on the
+# node, so a restarting sibling must never delete a download another container is still writing.
+# With xet the file is touched once per 64 MiB burst, which at the slowest rate measured in prod
+# (~50 KB/s per file) is ~22 min of silence on a HEALTHY download, so the window clears that by 10x.
+INCOMPLETE_MAX_AGE_MINUTES="${DOLPHIN_INCOMPLETE_MAX_AGE_MINUTES:-240}"
+
+# DAH-2805: with less free space than this the workers are not spawned while the model cache is
+# still incomplete, because spawning one starts another download. The backend only grants the cache
+# to a node with >= 190 GB free (DPHN_CACHE_SIZE_GB + DPHN_CACHE_LISTING_FLOOR_GB +
+# DPHN_CACHE_FREE_MARGIN_GB), so a healthy node never reaches this floor; a leaking one stops here
+# instead of crossing the 100 GB listing floor, below which it can take no rentals at all.
+DOWNLOAD_FLOOR_GB="${DOLPHIN_DOWNLOAD_FLOOR_GB:-150}"
+# How often the floor is re-measured while it holds a cold start back.
+DOWNLOAD_FLOOR_RECHECK_SECONDS="${DOLPHIN_DOWNLOAD_FLOOR_RECHECK_SECONDS:-300}"
+
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
 # every worker instance inside this one, so the binary download and the worker's self-update are
 # cross-process critical sections — two cold workers writing the same path at once produce a
@@ -285,6 +306,7 @@ wait_for_cache_seed() {
         # The supervise loop (and its log cap) is not running yet, and instance 0 already
         # writes its log — cap it here too so the seed wait is not an uncapped stretch.
         cap_worker_logs
+        sweep_abandoned_download_temporaries
         if engine_socket_present; then
             echo "[dolphin] shared cache seeded after ${waited}s; releasing siblings" >&2
             return 0
@@ -668,6 +690,39 @@ cap_worker_logs() {
     done
 }
 
+# Abandoned download temporaries under the shared cache. Age is the only signal available here:
+# the writer can live in a SIBLING container, where no pid or open-fd check can see it, while a live
+# download touches its file at least once per burst.
+sweep_abandoned_download_temporaries() {
+    local removed
+    # `|| true` inside the pipe: under `set -e` + pipefail a find over a cache directory that
+    # does not exist yet would end the container before a single worker starts.
+    removed="$({ find "${SHARED_CACHE}" -type f -name '*.incomplete' \
+        -mmin "+${INCOMPLETE_MAX_AGE_MINUTES}" -print -delete 2>/dev/null || true; } | wc -l)"
+    if (( removed > 0 )); then
+        echo "[dolphin] swept ${removed} abandoned download temporaries" \
+            "(untouched for over ${INCOMPLETE_MAX_AGE_MINUTES} min)" >&2
+    fi
+    return 0
+}
+
+free_gb_on_shared_cache() {
+    # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
+    df -Pk "${SHARED_CACHE}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'
+}
+
+# True when spawning a worker now would fill the disk. A complete cache needs no download at all, so
+# a node that already holds the weights is never held back — only one that must still fetch them is
+# measured. A reading we cannot take never blocks the node: a filler that refuses to run earns
+# nothing, which is a worse failure than one more download attempt.
+download_floor_blocks_spawn() {
+    model_cache_is_complete && return 1
+    local free_gb
+    free_gb="$(free_gb_on_shared_cache)"
+    [[ -n "${free_gb}" ]] || return 1
+    (( free_gb < DOWNLOAD_FLOOR_GB ))
+}
+
 spawn_instance() {
     local idx="$1"
     local log="${WORKER_LOG_DIR}/worker-${idx}.log"
@@ -738,6 +793,15 @@ spawn_all_instances() {
     # fast-exit counters intentionally survive it — they are cumulative for the sidecar.
     WORKER_EXITED_AT=()
     WORKER_NEXT_SPAWN_AT=()
+    # Blocking here is safe and is the point: nothing of ours is running yet, and a node this full
+    # would spend the whole container on a download it cannot land. The sweep runs on every pass, so
+    # a node whose garbage ages out starts on its own.
+    while download_floor_blocks_spawn; do
+        echo "[dolphin] only $(free_gb_on_shared_cache) GB free and the model cache is incomplete;" \
+            "not starting a worker until there is ${DOWNLOAD_FLOOR_GB} GB" >&2
+        interruptible_sleep "${DOWNLOAD_FLOOR_RECHECK_SECONDS}"
+        sweep_abandoned_download_temporaries
+    done
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
             # Only before the SECOND instance: once instance 0 serves, the runtime and the weights
@@ -809,6 +873,9 @@ supervise_running_workers_until_new_binary_published() {
             # The gate is a timestamp, not a sleep: a backed-off worker must not delay the
             # liveness checks and respawns of its siblings.
             (( SECONDS >= ${WORKER_NEXT_SPAWN_AT[$i]:-0} )) || continue
+            # Non-blocking, unlike the cold start: a full disk must not stop the liveness checks of
+            # the siblings, so the respawn is simply left for the next cycle.
+            download_floor_blocks_spawn && continue
             unset "WORKER_EXITED_AT[$i]"
             refresh_binary
             spawn_instance "${i}"
@@ -818,6 +885,7 @@ supervise_running_workers_until_new_binary_published() {
             running_etag="$(published_etag || true)"
         done
         cap_worker_logs
+        sweep_abandoned_download_temporaries
         elapsed=$((elapsed + LIVENESS_INTERVAL))
         if (( elapsed < CHECK_INTERVAL )); then
             continue
@@ -858,6 +926,7 @@ main() {
 
     ensure_worker_binary
     prune_stale_worker_logs
+    sweep_abandoned_download_temporaries
     plan_worker_instances
     start_metrics_sidecar
     start_engine_watchdogs

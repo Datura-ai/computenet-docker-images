@@ -17,6 +17,17 @@ MODEL="${MODEL:-qwen3.6-35b-a3b}"
 CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
 CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
+
+# DAH-2805: an abandoned huggingface_hub temporary is deleted once nothing has touched it for this
+# long. hf >= 1.18 writes every attempt to a unique `*.incomplete` and unlinks it in a `finally`, so
+# a file survives only a download whose process was KILLED — here, a container stopped mid-pull.
+# The retry then starts from byte zero under a new name, and the old one is never read again.
+# Age, not "delete every start": the checkpoint volume is shared with the other filler containers on
+# the node, and with xet a live download touches its file only once per 64 MiB burst.
+INCOMPLETE_MAX_AGE_MINUTES="${ENGY_INCOMPLETE_MAX_AGE_MINUTES:-240}"
+# Below this much free space the checkpoint pull is refused instead of filling the host disk. A node
+# under the 100 GB listing floor takes no rentals at all, so stopping above it is the cheaper loss.
+DOWNLOAD_FLOOR_GB="${ENGY_DOWNLOAD_FLOOR_GB:-150}"
 # The gateway's worker count when GW/meta cannot be read. Every miner must hold one leg per gateway
 # worker or it is refused onboarding, so this stands in for the live count everywhere the live count
 # is not available yet — the real one (resolve_gateway_worker_count) always wins over it.
@@ -134,6 +145,26 @@ start_capturing_output() {
 # Refuse to start, with the reason guaranteed to be ON DISK. Anything still holding the log pipe
 # keeps it from draining, so every child goes first; at the early call sites they are all empty and
 # that loop is a no-op. Then closing our end lets the pipe reach EOF and we wait for it to flush.
+# Abandoned download temporaries under the checkpoint and HF caches. Age is the only signal that
+# works here: the writer can be a sibling container, invisible to any pid or open-fd check.
+sweep_abandoned_download_temporaries() {
+    local removed
+    # `|| true` inside the pipe: under `set -e` + pipefail a find over a directory that does not
+    # exist yet would end the container before the checkpoint is pulled.
+    removed="$({ find "${CKPT_DIR}" "${ENGY_HOME}/hf" -type f -name '*.incomplete' \
+        -mmin "+${INCOMPLETE_MAX_AGE_MINUTES}" -print -delete 2>/dev/null || true; } | wc -l)"
+    if (( removed > 0 )); then
+        echo "[engy] swept ${removed} abandoned download temporaries" \
+            "(untouched for over ${INCOMPLETE_MAX_AGE_MINUTES} min)" >&2
+    fi
+    return 0
+}
+
+free_gb_on_checkpoint_volume() {
+    # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
+    df -Pk "${ENGY_HOME}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1048576) }'
+}
+
 refuse_to_start() {
     echo "[engy] $1" >&2
     local children=(${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"})
@@ -788,6 +819,12 @@ main() {
     # would keep publishing frozen lag series for GPUs it no longer has.
     rm -f "${PROBE_DIR}"/*.prom "${PROBE_DIR}"/*.prom.tmp
     if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
+        sweep_abandoned_download_temporaries
+        local free_gb
+        free_gb="$(free_gb_on_checkpoint_volume)"
+        if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
+            refuse_to_start "only ${free_gb} GB free; the ~35GB checkpoint pull would fill the host disk."
+        fi
         echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
         HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
     fi
