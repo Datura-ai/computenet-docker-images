@@ -683,10 +683,6 @@ free_gb_on_shared_cache() {
     { df -Pk "${SHARED_CACHE}" 2>/dev/null || true; } | awk 'NR == 2 { print int($4 / 1048576) }'
 }
 
-# Set by download_floor_blocks_spawn so a caller can report the reading without measuring the disk a
-# second time. Empty when the disk could not be measured at all.
-LAST_MEASURED_FREE_GB=""
-
 # Whether ANY copy of the model under the shared cache is complete — that is what says no download
 # is coming. Deliberately not model_cache_is_complete, which demands EVERY copy be complete: there a
 # wrong yes takes the node offline against a cache the engine cannot load, so erring costs nothing,
@@ -707,9 +703,10 @@ model_cache_has_a_complete_copy() {
 # and a reading we cannot take never blocks the node — a filler that refuses to run earns nothing,
 # which is a worse failure than one more download attempt.
 download_floor_blocks_spawn() {
-    LAST_MEASURED_FREE_GB="$(free_gb_on_shared_cache)"
-    [[ -n "${LAST_MEASURED_FREE_GB}" ]] || return 1
-    (( LAST_MEASURED_FREE_GB >= DOWNLOAD_FLOOR_GB )) && return 1
+    local free_gb
+    free_gb="$(free_gb_on_shared_cache)"
+    [[ -n "${free_gb}" ]] || return 1
+    (( free_gb >= DOWNLOAD_FLOOR_GB )) && return 1
     ! model_cache_has_a_complete_copy
 }
 
@@ -788,7 +785,7 @@ spawn_all_instances() {
     # validator sweeps abandoned download temporaries out of this volume every cycle (DAH-2805), so a
     # node whose garbage is collected starts on its own, with no human and no container restart.
     while download_floor_blocks_spawn; do
-        echo "[dolphin] only ${LAST_MEASURED_FREE_GB} GB free and the model cache is incomplete;" \
+        echo "[dolphin] only $(free_gb_on_shared_cache) GB free and the model cache is incomplete;" \
             "not starting a worker until there is ${DOWNLOAD_FLOOR_GB} GB" >&2
         interruptible_sleep "${DOWNLOAD_FLOOR_RECHECK_SECONDS}"
     done
@@ -833,10 +830,9 @@ supervise_running_workers_until_new_binary_published() {
         # leaves the container on the Hub for the rest of its life. The same call takes the switch
         # off again when it is on and no engine serves.
         sync_hf_offline_with_cache_and_engines
-        # Once per cycle, not once per dead worker: on a crash-looping split node the per-worker form
-        # measured the disk eight times for one answer that cannot change inside a cycle.
-        spawn_is_held_back_by_disk=0
-        download_floor_blocks_spawn && spawn_is_held_back_by_disk=1
+        # Measured at most once per cycle, and only if some worker actually wants respawning: the
+        # answer cannot change inside a cycle, and on a healthy node nobody asks the question at all.
+        spawn_is_held_back_by_disk=""
         for i in "${!WORKER_PIDS[@]}"; do
             if kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
                 continue
@@ -869,6 +865,10 @@ supervise_running_workers_until_new_binary_published() {
             (( SECONDS >= ${WORKER_NEXT_SPAWN_AT[$i]:-0} )) || continue
             # Non-blocking, unlike the cold start: a full disk must not stop the liveness checks of
             # the siblings, so the respawn is simply left for the next cycle.
+            if [[ -z "${spawn_is_held_back_by_disk}" ]]; then
+                spawn_is_held_back_by_disk=0
+                download_floor_blocks_spawn && spawn_is_held_back_by_disk=1
+            fi
             (( spawn_is_held_back_by_disk )) && continue
             unset "WORKER_EXITED_AT[$i]"
             refresh_binary
