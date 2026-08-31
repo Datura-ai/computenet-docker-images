@@ -395,6 +395,34 @@ def sidecar_series(sockets_found: int, proxy_ok: bool, engines_up: int = 0) -> b
     ).encode()
 
 
+# Written atomically by the entrypoint on every worker (re)spawn.
+WORKER_SPAWN_STATE_PATH = os.environ.get("DOLPHIN_WORKER_SPAWN_STATE", "/tmp/dolphin_worker_spawns.json")
+
+
+def worker_spawn_series() -> bytes:
+    """Per-worker spawn counters from the entrypoint.
+
+    A worker stuck redownloading the runtime in a respawn loop shows engines_up 0 — exactly
+    like a patient cold start. The spawn counter is the series that tells the two apart
+    (2026-08-24: two prod nodes pulled 50 and 86 GB for a 12 GB runtime, invisibly).
+    """
+    try:
+        with open(WORKER_SPAWN_STATE_PATH) as fh:
+            workers = json.load(fh)["workers"]
+    except (OSError, ValueError, KeyError):
+        return b""
+    lines: list[str] = []
+    # Grouped by metric name — interleaving families is invalid exposition (see watchdog_series).
+    for name, key in (("dolphin_worker_spawns_total", "spawns"), ("dolphin_worker_fast_exits", "fast_exits")):
+        for idx in sorted(workers):
+            value = workers[idx].get(key) if isinstance(workers[idx], dict) else None
+            if isinstance(value, int):
+                lines.append(f'{name}{{dolphin_worker="{idx}"}} {value}')
+    if not lines:
+        return b""
+    return ("\n".join(lines) + "\n").encode()
+
+
 def watchdog_state_paths() -> list[str]:
     # Globbed per request, not at import: in split mode the files appear as each bundle's
     # watchdog starts, and a list captured at boot would miss them.
@@ -519,7 +547,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             reason = f": {_last_error}" if _last_error else " (no error — engine not up yet)"
             _log(f"only {len(engines)}/{ENGINES_EXPECTED} engines answered{reason}")
         out = body + sidecar_series(len(sockets), proxy_ok=bool(engines), engines_up=len(engines))
-        self._reply(200, out + watchdog_series(), PROM_CONTENT_TYPE)
+        self._reply(200, out + watchdog_series() + worker_spawn_series(), PROM_CONTENT_TYPE)
 
     def _get_health(self) -> None:
         sockets = discover_sockets()

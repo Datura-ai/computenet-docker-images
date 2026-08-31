@@ -224,6 +224,89 @@ test_prepare_instance_home() {
 }
 
 # ---------------------------------------------------------------- cold-cache seed gate
+# ------------------------------------------------- worker log capture + spawn counters
+test_worker_log_and_spawn_counters() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export DOLPHIN_WORKER_SPAWN_STATE="${SANDBOX}/spawns.json"
+    mkdir -p "${DOLPHIN_HOME}"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<'STUB'
+#!/usr/bin/env bash
+echo "boom from worker"
+exit 7
+STUB
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+    load_entrypoint
+
+    GPU_SETS=("0,1")
+    INSTANCE_HOMES=("${SANDBOX}/home")
+    spawn_instance 0
+    wait "${WORKER_PIDS[0]}" 2>/dev/null
+    spawn_instance 0
+    wait "${WORKER_PIDS[0]}" 2>/dev/null
+
+    assert_eq "worker stdout lands in the shared-volume log" "boom from worker" \
+        "$(head -1 "${WORKER_LOG_DIR}/worker-0.log" 2>/dev/null)"
+    # grep, not python3: an earlier test's sandbox may have left a python3 stub on PATH.
+    assert_eq "spawn counter counts respawns" '"spawns":2' \
+        "$(grep -o '"spawns":[0-9]*' "${DOLPHIN_WORKER_SPAWN_STATE}" 2>/dev/null | head -1)"
+}
+
+# ------------------------------------- backoff keys on "served", not on how long the worker lived
+test_backoff_counts_a_long_dead_download_as_failed() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export DOLPHIN_WORKER_SPAWN_STATE="${SANDBOX}/spawns.json"
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    mkdir -p "${DOLPHIN_HOME}"
+    load_entrypoint
+
+    GPU_SETS=("all")
+    INSTANCE_HOMES=("${SANDBOX}/home")
+
+    # The DAH-2763 incident: a runtime download that dies after 15-27 minutes, never serving.
+    # A wall-clock rule would call that healthy; only "no engine socket" catches it.
+    WORKER_SERVED=(0)
+    WORKER_FAST_EXITS=(0)
+    assert_eq "a worker that never served counts as a failed exit" "1" \
+        "$(( ${WORKER_SERVED[0]} ? 0 : WORKER_FAST_EXITS[0] + 1 ))"
+
+    WORKER_SERVED=(1)
+    WORKER_FAST_EXITS=(3)
+    assert_eq "a worker that served resets the streak" "0" \
+        "$(( ${WORKER_SERVED[0]} ? 0 : WORKER_FAST_EXITS[0] + 1 ))"
+
+    # A live engine socket is what marks the worker as served.
+    mkdir -p "${SANDBOX}/dp-aaa" && touch "${SANDBOX}/dp-aaa/v.sock"
+    assert_eq "an engine socket reads as serving" "0" "$(engine_socket_present; echo $?)"
+    rm -rf "${SANDBOX}/dp-aaa"
+    assert_eq "no socket reads as not serving" "1" "$(engine_socket_present; echo $?)"
+}
+
+# ------------------------------------------------- per-container log dir + pruning of dead ones
+test_worker_logs_are_per_container_and_pruned() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export HOSTNAME="containerA"
+    unset DOLPHIN_WORKER_LOG_DIR || true
+    mkdir -p "${DOLPHIN_HOME}"
+    load_entrypoint
+
+    assert_eq "log dir is keyed on the container" "${DOLPHIN_HOME}/logs/containerA" "${WORKER_LOG_DIR}"
+
+    mkdir -p "${DOLPHIN_HOME}/logs/containerA" "${DOLPHIN_HOME}/logs/oldcontainer" "${DOLPHIN_HOME}/logs/freshcontainer"
+    touch -d "30 days ago" "${DOLPHIN_HOME}/logs/oldcontainer" 2>/dev/null \
+        || touch -t "$(date -v-30d +%Y%m%d%H%M 2>/dev/null)" "${DOLPHIN_HOME}/logs/oldcontainer"
+    prune_stale_worker_logs
+
+    assert_eq "a dead container's old logs are pruned" "absent" \
+        "$([[ -d "${DOLPHIN_HOME}/logs/oldcontainer" ]] && echo present || echo absent)"
+    assert_eq "a recent container's logs are kept" "present" \
+        "$([[ -d "${DOLPHIN_HOME}/logs/freshcontainer" ]] && echo present || echo absent)"
+    assert_eq "our own log dir is never pruned" "present" \
+        "$([[ -d "${DOLPHIN_HOME}/logs/containerA" ]] && echo present || echo absent)"
+}
+
 test_wait_for_cache_seed() {
     make_sandbox
     export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
@@ -730,6 +813,9 @@ test_enable_hf_offline
 test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later
 test_hf_offline_self_heals_when_no_engine_serves
+test_worker_log_and_spawn_counters
+test_backoff_counts_a_long_dead_download_as_failed
+test_worker_logs_are_per_container_and_pruned
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"

@@ -75,6 +75,29 @@ HF_OFFLINE_PTH_NAME="zz-dolphin-hf-offline.pth"
 # itself is treated as the cause and taken off. 10 cycles is 5 minutes at LIVENESS_INTERVAL — well
 # past a normal engine start (measured 2 min on a warm 8xH100 node) and far short of a shift.
 HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE=10
+# Worker stdout/stderr go to a file on the shared cache volume. The container log lives on the
+# miner's host, which the platform cannot read, so a failed cold start used to leave no evidence
+# at all (2026-08-24: two prod nodes redownloaded the runtime in a respawn loop for 110 minutes
+# and the reason was unrecoverable). One rotated generation per worker bounds the disk cost.
+# Keyed on the container, because DOLPHIN_HOME is shared by every filler container on the node
+# (see the lock below): a single logs/worker-0.log would have two containers writing one file and
+# each one's cap_worker_logs truncating the other mid-write.
+WORKER_LOG_DIR="${DOLPHIN_WORKER_LOG_DIR:-${DOLPHIN_HOME}/logs/${HOSTNAME:-$(hostname)}}"
+WORKER_LOG_MAX_BYTES="${DOLPHIN_WORKER_LOG_MAX_BYTES:-52428800}"
+# Per-container directories accumulate on a volume that outlives them, so a node that recreates
+# fillers for weeks would keep every generation. Old ones are pruned at boot.
+WORKER_LOG_RETENTION_DAYS="${DOLPHIN_WORKER_LOG_RETENTION_DAYS:-7}"
+# A worker that exits WITHOUT ever having served backs the respawn off, so a throttling download
+# source is not hammered every 30 seconds — the hammering itself extends a rate-limit ban.
+#
+# "Served", not "lived long enough": the download this exists for takes 15-27 min per attempt
+# (2026-08-24, 86 GB pulled for a 12 GB runtime), so ANY wall-clock threshold short enough to
+# catch a crash loop would call those attempts healthy and leave the backoff at zero in the very
+# incident it was written for. An engine socket is the one signal that cannot be wrong about it.
+WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS:-600}"
+# Spawn counters for the metrics sidecar: a node redownloading in a loop must stop looking
+# identical (engines_up 0) to a node patiently loading.
+WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.json}"
 
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
 # every worker instance inside this one, so the binary download and the worker's self-update are
@@ -259,6 +282,9 @@ wait_for_cache_seed() {
         sleep 10 &
         wait $! || true
         waited=$((waited + 10))
+        # The supervise loop (and its log cap) is not running yet, and instance 0 already
+        # writes its log — cap it here too so the seed wait is not an uncapped stretch.
+        cap_worker_logs
         if engine_socket_present; then
             echo "[dolphin] shared cache seeded after ${waited}s; releasing siblings" >&2
             return 0
@@ -331,6 +357,11 @@ refresh_binary() {
 GPU_SETS=()
 INSTANCE_HOMES=()
 WORKER_PIDS=()
+WORKER_SPAWNS=()
+WORKER_SERVED=()
+WORKER_FAST_EXITS=()
+WORKER_NEXT_SPAWN_AT=()
+WORKER_EXITED_AT=()
 WATCHDOG_PIDS=()
 SIDECAR_PID=""
 # Self-heal state for the offline switch: how many cycles have passed with the switch on and no
@@ -603,9 +634,49 @@ sync_hf_offline_with_cache_and_engines() {
     fi
 }
 
+# Atomic (tmp + mv): the sidecar reads this file on every scrape and must never see half a JSON.
+write_spawn_state() {
+    local i entries=()
+    for i in "${!GPU_SETS[@]}"; do
+        entries+=("\"${i}\":{\"spawns\":${WORKER_SPAWNS[$i]:-0},\"fast_exits\":${WORKER_FAST_EXITS[$i]:-0}}")
+    done
+    local joined
+    joined="$(IFS=,; echo "${entries[*]}")"
+    printf '{"updated":%s,"workers":{%s}}\n' "$(date +%s)" "${joined}" >"${WORKER_SPAWN_STATE}.tmp" \
+        && mv "${WORKER_SPAWN_STATE}.tmp" "${WORKER_SPAWN_STATE}"
+}
+
+# Log directories of containers that are gone. Only whole per-container directories are removed,
+# and only under our own logs root, so a live container's files are never a candidate.
+prune_stale_worker_logs() {
+    local root="${WORKER_LOG_DIR%/*}"
+    [[ -d "${root}" && "${root}" != "${WORKER_LOG_DIR}" ]] || return 0
+    find "${root}" -mindepth 1 -maxdepth 1 -type d ! -name "$(basename "${WORKER_LOG_DIR}")" \
+        -mtime "+${WORKER_LOG_RETENTION_DAYS}" -exec rm -rf {} + 2>/dev/null || true
+}
+
+# copytruncate, not mv: the worker keeps its fd, so the file must stay in place. The few lines
+# written between cp and truncate are lost, which logrotate accepts for the same reason we do.
+cap_worker_logs() {
+    local log size
+    for log in "${WORKER_LOG_DIR}"/worker-*.log; do
+        [[ -f "${log}" ]] || continue
+        size="$(stat -c%s "${log}" 2>/dev/null || echo 0)"
+        if (( size > WORKER_LOG_MAX_BYTES )); then
+            cp "${log}" "${log}.1" && : >"${log}"
+        fi
+    done
+}
+
 spawn_instance() {
     local idx="$1"
-    (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) &
+    local log="${WORKER_LOG_DIR}/worker-${idx}.log"
+    mkdir -p "${WORKER_LOG_DIR}"
+    WORKER_SPAWNS[idx]=$(( ${WORKER_SPAWNS[$idx]:-0} + 1 ))
+    WORKER_SERVED[idx]=0
+    write_spawn_state
+    echo "[dolphin] worker [${GPU_SETS[$idx]}] spawn #${WORKER_SPAWNS[$idx]}, log ${log}" >&2
+    (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) >>"${log}" 2>&1 &
     WORKER_PIDS[idx]=$!
 }
 
@@ -663,6 +734,10 @@ spawn_all_instances() {
     # A warm node — the shared cache volume already holds the weights from an earlier container —
     # needs no Hub at all, not even for instance 0.
     sync_hf_offline_with_cache
+    # Exit bookkeeping is per-process and must not leak across a full restart; the spawn and
+    # fast-exit counters intentionally survive it — they are cumulative for the sidecar.
+    WORKER_EXITED_AT=()
+    WORKER_NEXT_SPAWN_AT=()
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
             # Only before the SECOND instance: once instance 0 serves, the runtime and the weights
@@ -683,9 +758,21 @@ spawn_all_instances() {
 # on their own meanwhile. Returns only when the whole set has to be restarted for an update.
 supervise_running_workers_until_new_binary_published() {
     local running_etag="$1"
-    local elapsed=0 i latest_etag
+    local elapsed=0 i latest_etag backoff engine_serving
     while true; do
         interruptible_sleep "${LIVENESS_INTERVAL}"
+        # An engine socket proves a worker got all the way to serving, which is what separates a
+        # crash loop from a slow but healthy start. Read once per cycle and credited to every
+        # live worker: in split mode the glob cannot say WHICH instance owns the socket, and
+        # crediting all of them only ever errs towards respawning at once, never towards backing
+        # off a worker that is fine.
+        engine_serving=0
+        engine_socket_present && engine_serving=1
+        for i in "${!WORKER_PIDS[@]}"; do
+            if (( engine_serving )) && kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
+                WORKER_SERVED[i]=1
+            fi
+        done
         # Every cycle, because the seed wait ends when the first worker opens its engine socket,
         # about 30 s after start — minutes BEFORE the download of the weights completes (measured
         # on a cold 8xH100 node, 2026-08-21). A check at spawn time alone sees a partial cache and
@@ -693,17 +780,44 @@ supervise_running_workers_until_new_binary_published() {
         # off again when it is on and no engine serves.
         sync_hf_offline_with_cache_and_engines
         for i in "${!WORKER_PIDS[@]}"; do
-            if ! kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
-                wait "${WORKER_PIDS[$i]}" 2>/dev/null || true
-                echo "[dolphin] worker [${GPU_SETS[$i]}] exited; restarting" >&2
-                refresh_binary
-                spawn_instance "${i}"
-                # A worker exits to self-update onto a freshly published binary; refresh_binary
-                # just pulled it, so re-baseline the etag — otherwise the poll below still sees the
-                # old baseline and forces a redundant full restart of every worker.
-                running_etag="$(published_etag || true)"
+            if kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
+                continue
             fi
+            if [[ -z "${WORKER_EXITED_AT[$i]:-}" ]]; then
+                wait "${WORKER_PIDS[$i]}" 2>/dev/null || true
+                WORKER_EXITED_AT[i]=${SECONDS}
+                if (( ${WORKER_SERVED[$i]:-0} )); then
+                    WORKER_FAST_EXITS[i]=0
+                else
+                    WORKER_FAST_EXITS[i]=$(( ${WORKER_FAST_EXITS[$i]:-0} + 1 ))
+                fi
+                # The first failed exit respawns immediately (the shipped behavior — a self-update
+                # exits on purpose). From the second in a row the delay doubles, capped: a
+                # download that dies otherwise restarts from byte zero every 30s.
+                backoff=0
+                if (( WORKER_FAST_EXITS[i] > 1 )); then
+                    backoff=$(( LIVENESS_INTERVAL * (1 << (WORKER_FAST_EXITS[i] - 1)) ))
+                    (( backoff > WORKER_RESPAWN_BACKOFF_MAX_SECONDS )) \
+                        && backoff="${WORKER_RESPAWN_BACKOFF_MAX_SECONDS}"
+                fi
+                WORKER_NEXT_SPAWN_AT[i]=$(( SECONDS + backoff ))
+                write_spawn_state
+                echo "[dolphin] worker [${GPU_SETS[$i]}] exited" \
+                    "(served: ${WORKER_SERVED[$i]:-0}, failed exits in a row:" \
+                    "${WORKER_FAST_EXITS[$i]}); respawn in ${backoff}s" >&2
+            fi
+            # The gate is a timestamp, not a sleep: a backed-off worker must not delay the
+            # liveness checks and respawns of its siblings.
+            (( SECONDS >= ${WORKER_NEXT_SPAWN_AT[$i]:-0} )) || continue
+            unset "WORKER_EXITED_AT[$i]"
+            refresh_binary
+            spawn_instance "${i}"
+            # A worker exits to self-update onto a freshly published binary; refresh_binary
+            # just pulled it, so re-baseline the etag — otherwise the poll below still sees the
+            # old baseline and forces a redundant full restart of every worker.
+            running_etag="$(published_etag || true)"
         done
+        cap_worker_logs
         elapsed=$((elapsed + LIVENESS_INTERVAL))
         if (( elapsed < CHECK_INTERVAL )); then
             continue
@@ -743,6 +857,7 @@ main() {
     export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
 
     ensure_worker_binary
+    prune_stale_worker_logs
     plan_worker_instances
     start_metrics_sidecar
     start_engine_watchdogs
