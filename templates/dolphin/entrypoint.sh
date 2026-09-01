@@ -99,6 +99,16 @@ WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS
 # identical (engines_up 0) to a node patiently loading.
 WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.json}"
 
+# DAH-2805: with less free space than this the workers are not spawned while the model cache is
+# still incomplete, because spawning one starts another download.
+# The number must sit BELOW the smallest fit gate the backend actually uses, or the platform grants a
+# node the filler and the filler then parks forever. That gate is the workload size plus
+# EXECUTORS_FILTER_MIN_GB, which is 50 in prod and 15 on staging — so DPHN is admitted at 130 GB free
+# in prod and 95 GB on staging, NOT the 180 the code default suggests. 60 clears the ~40 GB the pull
+# needs and still stops a node that genuinely cannot take it.
+DOWNLOAD_FLOOR_GB="${DOLPHIN_DOWNLOAD_FLOOR_GB:-60}"
+DOWNLOAD_FLOOR_RECHECK_SECONDS=300
+
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
 # every worker instance inside this one, so the binary download and the worker's self-update are
 # cross-process critical sections — two cold workers writing the same path at once produce a
@@ -515,25 +525,27 @@ snapshot_under_ref_is_complete() {
     (( listed > 0 && ! missing ))
 }
 
+# Every copy of this model under the shared cache. `.locks` is PRUNED: hf_hub puts its download locks
+# in `<cache>/.locks/models--<repo>/`, which carries the very same directory name and holds no refs at
+# all — left in, that lock directory reads as a forever-incomplete copy.
+# The copies are SEARCHED rather than read from a fixed path: the worker has moved its cache directory
+# before (this entrypoint exports <home>/.cache/huggingface, the worker uses
+# <home>/.cache/dolphinpod-worker/cache), so the next move survives too.
+model_cache_repo_dirs() {
+    find "${SHARED_CACHE}" -maxdepth 5 -name .locks -prune -o \
+        -type d -name "$(hf_cache_dir_name "${MODEL}")" -print 2>/dev/null
+}
+
 model_cache_is_complete() {
-    # EVERY copy of this model under the shared volume must be complete, not merely one of them.
-    # The worker has moved its cache directory before (this entrypoint exports
-    # <home>/.cache/huggingface, the worker uses <home>/.cache/dolphinpod-worker/cache), so a stale
-    # complete copy under the old root can sit beside the half-downloaded copy the engine actually
-    # reads. Accepting the stale one takes the node offline and the real download can never finish.
-    # Demanding all of them only ever errs towards staying online, which is what the node did
-    # before DAH-2743.
-    #
-    # The copies are SEARCHED rather than read from a fixed path, so the next move survives too.
-    # `.locks` is PRUNED: hf_hub puts its download locks in `<cache>/.locks/models--<repo>/`, which
-    # carries the very same directory name and holds no refs at all. Left in, that lock directory
-    # reads as a forever-incomplete copy and the node never goes offline.
+    # EVERY copy must be complete, not merely one of them: a stale complete copy under an old cache
+    # root can sit beside the half-downloaded copy the engine actually reads, and accepting the stale
+    # one takes the node offline while the real download can never finish. Demanding all of them only
+    # ever errs towards staying online, which is what the node did before DAH-2743.
     local repo_dir found=0
     while read -r repo_dir; do
         found=1
         snapshot_under_ref_is_complete "${repo_dir}" || return 1
-    done < <(find "${SHARED_CACHE}" -maxdepth 5 -name .locks -prune -o \
-        -type d -name "$(hf_cache_dir_name "${MODEL}")" -print 2>/dev/null)
+    done < <(model_cache_repo_dirs)
     (( found ))
 }
 
@@ -668,6 +680,39 @@ cap_worker_logs() {
     done
 }
 
+free_gb_on_shared_cache() {
+    # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
+    # `|| true` inside the pipe: under `set -e` + pipefail a df that fails would otherwise end the
+    # container at the assignment, instead of reading as the "cannot measure" the callers handle.
+    { df -Pk "${SHARED_CACHE}" 2>/dev/null || true; } | awk 'NR == 2 { print int($4 / 1048576) }'
+}
+
+# Whether ANY copy of the model under the shared cache is complete — that is what says no download
+# is coming. Deliberately not model_cache_is_complete, which demands EVERY copy be complete: there a
+# wrong yes takes the node offline against a cache the engine cannot load, so erring costs nothing,
+# while HERE a wrong no parks a healthy node for as long as the disk stays full. One stale half-copy
+# under an old cache root (the worker has moved its cache directory before) would be enough.
+model_cache_has_a_complete_copy() {
+    local repo_dir
+    while read -r repo_dir; do
+        snapshot_under_ref_is_complete "${repo_dir}" && return 0
+    done < <(model_cache_repo_dirs)
+    return 1
+}
+
+# True when spawning a worker now would fill the disk. The cheap question comes first: on a node with
+# room the answer is the df alone, and the cache walk behind the copy check is never paid.
+# A cache that already holds the weights starts no download, so such a node is never held back,
+# and a reading we cannot take never blocks the node — a filler that refuses to run earns nothing,
+# which is a worse failure than one more download attempt.
+download_floor_blocks_spawn() {
+    local free_gb
+    free_gb="$(free_gb_on_shared_cache)"
+    [[ -n "${free_gb}" ]] || return 1
+    (( free_gb >= DOWNLOAD_FLOOR_GB )) && return 1
+    ! model_cache_has_a_complete_copy
+}
+
 spawn_instance() {
     local idx="$1"
     local log="${WORKER_LOG_DIR}/worker-${idx}.log"
@@ -738,6 +783,15 @@ spawn_all_instances() {
     # fast-exit counters intentionally survive it — they are cumulative for the sidecar.
     WORKER_EXITED_AT=()
     WORKER_NEXT_SPAWN_AT=()
+    # Blocking here is safe and is the point: nothing of ours is running yet, and a node this full
+    # would spend the whole container on a download it cannot land. The wait is not a dead end — the
+    # validator sweeps abandoned download temporaries out of this volume every cycle (DAH-2805), so a
+    # node whose garbage is collected starts on its own, with no human and no container restart.
+    while download_floor_blocks_spawn; do
+        echo "[dolphin] only $(free_gb_on_shared_cache) GB free and the model cache is incomplete;" \
+            "not starting a worker until there is ${DOWNLOAD_FLOOR_GB} GB" >&2
+        interruptible_sleep "${DOWNLOAD_FLOOR_RECHECK_SECONDS}"
+    done
     for i in "${!GPU_SETS[@]}"; do
         if (( i == 1 )); then
             # Only before the SECOND instance: once instance 0 serves, the runtime and the weights
@@ -758,7 +812,7 @@ spawn_all_instances() {
 # on their own meanwhile. Returns only when the whole set has to be restarted for an update.
 supervise_running_workers_until_new_binary_published() {
     local running_etag="$1"
-    local elapsed=0 i latest_etag backoff engine_serving
+    local elapsed=0 i latest_etag backoff engine_serving spawn_is_held_back_by_disk
     while true; do
         interruptible_sleep "${LIVENESS_INTERVAL}"
         # An engine socket proves a worker got all the way to serving, which is what separates a
@@ -779,6 +833,9 @@ supervise_running_workers_until_new_binary_published() {
         # leaves the container on the Hub for the rest of its life. The same call takes the switch
         # off again when it is on and no engine serves.
         sync_hf_offline_with_cache_and_engines
+        # Measured at most once per cycle, and only if some worker actually wants respawning: the
+        # answer cannot change inside a cycle, and on a healthy node nobody asks the question at all.
+        spawn_is_held_back_by_disk=""
         for i in "${!WORKER_PIDS[@]}"; do
             if kill -0 "${WORKER_PIDS[$i]}" 2>/dev/null; then
                 continue
@@ -809,6 +866,13 @@ supervise_running_workers_until_new_binary_published() {
             # The gate is a timestamp, not a sleep: a backed-off worker must not delay the
             # liveness checks and respawns of its siblings.
             (( SECONDS >= ${WORKER_NEXT_SPAWN_AT[$i]:-0} )) || continue
+            # Non-blocking, unlike the cold start: a full disk must not stop the liveness checks of
+            # the siblings, so the respawn is simply left for the next cycle.
+            if [[ -z "${spawn_is_held_back_by_disk}" ]]; then
+                spawn_is_held_back_by_disk=0
+                download_floor_blocks_spawn && spawn_is_held_back_by_disk=1
+            fi
+            (( spawn_is_held_back_by_disk )) && continue
             unset "WORKER_EXITED_AT[$i]"
             refresh_binary
             spawn_instance "${i}"

@@ -17,6 +17,14 @@ MODEL="${MODEL:-qwen3.6-35b-a3b}"
 CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
 CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
+
+# DAH-2805: below this much free space the checkpoint pull is refused instead of filling the host
+# disk, and the container exits so the backend frees the GPU. The number sits BELOW the smallest fit
+# gate the backend uses — workload size plus EXECUTORS_FILTER_MIN_GB, i.e. ENGY admitted at 110 GB
+# free in prod and 75 GB on staging — because a floor above the gate would refuse nodes the platform
+# just granted. 60 clears the ~35 GB the checkpoint needs. The garbage that puts a node here is
+# swept by the validator, which reaches the node whatever image runs on it.
+DOWNLOAD_FLOOR_GB="${ENGY_DOWNLOAD_FLOOR_GB:-60}"
 # The gateway's worker count when GW/meta cannot be read. Every miner must hold one leg per gateway
 # worker or it is refused onboarding, so this stands in for the live count everywhere the live count
 # is not available yet — the real one (resolve_gateway_worker_count) always wins over it.
@@ -158,6 +166,13 @@ refuse_to_start() {
     exec 1>&- 2>&-
     wait "${log_pipe_pid}" 2>/dev/null || true
     exit 1
+}
+
+free_gb_on_checkpoint_volume() {
+    # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
+    # `|| true` inside the pipe: under `set -e` + pipefail a df that fails would otherwise end the
+    # container at the assignment below, killing a node this check exists to keep alive.
+    { df -Pk "${ENGY_HOME}" 2>/dev/null || true; } | awk 'NR == 2 { print int($4 / 1048576) }'
 }
 
 # Start a supervised loop in a session of its own and echo its pid, which `setsid` also makes the
@@ -788,6 +803,11 @@ main() {
     # would keep publishing frozen lag series for GPUs it no longer has.
     rm -f "${PROBE_DIR}"/*.prom "${PROBE_DIR}"/*.prom.tmp
     if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
+        local free_gb
+        free_gb="$(free_gb_on_checkpoint_volume)"
+        if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
+            refuse_to_start "only ${free_gb} GB free; the ~35GB checkpoint pull would fill the host disk."
+        fi
         echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
         HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
     fi

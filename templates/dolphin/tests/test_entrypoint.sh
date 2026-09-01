@@ -30,10 +30,31 @@ assert_fails() {
     fi
 }
 
+mock_df_free_gb() {
+    # df -Pk prints KiB; the entrypoint reads the 4th column of the second line.
+    cat >"${SANDBOX}/bin/df" <<EOF
+#!/usr/bin/env bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/sda1 100000000 1 $(( $1 * 1048576 )) 1% /"
+EOF
+    chmod +x "${SANDBOX}/bin/df"
+}
+
+mock_df_fails() {
+    cat >"${SANDBOX}/bin/df" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/df"
+}
+
 make_sandbox() {
     SANDBOX="$(mktemp -d)"
     mkdir -p "${SANDBOX}/bin"
     export PATH="${SANDBOX}/bin:${PATH}"
+    # A roomy disk by default: the download floor reads df, and a laptop under the floor would
+    # otherwise fail every test that spawns a worker.
+    mock_df_free_gb 900
     export HOME="${SANDBOX}/home"
     export DOLPHIN_WATCHDOG_STATE_DIR="${SANDBOX}/state"
     mkdir -p "${HOME}" "${DOLPHIN_WATCHDOG_STATE_DIR}"
@@ -797,6 +818,42 @@ test_hf_offline_self_heals_when_no_engine_serves() {
     assert_eq "a serving engine arms it again" "yes" "$(offline_mode_on)"
 }
 
+
+# ---------------------------------------------------------------- DAH-2805 download temporaries
+test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete() {
+    make_sandbox
+    load_entrypoint
+
+    mock_df_free_gb 20
+    assert_eq "a full disk holds back a download" "yes" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
+    mock_df_free_gb 900
+    assert_eq "room to download does not hold anything back" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
+    # A node that already holds the weights starts no download at all, so the floor must not
+    # keep it off the network's work over a disk it is not going to fill.
+    mock_df_free_gb 20
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "a complete cache is never held back" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
+    # A stale half-copy under an old cache root must not park a node whose real cache is complete:
+    # the offline switch demands every copy be complete, this decision must not.
+    mkdir -p "${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${MODEL}")/snapshots/dead"
+    assert_eq "a stale half-copy elsewhere does not park the node" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
+    # A reading we cannot take must not park the filler: earning nothing is worse than one more
+    # download attempt.
+    rm -rf "${SHARED_CACHE}/dolphinpod-worker"
+    mock_df_fails
+    assert_eq "an unmeasurable disk does not hold anything back" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -816,6 +873,7 @@ test_hf_offline_self_heals_when_no_engine_serves
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
 test_worker_logs_are_per_container_and_pruned
+test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"
