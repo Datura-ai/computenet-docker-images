@@ -336,10 +336,12 @@ download_worker_binary() {
     fi
     local staged
     staged="$(mktemp "${DOLPHIN_HOME}/.dolphinpod-worker.XXXXXX")"
-    # A fleet-wide rollout starts every container at once and updates.dphn.ai answers part of
-    # the burst with 429. curl treats 429 as transient with --retry and waits out Retry-After;
-    # without it the exit 22 kills the entrypoint (set -e) and docker restart-loops the container.
-    curl -fsSL --retry 8 "${WORKER_URL}" -o "${staged}"
+    # A fleet-wide rollout starts every container at once and updates.dphn.ai answers part of the
+    # burst with 429; unretried, curl exits 22 and `set -e` restart-loops the container instead.
+    # --retry-max-time is the ceiling (~480 s worst case, one final attempt may start just under
+    # it) and holds the shared lock for all of it. --max-time is what ends a stalled connection,
+    # which raises no error for --retry to catch.
+    curl -fsSL --retry 8 --retry-max-time 300 --max-time 180 "${WORKER_URL}" -o "${staged}"
     chmod +x "${staged}"
     # Atomic: even a lock timeout can never expose a half-written binary to a sibling.
     mv -f "${staged}" "${WORKER_BIN}"
