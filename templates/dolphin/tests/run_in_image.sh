@@ -113,7 +113,10 @@ docker run --rm --entrypoint bash "${IMAGE}" -c \
     'grep -a -q CXXABI_1.3.15 /usr/lib/x86_64-linux-gnu/libstdc++.so.6' \
     || { echo "FAIL: host libstdc++ has no CXXABI_1.3.15; Dolphin's engine cannot import"; exit 1; }
 # The base image moved to 24.04 for that ABI, so prove the move kept every tool the image uses.
+# flock and pkill are the ones that matter: they come from the BASE, not from our apt line, and the
+# entrypoint calls pkill with `|| true` (line 709), so losing it would go unnoticed until a worker
+# refused to die. A missing python3/gcc/curl/jq already fails the build, but they cost nothing here.
 docker run --rm --entrypoint bash "${IMAGE}" -c \
-    'command -v python3 && command -v gcc && command -v curl && command -v jq' >/dev/null \
-    || { echo "FAIL: python3/gcc/curl/jq missing after the libstdc++ upgrade"; exit 1; }
+    'command -v python3 && command -v gcc && command -v curl && command -v jq && command -v flock && command -v pkill' >/dev/null \
+    || { echo "FAIL: the image lost a tool the entrypoint needs"; exit 1; }
 echo "OK: libstdc++ new enough, image tools intact"
