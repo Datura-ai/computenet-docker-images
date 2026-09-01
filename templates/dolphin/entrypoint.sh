@@ -100,11 +100,13 @@ WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS
 WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.json}"
 
 # DAH-2805: with less free space than this the workers are not spawned while the model cache is
-# still incomplete, because spawning one starts another download. The backend only grants the cache
-# to a node with >= 190 GB free (DPHN_CACHE_SIZE_GB + DPHN_CACHE_LISTING_FLOOR_GB +
-# DPHN_CACHE_FREE_MARGIN_GB), so a healthy node never reaches this floor; a leaking one stops here
-# instead of crossing the 100 GB listing floor, below which it can take no rentals at all.
-DOWNLOAD_FLOOR_GB="${DOLPHIN_DOWNLOAD_FLOOR_GB:-150}"
+# still incomplete, because spawning one starts another download.
+# The number must sit BELOW the smallest fit gate the backend actually uses, or the platform grants a
+# node the filler and the filler then parks forever. That gate is the workload size plus
+# EXECUTORS_FILTER_MIN_GB, which is 50 in prod and 15 on staging — so DPHN is admitted at 130 GB free
+# in prod and 95 GB on staging, NOT the 180 the code default suggests. 60 clears the ~40 GB the pull
+# needs and still stops a node that genuinely cannot take it.
+DOWNLOAD_FLOOR_GB="${DOLPHIN_DOWNLOAD_FLOOR_GB:-60}"
 DOWNLOAD_FLOOR_RECHECK_SECONDS=300
 
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by

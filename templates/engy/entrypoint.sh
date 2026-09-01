@@ -19,10 +19,12 @@ CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
 CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
 
 # DAH-2805: below this much free space the checkpoint pull is refused instead of filling the host
-# disk. A node under the 100 GB listing floor takes no rentals at all, so stopping above it is the
-# cheaper loss. The garbage that put a node here is swept by the validator, not from inside the
-# image: it reaches the node on every cycle whatever image runs on it.
-DOWNLOAD_FLOOR_GB="${ENGY_DOWNLOAD_FLOOR_GB:-150}"
+# disk, and the container exits so the backend frees the GPU. The number sits BELOW the smallest fit
+# gate the backend uses — workload size plus EXECUTORS_FILTER_MIN_GB, i.e. ENGY admitted at 110 GB
+# free in prod and 75 GB on staging — because a floor above the gate would refuse nodes the platform
+# just granted. 60 clears the ~35 GB the checkpoint needs. The garbage that puts a node here is
+# swept by the validator, which reaches the node whatever image runs on it.
+DOWNLOAD_FLOOR_GB="${ENGY_DOWNLOAD_FLOOR_GB:-60}"
 # The gateway's worker count when GW/meta cannot be read. Every miner must hold one leg per gateway
 # worker or it is refused onboarding, so this stands in for the live count everywhere the live count
 # is not available yet — the real one (resolve_gateway_worker_count) always wins over it.
