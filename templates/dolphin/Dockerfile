@@ -11,7 +11,14 @@
 #
 # CUDA 12.8 runtime base so Blackwell (NVFP4) drivers are available; the worker still pulls
 # its own model runtime on top. Override BASE_IMAGE for older CUDA if needed.
-ARG BASE_IMAGE=nvidia/cuda:12.8.0-runtime-ubuntu22.04
+#
+# Ubuntu 24.04, NOT 22.04 (DAH-2815): the worker downloads its engine runtime from Dolphin at every
+# engine start, and their launcher (runtimes/<type>/run-sonar) searches /usr/lib/x86_64-linux-gnu
+# BEFORE its own lib directory. Their 2026-09-01 runtime links ICU against CXXABI_1.3.15, which
+# 22.04's libstdc++ (CXXABI_1.3.13) does not have, so every engine died at import and the fleet
+# stopped mining. 24.04 ships libstdc++6 14.2 (CXXABI_1.3.15) from the official archive. Do not move
+# this base back to 22.04.
+ARG BASE_IMAGE=nvidia/cuda:12.8.0-runtime-ubuntu24.04
 FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive

@@ -7,16 +7,16 @@
 # The watchdog's kill tests are skipped on a macOS host for want of /proc, so
 # this is the only place they actually run — do not skip it.
 set -euo pipefail
-IMAGE="${1:-daturaai/dolphin:0.0.18}"
+IMAGE="${1:-daturaai/dolphin:0.0.24}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-echo "== [1/4] sidecar tests inside ${IMAGE} =="
+echo "== [1/5] sidecar tests inside ${IMAGE} =="
 docker run --rm --entrypoint python3 \
     -v "${HERE}:/tests:ro" \
     -e SIDECAR_PATH=/opt/dolphinpod/metrics_sidecar.py \
     "${IMAGE}" /tests/test_sidecar.py
 
-echo "== [2/4] watchdog tests inside ${IMAGE} (they kill real processes, hence a container) =="
+echo "== [2/5] watchdog tests inside ${IMAGE} (they kill real processes, hence a container) =="
 docker run --rm --entrypoint python3 \
     -v "${HERE}:/tests:ro" \
     -e SIDECAR_PATH=/opt/dolphinpod/metrics_sidecar.py \
@@ -24,11 +24,11 @@ docker run --rm --entrypoint python3 \
     -e PYTHONPATH=/opt/dolphinpod \
     "${IMAGE}" /tests/test_watchdog.py
 
-echo "== [3/4] entrypoint integration: sidecar + watchdog up, clean docker stop =="
+echo "== [3/5] entrypoint integration: sidecar + watchdog up, clean docker stop =="
 CT="dolphin-sidecar-test-$$"
 docker rm -f "${CT}" >/dev/null 2>&1 || true
 # DOLPHIN_WORKER_PER_GPU=0 pins the single-worker mode: on a multi-GPU host the entrypoint
-# would otherwise split, and split mode labels its watchdog series per bundle ([4/4] covers
+# would otherwise split, and split mode labels its watchdog series per bundle ([4/5] covers
 # that shape) — here the point is that the unlabelled single-engine contract is unchanged.
 docker run -d --name "${CT}" \
     -e DOLPHIN_API_KEY=dp-dummy-key \
@@ -58,7 +58,7 @@ echo "docker stop took ${STOP_SECONDS}s, exit code ${EXIT_CODE}"
 [ "${STOP_SECONDS}" -le 9 ] || { echo "FAIL: stop hit the kill grace (trap broken)"; exit 1; }
 echo "OK: entrypoint integration clean"
 
-echo "== [4/4] split mode: two workers, engine count exported, a watchdog per bundle =="
+echo "== [4/5] split mode: two workers, engine count exported, a watchdog per bundle =="
 # A fake nvidia-smi makes the split deterministic without needing real GPUs, so this runs
 # identically on a laptop and on a filler node.
 SPLIT_CT="dolphin-split-test-$$"
@@ -105,3 +105,18 @@ echo "split-mode docker stop took ${SPLIT_STOP_SECONDS}s, exit code ${SPLIT_EXIT
 [ "${SPLIT_EXIT}" = "0" ] || { echo "FAIL: non-zero exit on docker stop in split mode"; exit 1; }
 [ "${SPLIT_STOP_SECONDS}" -le 9 ] || { echo "FAIL: split-mode stop hit the kill grace"; exit 1; }
 echo "OK: split mode clean"
+
+echo "== [5/5] the host libstdc++ answers Dolphin's runtime (DAH-2815) =="
+# Dolphin's launcher searches /usr/lib/x86_64-linux-gnu BEFORE its own lib directory, so the ABI
+# their engine links against must exist HERE or the engine dies at import and never mines.
+docker run --rm --entrypoint bash "${IMAGE}" -c \
+    'grep -a -q CXXABI_1.3.15 /usr/lib/x86_64-linux-gnu/libstdc++.so.6' \
+    || { echo "FAIL: host libstdc++ has no CXXABI_1.3.15; Dolphin's engine cannot import"; exit 1; }
+# The base image moved to 24.04 for that ABI, so prove the move kept every tool the image uses.
+# flock and pkill are the ones that matter: they come from the BASE, not from our apt line, and the
+# entrypoint calls pkill with `|| true` (line 709), so losing it would go unnoticed until a worker
+# refused to die. A missing python3/gcc/curl/jq already fails the build, but they cost nothing here.
+docker run --rm --entrypoint bash "${IMAGE}" -c \
+    'command -v python3 && command -v gcc && command -v curl && command -v jq && command -v flock && command -v pkill' >/dev/null \
+    || { echo "FAIL: the image lost a tool the entrypoint needs"; exit 1; }
+echo "OK: libstdc++ new enough, image tools intact"

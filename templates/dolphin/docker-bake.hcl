@@ -1,9 +1,9 @@
 variable "VERSION" {
-    default = "0.0.21"
+    default = "0.0.24"
 }
 
 variable "BASE_IMAGE" {
-    default = "nvidia/cuda:12.8.0-runtime-ubuntu22.04"
+    default = "nvidia/cuda:12.8.0-runtime-ubuntu24.04"
 }
 
 target "default" {
