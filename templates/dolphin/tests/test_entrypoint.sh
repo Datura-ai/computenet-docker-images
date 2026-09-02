@@ -822,6 +822,12 @@ test_hf_offline_stays_off_when_the_top_up_fails() {
     sync_hf_offline_with_cache
     assert_eq "a failed top-up keeps the Hub reachable" "no" \
         "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+
+    # The top-up blocks the supervisor for as long as it waits. A Hub that keeps answering 429
+    # must not buy that wait again on the very next 30 s cycle.
+    sync_hf_offline_with_cache
+    assert_eq "a failed top-up is not retried on the next cycle" "1" \
+        "$(grep -c '^0:' "${SANDBOX}/hf_calls")"
     unset ONLINE_EXIT
 }
 

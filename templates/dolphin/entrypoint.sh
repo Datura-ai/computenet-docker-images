@@ -79,6 +79,10 @@ HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE=10
 # only reads the cache; the top-up fetches the small files of the commit, never the weights.
 HF_OFFLINE_CHECK_TIMEOUT_S=90
 HF_OFFLINE_TOP_UP_TIMEOUT_S=300
+# The top-up runs INSIDE the supervisor cycle, so it holds back every liveness check and respawn
+# while it waits. A Hub that answers 429 would otherwise burn that wait on every 30 s cycle and
+# leave the node's workers unattended most of the time. One attempt per this many seconds.
+HF_OFFLINE_TOP_UP_MIN_INTERVAL_S=600
 # Worker stdout/stderr go to a file on the shared cache volume. The container log lives on the
 # miner's host, which the platform cannot read, so a failed cold start used to leave no evidence
 # at all (2026-08-24: two prod nodes redownloaded the runtime in a respawn loop for 110 minutes
@@ -384,6 +388,8 @@ WORKER_EXITED_AT=()
 # DAH-2843: when the last worker of this container was spawned, cold start or respawn.
 # -SPLIT_STAGGER_SECONDS so the very first spawn is never held back.
 LAST_SPAWN_AT=$(( -SPLIT_STAGGER_SECONDS ))
+# When the last online top-up of the HF cache ran. Negative so the first one is never held back.
+LAST_HF_TOP_UP_AT=$(( -HF_OFFLINE_TOP_UP_MIN_INTERVAL_S ))
 WATCHDOG_PIDS=()
 SIDECAR_PID=""
 # Self-heal state for the offline switch: how many cycles have passed with the switch on and no
@@ -625,9 +631,20 @@ hf_cache_is_engine_ready() {
     [[ -n "${python_bin}" ]] || return 0
     while read -r repo_dir; do
         # `<HF_HOME>/hub/models--<repo>` is the hf_hub cache layout, so HF_HOME is two levels up.
+        # A copy that is NOT under a `hub` directory is not a copy the library can read, and
+        # handing its parent to snapshot_download would point the top-up at an empty cache root —
+        # a 23 GB download of the weights, past the disk floor that guards every other download.
+        [[ "${repo_dir%/*}" == */hub ]] || continue
         hf_home="${repo_dir%/*/*}"
         hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" && continue
+        # The wait blocks the supervisor, so it is rationed. Until the next attempt is due the
+        # answer is simply no, and offline mode stays off.
+        if (( SECONDS - LAST_HF_TOP_UP_AT < HF_OFFLINE_TOP_UP_MIN_INTERVAL_S )); then
+            ready=0
+            continue
+        fi
         echo "[dolphin] the HF library refuses the cache under ${hf_home}; fetching what it misses before offline mode arms" >&2
+        LAST_HF_TOP_UP_AT=${SECONDS}
         # A failed top-up (a rate limit, a Hub outage) leaves the switch off, which is what the
         # node did before DAH-2743 — never worse than today.
         top_up_hf_cache_from_hub "${python_bin}" "${hf_home}" || { ready=0; continue; }
