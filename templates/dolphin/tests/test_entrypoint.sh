@@ -709,7 +709,8 @@ test_hf_offline_wiring() {
     DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
     local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
-
+    install_stub_python
+    touch "${SANDBOX}/topped_up"
     offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
 
     # Cold node: the cache must be seeded from the Hub, so the Hub stays reachable.
@@ -729,6 +730,8 @@ test_hf_offline_is_re_evaluated_later() {
     DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
     local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    touch "${SANDBOX}/topped_up"
     offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
 
     # Measured on a real cold node 2026-08-21: the worker opens its engine socket about 30 s after
@@ -820,6 +823,22 @@ test_hf_offline_waits_for_the_library() {
     sync_hf_offline_with_cache
     assert_eq "an armed switch with no engine is checked again" "yes" \
         "$([[ "$(wc -l <"${SANDBOX}/hf_calls")" -gt "${calls_before}" ]] && echo yes || echo no)"
+}
+
+test_a_half_installed_runtime_never_arms() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    # site-packages already on disk, the interpreter not yet. The switch is written into
+    # site-packages, so arming here would put it into a runtime that never approved the cache.
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    sync_hf_offline_with_cache
+    assert_eq "a runtime with no interpreter keeps the Hub" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
 }
 
 test_hf_offline_needs_a_cache_the_library_can_read() {
@@ -930,6 +949,8 @@ test_hf_offline_self_heals_when_no_engine_serves() {
     DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
     local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    touch "${SANDBOX}/topped_up"
     offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
     run_cycles() { local n="$1" i; for (( i = 0; i < n; i++ )); do sync_hf_offline_with_cache_and_engines; done; }
 
@@ -1044,6 +1065,7 @@ test_hf_offline_is_re_evaluated_later
 test_hf_offline_self_heals_when_no_engine_serves
 test_hf_offline_waits_for_the_library
 test_hf_offline_needs_a_cache_the_library_can_read
+test_a_half_installed_runtime_never_arms
 test_hf_offline_stays_off_when_the_top_up_fails
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed

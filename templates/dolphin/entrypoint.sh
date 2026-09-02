@@ -639,9 +639,14 @@ hf_cache_is_engine_ready() {
     while read -r python_bin; do
         [[ -x "${python_bin}" ]] && pythons+=("${python_bin}")
     done < <(worker_runtime_pythons)
-    # No runtime yet (cold container): the library cannot be asked, and there is no site-packages
-    # to arm either. The file check above is then the whole answer, exactly as before this change.
-    (( ${#pythons[@]} )) || return 0
+    # No interpreter to ask. On a cold container there is no site-packages to arm either, so the
+    # answer does not matter — enable_hf_offline writes no file. A HALF-INSTALLED runtime is the
+    # case that does matter: site-packages already on disk, interpreter not yet. Arming there puts
+    # the switch into a runtime whose library never approved the cache, which is this whole bug.
+    if (( ${#pythons[@]} == 0 )); then
+        worker_runtime_site_packages_dirs | grep -q . && return 1
+        return 0
+    fi
     while read -r repo_dir; do
         # `<HF_HOME>/hub/models--<repo>` is the hf_hub cache layout, so HF_HOME is two levels up.
         # A copy that is NOT under a `hub` directory is not a copy the library can read, and
