@@ -624,11 +624,17 @@ top_up_hf_cache_from_hub() {
     # download. The local check above stays unpinned on purpose — it must resolve `main` from the
     # local ref exactly like the engine does.
     local python_bin="$1" hf_home="$2" revision="$3"
+    # The weights are NEVER downloaded here. Only a cache whose shards are already complete reaches
+    # this line, so the files it misses are small ones. The pattern is what makes the pin safe: a
+    # commit that lands between the check and this call cannot cost 23 GB of weights, past the disk
+    # floor that guards every other download.
     HF_HOME="${hf_home}" HF_HUB_OFFLINE=0 DOLPHIN_HF_MODEL="${MODEL}" DOLPHIN_HF_REVISION="${revision}" \
+        DOLPHIN_HF_IGNORE="*.safetensors" \
         run_with_timeout "${HF_OFFLINE_TOP_UP_TIMEOUT_S}" "${python_bin}" -c '
 import os
 from huggingface_hub import snapshot_download
-snapshot_download(os.environ["DOLPHIN_HF_MODEL"], revision=os.environ["DOLPHIN_HF_REVISION"])
+snapshot_download(os.environ["DOLPHIN_HF_MODEL"], revision=os.environ["DOLPHIN_HF_REVISION"],
+                  ignore_patterns=[os.environ["DOLPHIN_HF_IGNORE"]])
 ' >/dev/null 2>&1
 }
 
@@ -754,11 +760,16 @@ sync_hf_offline_with_cache() {
 }
 
 hf_offline_is_armed() {
-    local site_dir
+    # EVERY runtime, not any of them. The worker leaves the old runtime in place when it installs a
+    # new one, and the new one starts without the switch. Reading "armed" off the old runtime while
+    # its engine still serves would skip the new one for good, and its first engine start would go
+    # back to the Hub — the rate limit this switch exists to avoid.
+    local site_dir found=0
     while read -r site_dir; do
-        [[ -f "${site_dir}/${HF_OFFLINE_PTH_NAME}" ]] && return 0
+        [[ -f "${site_dir}/${HF_OFFLINE_PTH_NAME}" ]] || return 1
+        found=1
     done < <(worker_runtime_site_packages_dirs)
-    return 1
+    (( found ))
 }
 
 # The cache check is one opinion about whether this node can run offline. A serving engine is the

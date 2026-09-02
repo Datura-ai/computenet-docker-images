@@ -772,7 +772,7 @@ install_stub_python() {
 #!/usr/bin/env bash
 echo "\${HF_HUB_OFFLINE}:\${HF_HOME}" >>"${SANDBOX}/hf_calls"
 if [[ "\${HF_HUB_OFFLINE}" == "0" ]]; then
-    echo "revision=\${DOLPHIN_HF_REVISION}" >>"${SANDBOX}/hf_calls"
+    echo "revision=\${DOLPHIN_HF_REVISION} ignore=\${DOLPHIN_HF_IGNORE}" >>"${SANDBOX}/hf_calls"
     ${1:-touch "${SANDBOX}/topped_up"}
     exit \${ONLINE_EXIT:-0}
 fi
@@ -805,7 +805,9 @@ test_hf_offline_waits_for_the_library() {
         "$(grep -c "1:${SHARED_CACHE}/dolphinpod-worker/cache\$" "${SANDBOX}/hf_calls")"
     # Unpinned, the online call resolves `main` at call time. A commit published upstream in that
     # moment would make it fetch the new weights — 23 GB, past the disk floor.
-    assert_eq "the top-up is pinned to the cached commit" "revision=deadbeef" \
+    # Pinned, and unable to fetch a shard even so: a commit that lands between the check and the
+    # call must never cost 23 GB of weights.
+    assert_eq "the top-up is pinned and cannot fetch weights" "revision=deadbeef ignore=*.safetensors" \
         "$(grep '^revision=' "${SANDBOX}/hf_calls" | head -1)"
 
     # Armed AND an engine serves: the files are proven good, so no interpreter runs on later cycles.
@@ -852,6 +854,12 @@ STUB
     sync_hf_offline_with_cache
     assert_eq "one runnable runtime does not excuse a half-installed sibling" "no" \
         "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+
+    # A runtime the worker has just installed carries no switch yet. Reading "armed" off the old
+    # one would skip the new one for good, and its first engine start would go back to the Hub.
+    touch "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    assert_eq "a runtime without the switch means not armed" "no" \
+        "$(hf_offline_is_armed && echo yes || echo no)"
 }
 
 test_hf_offline_needs_a_cache_the_library_can_read() {
