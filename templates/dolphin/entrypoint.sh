@@ -588,11 +588,15 @@ worker_runtime_pythons() {
 run_with_timeout() {
     local seconds="$1"
     shift
+    # Background + wait, for the same reason interruptible_sleep does it: bash holds the TERM trap
+    # until a FOREGROUND command returns, and `docker stop` gives this container 15 s before the
+    # kill. A library call in the foreground would spend a customer's rent teardown waiting.
     if command -v timeout >/dev/null 2>&1; then
-        timeout "${seconds}" "$@"
+        timeout "${seconds}" "$@" &
     else
-        "$@"
+        "$@" &
     fi
+    wait $!
 }
 
 # DAH-2843: whether the LIBRARY accepts the local cache, asked of the library itself.
@@ -647,6 +651,14 @@ hf_cache_is_engine_ready() {
         worker_runtime_site_packages_dirs | grep -q . && return 1
         return 0
     fi
+    # The switch is written into EVERY runtime's site-packages, so every one of them must have an
+    # interpreter that could be asked. One runnable runtime beside a half-installed one would
+    # otherwise hand the switch to a library that never approved the cache.
+    local site_dir
+    while read -r site_dir; do
+        # `<runtime>/lib/pythonX.Y/site-packages` -> `<runtime>`.
+        [[ -x "${site_dir%/lib/*}/bin/python" ]] || return 1
+    done < <(worker_runtime_site_packages_dirs)
     while read -r repo_dir; do
         # `<HF_HOME>/hub/models--<repo>` is the hf_hub cache layout, so HF_HOME is two levels up.
         # A copy that is NOT under a `hub` directory is not a copy the library can read, and

@@ -839,6 +839,19 @@ test_a_half_installed_runtime_never_arms() {
     sync_hf_offline_with_cache
     assert_eq "a runtime with no interpreter keeps the Hub" "no" \
         "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+
+    # A second runtime that CAN be asked does not excuse the first: the switch is written into
+    # every site-packages, so a runtime nothing asked would still receive it.
+    local old_runtime="${DOLPHIN_HOME}/runtimes/text-old"
+    mkdir -p "${old_runtime}/lib/python3.12/site-packages" "${old_runtime}/bin"
+    cat >"${old_runtime}/bin/python" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "${old_runtime}/bin/python"
+    sync_hf_offline_with_cache
+    assert_eq "one runnable runtime does not excuse a half-installed sibling" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
 }
 
 test_hf_offline_needs_a_cache_the_library_can_read() {
