@@ -273,6 +273,42 @@ STUB
         "$(grep -o '"spawns":[0-9]*' "${DOLPHIN_WORKER_SPAWN_STATE}" 2>/dev/null | head -1)"
 }
 
+# ------------------------------------- DAH-2843: a respawn is spaced out like a cold start
+test_respawns_are_staggered() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export DOLPHIN_WORKER_SPAWN_STATE="${SANDBOX}/spawns.json"
+    mkdir -p "${DOLPHIN_HOME}"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<'STUB'
+#!/usr/bin/env bash
+sleep 30
+STUB
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+    load_entrypoint
+    GPU_SETS=("0,1" "2,3")
+    INSTANCE_HOMES=("${SANDBOX}/home" "${SANDBOX}/home")
+
+    # Before anything ran, the gate must let the first worker through.
+    assert_eq "the first spawn is never held back" "yes" \
+        "$(if (( SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS )); then echo yes; else echo no; fi)"
+
+    spawn_instance 0
+    kill "${WORKER_PIDS[0]}" 2>/dev/null
+    # Four workers that die together used to come back together and read the same 23 GB at once.
+    assert_eq "a sibling waits its turn in the same cycle" "no" \
+        "$(if (( SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS )); then echo yes; else echo no; fi)"
+
+    # The gate is a timestamp, so the wait costs nothing: a later cycle lets the sibling in.
+    LAST_SPAWN_AT=$(( SECONDS - SPLIT_STAGGER_SECONDS ))
+    assert_eq "a later cycle lets the sibling in" "yes" \
+        "$(if (( SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS )); then echo yes; else echo no; fi)"
+
+    # Driving the expression here would still pass if someone dropped it from the loop.
+    assert_eq "the supervisor gates every respawn on it" "1" \
+        "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
+            | grep -c 'SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS')"
+}
+
 # ------------------------------------- backoff keys on "served", not on how long the worker lived
 test_backoff_counts_a_long_dead_download_as_failed() {
     make_sandbox
@@ -968,6 +1004,7 @@ test_hf_offline_waits_for_the_library
 test_hf_offline_stays_off_when_the_top_up_fails
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
+test_respawns_are_staggered
 test_worker_logs_are_per_container_and_pruned
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
 test_binary_download_asks_curl_to_retry_within_time_bounds

@@ -381,6 +381,9 @@ WORKER_SERVED=()
 WORKER_FAST_EXITS=()
 WORKER_NEXT_SPAWN_AT=()
 WORKER_EXITED_AT=()
+# DAH-2843: when the last worker of this container was spawned, cold start or respawn.
+# -SPLIT_STAGGER_SECONDS so the very first spawn is never held back.
+LAST_SPAWN_AT=$(( -SPLIT_STAGGER_SECONDS ))
 WATCHDOG_PIDS=()
 SIDECAR_PID=""
 # Self-heal state for the offline switch: how many cycles have passed with the switch on and no
@@ -808,6 +811,7 @@ spawn_instance() {
     echo "[dolphin] worker [${GPU_SETS[$idx]}] spawn #${WORKER_SPAWNS[$idx]}, log ${log}" >&2
     (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) >>"${log}" 2>&1 &
     WORKER_PIDS[idx]=$!
+    LAST_SPAWN_AT=${SECONDS}
 }
 
 # DAH-2551: the wait is BOUNDED. A customer rent blocks on this teardown, and the old
@@ -958,6 +962,13 @@ supervise_running_workers_until_new_binary_published() {
                 download_floor_blocks_spawn && spawn_is_held_back_by_disk=1
             fi
             (( spawn_is_held_back_by_disk )) && continue
+            # DAH-2843: the cold start spaces the workers out, the respawn used to bring them all
+            # back in one cycle. On 2026-09-02 an 8x RTX 6000 Ada node with 4 workers read the same
+            # 23 GB of weights four times at once: `Loading weights took 278.81 seconds`, and the
+            # worker kills a backend that is not ready in 10 minutes, so the node never left the
+            # loop. Same gate as the cold start, and it is a timestamp rather than a sleep, so a
+            # held-back respawn never delays a sibling's liveness check.
+            (( SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS )) || continue
             unset "WORKER_EXITED_AT[$i]"
             refresh_binary
             spawn_instance "${i}"
