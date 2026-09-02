@@ -576,7 +576,10 @@ worker_runtime_site_packages_dirs() {
 worker_runtime_pythons() {
     # The interpreter beside every runtime's site-packages. It is the ONLY copy of huggingface_hub
     # that matters, because it is the one the engine imports.
-    find "${DOLPHIN_HOME}/runtimes" -maxdepth 3 -type f -name python -perm -u+x 2>/dev/null
+    # `-type l` is not optional: the runtime ships `bin/python` as a symlink to `bin/python3.12`
+    # (checked on a prod node 2026-09-02), so a plain `-type f` finds nothing and the whole check
+    # silently turns into "no runtime" — which arms the switch, the very bug this is here to fix.
+    find "${DOLPHIN_HOME}/runtimes" -maxdepth 3 -name python \( -type f -o -type l \) 2>/dev/null
 }
 
 # `timeout` is coreutils, and the test suite also runs outside the image (a Mac has no timeout),
@@ -624,11 +627,16 @@ snapshot_download(os.environ["DOLPHIN_HF_MODEL"])
 # the same: the copy the engine opens is not knowable from here, and a wrong yes takes the node to
 # zero tokens for the life of the container.
 hf_cache_is_engine_ready() {
-    local python_bin repo_dir hf_home ready=1
-    python_bin="$(worker_runtime_pythons | head -1)"
+    local python_bin repo_dir hf_home ready=1 pythons=()
+    # EVERY runtime, not the first one: the worker leaves the old runtime in place when it updates
+    # itself, and the switch is written into the site-packages of both. An old library that accepts
+    # the cache would then arm the new one against a cache the new one rejects.
+    while read -r python_bin; do
+        [[ -x "${python_bin}" ]] && pythons+=("${python_bin}")
+    done < <(worker_runtime_pythons)
     # No runtime yet (cold container): the library cannot be asked, and there is no site-packages
     # to arm either. The file check above is then the whole answer, exactly as before this change.
-    [[ -n "${python_bin}" ]] || return 0
+    (( ${#pythons[@]} )) || return 0
     while read -r repo_dir; do
         # `<HF_HOME>/hub/models--<repo>` is the hf_hub cache layout, so HF_HOME is two levels up.
         # A copy that is NOT under a `hub` directory is not a copy the library can read, and
@@ -636,19 +644,21 @@ hf_cache_is_engine_ready() {
         # a 23 GB download of the weights, past the disk floor that guards every other download.
         [[ "${repo_dir%/*}" == */hub ]] || continue
         hf_home="${repo_dir%/*/*}"
-        hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" && continue
-        # The wait blocks the supervisor, so it is rationed. Until the next attempt is due the
-        # answer is simply no, and offline mode stays off.
-        if (( SECONDS - LAST_HF_TOP_UP_AT < HF_OFFLINE_TOP_UP_MIN_INTERVAL_S )); then
-            ready=0
-            continue
-        fi
-        echo "[dolphin] the HF library refuses the cache under ${hf_home}; fetching what it misses before offline mode arms" >&2
-        LAST_HF_TOP_UP_AT=${SECONDS}
-        # A failed top-up (a rate limit, a Hub outage) leaves the switch off, which is what the
-        # node did before DAH-2743 — never worse than today.
-        top_up_hf_cache_from_hub "${python_bin}" "${hf_home}" || { ready=0; continue; }
-        hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" || ready=0
+        for python_bin in "${pythons[@]}"; do
+            hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" && continue
+            # The wait blocks the supervisor, so it is rationed. Until the next attempt is due the
+            # answer is simply no, and offline mode stays off.
+            if (( SECONDS - LAST_HF_TOP_UP_AT < HF_OFFLINE_TOP_UP_MIN_INTERVAL_S )); then
+                ready=0
+                continue
+            fi
+            echo "[dolphin] the HF library refuses the cache under ${hf_home}; fetching what it misses before offline mode arms" >&2
+            LAST_HF_TOP_UP_AT=${SECONDS}
+            # A failed top-up (a rate limit, a Hub outage) leaves the switch off, which is what the
+            # node did before DAH-2743 — never worse than today.
+            top_up_hf_cache_from_hub "${python_bin}" "${hf_home}" || { ready=0; continue; }
+            hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" || ready=0
+        done
     done < <(model_cache_repo_dirs)
     (( ready ))
 }
@@ -702,9 +712,12 @@ sync_hf_offline_with_cache() {
         disable_hf_offline
         return 0
     fi
-    # Already armed against a complete cache: nothing left to decide, and no interpreter to start
-    # on a cycle that runs every 30 s.
-    hf_offline_is_armed && return 0
+    # An armed switch is trusted only while an engine serves: that proves the local files ARE the
+    # files the engine needs, and it costs no interpreter on a healthy node's 30 s cycle. A node
+    # that carries the switch over from an earlier container — every node broken on 2026-09-02 —
+    # has no engine, so it is checked again and repaired instead of staying offline against a
+    # cache the library rejects.
+    hf_offline_is_armed && engine_socket_present && return 0
     if hf_cache_is_engine_ready; then
         enable_hf_offline
     else

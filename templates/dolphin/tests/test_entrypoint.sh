@@ -785,6 +785,7 @@ test_hf_offline_waits_for_the_library() {
     local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
     offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
     install_stub_python
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
     seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
         "model-00003-of-00003.safetensors"
 
@@ -799,11 +800,21 @@ test_hf_offline_waits_for_the_library() {
     assert_eq "HF_HOME is the cache root, not the repo dir" "2" \
         "$(grep -c "1:${SHARED_CACHE}/dolphinpod-worker/cache\$" "${SANDBOX}/hf_calls")"
 
-    # Armed and complete: the decision is made, so no interpreter runs on later cycles.
+    # Armed AND an engine serves: the files are proven good, so no interpreter runs on later cycles.
+    mkdir -p "${SANDBOX}/dp-1/" && touch "${SANDBOX}/dp-1/v.sock"
     local calls_before
     calls_before="$(wc -l <"${SANDBOX}/hf_calls")"
     sync_hf_offline_with_cache
-    assert_eq "an armed switch costs no python start" "${calls_before}" "$(wc -l <"${SANDBOX}/hf_calls")"
+    assert_eq "an armed switch with a serving engine costs no python start" "${calls_before}" \
+        "$(wc -l <"${SANDBOX}/hf_calls")"
+
+    # The 2026-09-02 shape: the switch survives in the runtime from an earlier container and no
+    # engine serves. The library must be asked again, or the node stays offline against a cache it
+    # rejects for the whole life of the container.
+    rm -f "${SANDBOX}/dp-1/v.sock" "${SANDBOX}/topped_up"
+    sync_hf_offline_with_cache
+    assert_eq "an armed switch with no engine is checked again" "yes" \
+        "$([[ "$(wc -l <"${SANDBOX}/hf_calls")" -gt "${calls_before}" ]] && echo yes || echo no)"
 }
 
 test_hf_offline_stays_off_when_the_top_up_fails() {
@@ -813,6 +824,7 @@ test_hf_offline_stays_off_when_the_top_up_fails() {
     mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
     local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
     install_stub_python "true"
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
     export ONLINE_EXIT=1
     seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
         "model-00003-of-00003.safetensors"
