@@ -614,12 +614,17 @@ snapshot_download(os.environ["DOLPHIN_HF_MODEL"], local_files_only=True)
 # One online pass over the same cache. The weights are already there, so it fetches kilobytes.
 # HF_HUB_OFFLINE is set to 0 explicitly: our .pth uses setdefault, so an existing value wins.
 top_up_hf_cache_from_hub() {
-    local python_bin="$1" hf_home="$2"
-    HF_HOME="${hf_home}" HF_HUB_OFFLINE=0 DOLPHIN_HF_MODEL="${MODEL}" \
+    # PINNED to the commit the cache already holds. Unpinned, this resolves `main` at call time:
+    # a commit published upstream between the check and this line would make it fetch that commit
+    # instead, which is the full 23 GB of weights, past the disk floor that guards every other
+    # download. The local check above stays unpinned on purpose — it must resolve `main` from the
+    # local ref exactly like the engine does.
+    local python_bin="$1" hf_home="$2" revision="$3"
+    HF_HOME="${hf_home}" HF_HUB_OFFLINE=0 DOLPHIN_HF_MODEL="${MODEL}" DOLPHIN_HF_REVISION="${revision}" \
         run_with_timeout "${HF_OFFLINE_TOP_UP_TIMEOUT_S}" "${python_bin}" -c '
 import os
 from huggingface_hub import snapshot_download
-snapshot_download(os.environ["DOLPHIN_HF_MODEL"])
+snapshot_download(os.environ["DOLPHIN_HF_MODEL"], revision=os.environ["DOLPHIN_HF_REVISION"])
 ' >/dev/null 2>&1
 }
 
@@ -627,7 +632,7 @@ snapshot_download(os.environ["DOLPHIN_HF_MODEL"])
 # the same: the copy the engine opens is not knowable from here, and a wrong yes takes the node to
 # zero tokens for the life of the container.
 hf_cache_is_engine_ready() {
-    local python_bin repo_dir hf_home ready=1 pythons=()
+    local python_bin repo_dir hf_home revision ready=1 asked=0 pythons=()
     # EVERY runtime, not the first one: the worker leaves the old runtime in place when it updates
     # itself, and the switch is written into the site-packages of both. An old library that accepts
     # the cache would then arm the new one against a cache the new one rejects.
@@ -644,6 +649,9 @@ hf_cache_is_engine_ready() {
         # a 23 GB download of the weights, past the disk floor that guards every other download.
         [[ "${repo_dir%/*}" == */hub ]] || continue
         hf_home="${repo_dir%/*/*}"
+        [[ -f "${repo_dir}/refs/main" ]] || continue
+        revision="$(<"${repo_dir}/refs/main")"
+        asked=1
         for python_bin in "${pythons[@]}"; do
             hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" && continue
             # The wait blocks the supervisor, so it is rationed. Until the next attempt is due the
@@ -656,11 +664,14 @@ hf_cache_is_engine_ready() {
             LAST_HF_TOP_UP_AT=${SECONDS}
             # A failed top-up (a rate limit, a Hub outage) leaves the switch off, which is what the
             # node did before DAH-2743 — never worse than today.
-            top_up_hf_cache_from_hub "${python_bin}" "${hf_home}" || { ready=0; continue; }
+            top_up_hf_cache_from_hub "${python_bin}" "${hf_home}" "${revision}" || { ready=0; continue; }
             hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" || ready=0
         done
     done < <(model_cache_repo_dirs)
-    (( ready ))
+    # No copy could be asked at all — every one sits outside a `hub` directory, or holds no ref.
+    # Arming on that would be the old file-only decision under a new name, so the answer is no and
+    # the node keeps the Hub: a slower start, never a dead engine.
+    (( asked && ready ))
 }
 
 enable_hf_offline() {

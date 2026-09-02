@@ -769,6 +769,7 @@ install_stub_python() {
 #!/usr/bin/env bash
 echo "\${HF_HUB_OFFLINE}:\${HF_HOME}" >>"${SANDBOX}/hf_calls"
 if [[ "\${HF_HUB_OFFLINE}" == "0" ]]; then
+    echo "revision=\${DOLPHIN_HF_REVISION}" >>"${SANDBOX}/hf_calls"
     ${1:-touch "${SANDBOX}/topped_up"}
     exit \${ONLINE_EXIT:-0}
 fi
@@ -799,6 +800,10 @@ test_hf_offline_waits_for_the_library() {
     # library resolves <HF_HOME>/hub/models--<repo> itself and cannot be handed the repo dir.
     assert_eq "HF_HOME is the cache root, not the repo dir" "2" \
         "$(grep -c "1:${SHARED_CACHE}/dolphinpod-worker/cache\$" "${SANDBOX}/hf_calls")"
+    # Unpinned, the online call resolves `main` at call time. A commit published upstream in that
+    # moment would make it fetch the new weights — 23 GB, past the disk floor.
+    assert_eq "the top-up is pinned to the cached commit" "revision=deadbeef" \
+        "$(grep '^revision=' "${SANDBOX}/hf_calls" | head -1)"
 
     # Armed AND an engine serves: the files are proven good, so no interpreter runs on later cycles.
     mkdir -p "${SANDBOX}/dp-1/" && touch "${SANDBOX}/dp-1/v.sock"
@@ -815,6 +820,25 @@ test_hf_offline_waits_for_the_library() {
     sync_hf_offline_with_cache
     assert_eq "an armed switch with no engine is checked again" "yes" \
         "$([[ "$(wc -l <"${SANDBOX}/hf_calls")" -gt "${calls_before}" ]] && echo yes || echo no)"
+}
+
+test_hf_offline_needs_a_cache_the_library_can_read() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # Move the whole cache out of `hub`. The library resolves <HF_HOME>/hub/models--<repo> and
+    # reads nothing here, so arming offline mode would leave the engine with no weights it can open.
+    mv "${SHARED_CACHE}/dolphinpod-worker/cache/hub" "${SHARED_CACHE}/dolphinpod-worker/cache/notahub"
+    sync_hf_offline_with_cache
+    assert_eq "a cache the library cannot read keeps the Hub" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
 }
 
 test_hf_offline_stays_off_when_the_top_up_fails() {
@@ -1019,6 +1043,7 @@ test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later
 test_hf_offline_self_heals_when_no_engine_serves
 test_hf_offline_waits_for_the_library
+test_hf_offline_needs_a_cache_the_library_can_read
 test_hf_offline_stays_off_when_the_top_up_fails
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
