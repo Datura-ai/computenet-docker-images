@@ -819,6 +819,32 @@ test_hf_offline_self_heals_when_no_engine_serves() {
 }
 
 
+# ---------------------------------------------------------------- DAH-2824 download retry
+test_binary_download_asks_curl_to_retry_within_time_bounds() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}"
+    load_entrypoint
+
+    # Regression guard for the 429 rollout burst of 2026-09-01: the stub records the flags rather
+    # than the transfer, because what failed then was curl never being asked to retry at all.
+    cat >"${SANDBOX}/bin/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >"${SANDBOX}/curl-args.log"
+echo binary >"\${@: -1}"
+EOF
+    chmod +x "${SANDBOX}/bin/curl"
+
+    download_worker_binary
+    assert_eq "downloaded binary lands in place" "yes" \
+        "$([[ -x "${DOLPHIN_HOME}/dolphinpod-worker" ]] && echo yes || echo no)"
+    local flag
+    for flag in --retry --retry-max-time --max-time; do
+        assert_eq "download curl carries ${flag}" "yes" \
+            "$(grep -qx -- "${flag}" "${SANDBOX}/curl-args.log" && echo yes || echo no)"
+    done
+}
+
 # ---------------------------------------------------------------- DAH-2805 download temporaries
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete() {
     make_sandbox
@@ -874,6 +900,7 @@ test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
 test_worker_logs_are_per_container_and_pruned
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
+test_binary_download_asks_curl_to_retry_within_time_bounds
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"
