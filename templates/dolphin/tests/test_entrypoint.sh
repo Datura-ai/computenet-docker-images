@@ -721,6 +721,74 @@ test_hf_offline_is_re_evaluated_later() {
             | grep -c 'sync_hf_offline_with_cache_and_engines')"
 }
 
+# --- DAH-2843: the library, not our file list, decides whether offline mode may arm ------------
+
+# A stand-in for the runtime interpreter. It answers like huggingface_hub 1.29 does: the local
+# cache is refused until an online pass has run once. The mode is read from HF_HUB_OFFLINE, and
+# the online pass leaves a marker, so the sequence check -> top-up -> check is observable.
+install_stub_python() {
+    local runtime_bin="${DOLPHIN_HOME}/runtimes/text-v/bin"
+    mkdir -p "${runtime_bin}"
+    cat >"${runtime_bin}/python" <<EOF
+#!/usr/bin/env bash
+echo "\${HF_HUB_OFFLINE}:\${HF_HOME}" >>"${SANDBOX}/hf_calls"
+if [[ "\${HF_HUB_OFFLINE}" == "0" ]]; then
+    ${1:-touch "${SANDBOX}/topped_up"}
+    exit \${ONLINE_EXIT:-0}
+fi
+[[ -f "${SANDBOX}/topped_up" ]]
+EOF
+    chmod +x "${runtime_bin}/python"
+}
+
+test_hf_offline_waits_for_the_library() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
+    install_stub_python
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # The weights are all there, so the old check said "complete" and armed the switch at once.
+    # The library still refuses the cache until the small files of the commit are fetched.
+    sync_hf_offline_with_cache
+    assert_eq "the missing small files are fetched once" "yes" \
+        "$([[ -f "${SANDBOX}/topped_up" ]] && echo yes || echo no)"
+    assert_eq "offline mode arms after the library accepts the cache" "yes" "$(offline_mode_on)"
+    # Two offline calls, one before the top-up and one after, both against the cache ROOT: the
+    # library resolves <HF_HOME>/hub/models--<repo> itself and cannot be handed the repo dir.
+    assert_eq "HF_HOME is the cache root, not the repo dir" "2" \
+        "$(grep -c "1:${SHARED_CACHE}/dolphinpod-worker/cache\$" "${SANDBOX}/hf_calls")"
+
+    # Armed and complete: the decision is made, so no interpreter runs on later cycles.
+    local calls_before
+    calls_before="$(wc -l <"${SANDBOX}/hf_calls")"
+    sync_hf_offline_with_cache
+    assert_eq "an armed switch costs no python start" "${calls_before}" "$(wc -l <"${SANDBOX}/hf_calls")"
+}
+
+test_hf_offline_stays_off_when_the_top_up_fails() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python "true"
+    export ONLINE_EXIT=1
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # A Hub that answers 429 (the 2026-09-02 outage) must leave the node exactly as it was:
+    # online, able to try again, never armed against a cache the engine cannot open.
+    sync_hf_offline_with_cache
+    assert_eq "a failed top-up keeps the Hub reachable" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+    unset ONLINE_EXIT
+}
+
 test_only_the_snapshot_under_the_ref_counts() {
     make_sandbox
     load_entrypoint
@@ -896,6 +964,8 @@ test_enable_hf_offline
 test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later
 test_hf_offline_self_heals_when_no_engine_serves
+test_hf_offline_waits_for_the_library
+test_hf_offline_stays_off_when_the_top_up_fails
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
 test_worker_logs_are_per_container_and_pruned

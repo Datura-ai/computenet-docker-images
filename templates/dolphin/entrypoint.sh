@@ -75,6 +75,10 @@ HF_OFFLINE_PTH_NAME="zz-dolphin-hf-offline.pth"
 # itself is treated as the cause and taken off. 10 cycles is 5 minutes at LIVENESS_INTERVAL — well
 # past a normal engine start (measured 2 min on a warm 8xH100 node) and far short of a shift.
 HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE=10
+# DAH-2843: seconds the two huggingface_hub calls that decide the switch may take. The local check
+# only reads the cache; the top-up fetches the small files of the commit, never the weights.
+HF_OFFLINE_CHECK_TIMEOUT_S=90
+HF_OFFLINE_TOP_UP_TIMEOUT_S=300
 # Worker stdout/stderr go to a file on the shared cache volume. The container log lives on the
 # miner's host, which the platform cannot read, so a failed cold start used to leave no evidence
 # at all (2026-08-24: two prod nodes redownloaded the runtime in a respawn loop for 110 minutes
@@ -560,6 +564,75 @@ worker_runtime_site_packages_dirs() {
     find "${DOLPHIN_HOME}/runtimes" -maxdepth 4 -type d -name site-packages 2>/dev/null
 }
 
+worker_runtime_pythons() {
+    # The interpreter beside every runtime's site-packages. It is the ONLY copy of huggingface_hub
+    # that matters, because it is the one the engine imports.
+    find "${DOLPHIN_HOME}/runtimes" -maxdepth 3 -type f -name python -perm -u+x 2>/dev/null
+}
+
+# `timeout` is coreutils, and the test suite also runs outside the image (a Mac has no timeout),
+# so it is used when it is there and skipped when it is not — the same reason the df reader avoids
+# GNU-only flags.
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${seconds}" "$@"
+    else
+        "$@"
+    fi
+}
+
+# DAH-2843: whether the LIBRARY accepts the local cache, asked of the library itself.
+# Our own file list cannot answer this. huggingface_hub 1.29 (inside the runtime the worker
+# downloaded on 2026-09-01) also demands the small files of the commit — README.md, .gitattributes
+# — and raises IncompleteSnapshotError without them. The Hub commit of 2026-08-29 changed only
+# README.md, so on 2026-09-02 every node that had armed the switch died on the first engine start
+# while its 23 GB of weights sat complete on disk.
+hf_hub_accepts_local_cache() {
+    local python_bin="$1" hf_home="$2"
+    HF_HOME="${hf_home}" HF_HUB_OFFLINE=1 DOLPHIN_HF_MODEL="${MODEL}" \
+        run_with_timeout "${HF_OFFLINE_CHECK_TIMEOUT_S}" "${python_bin}" -c '
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(os.environ["DOLPHIN_HF_MODEL"], local_files_only=True)
+' >/dev/null 2>&1
+}
+
+# One online pass over the same cache. The weights are already there, so it fetches kilobytes.
+# HF_HUB_OFFLINE is set to 0 explicitly: our .pth uses setdefault, so an existing value wins.
+top_up_hf_cache_from_hub() {
+    local python_bin="$1" hf_home="$2"
+    HF_HOME="${hf_home}" HF_HUB_OFFLINE=0 DOLPHIN_HF_MODEL="${MODEL}" \
+        run_with_timeout "${HF_OFFLINE_TOP_UP_TIMEOUT_S}" "${python_bin}" -c '
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(os.environ["DOLPHIN_HF_MODEL"])
+' >/dev/null 2>&1
+}
+
+# EVERY copy of the model must satisfy the library, for the reason model_cache_is_complete demands
+# the same: the copy the engine opens is not knowable from here, and a wrong yes takes the node to
+# zero tokens for the life of the container.
+hf_cache_is_engine_ready() {
+    local python_bin repo_dir hf_home ready=1
+    python_bin="$(worker_runtime_pythons | head -1)"
+    # No runtime yet (cold container): the library cannot be asked, and there is no site-packages
+    # to arm either. The file check above is then the whole answer, exactly as before this change.
+    [[ -n "${python_bin}" ]] || return 0
+    while read -r repo_dir; do
+        # `<HF_HOME>/hub/models--<repo>` is the hf_hub cache layout, so HF_HOME is two levels up.
+        hf_home="${repo_dir%/*/*}"
+        hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" && continue
+        echo "[dolphin] the HF library refuses the cache under ${hf_home}; fetching what it misses before offline mode arms" >&2
+        # A failed top-up (a rate limit, a Hub outage) leaves the switch off, which is what the
+        # node did before DAH-2743 — never worse than today.
+        top_up_hf_cache_from_hub "${python_bin}" "${hf_home}" || { ready=0; continue; }
+        hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" || ready=0
+    done < <(model_cache_repo_dirs)
+    (( ready ))
+}
+
 enable_hf_offline() {
     # Python runs every `import` line of a .pth file in site-packages at interpreter startup, so
     # the switch reaches a child whose environment the worker rebuilt without it.
@@ -605,7 +678,14 @@ disable_hf_offline() {
 }
 
 sync_hf_offline_with_cache() {
-    if model_cache_is_complete; then
+    if ! model_cache_is_complete; then
+        disable_hf_offline
+        return 0
+    fi
+    # Already armed against a complete cache: nothing left to decide, and no interpreter to start
+    # on a cycle that runs every 30 s.
+    hf_offline_is_armed && return 0
+    if hf_cache_is_engine_ready; then
         enable_hf_offline
     else
         disable_hf_offline
