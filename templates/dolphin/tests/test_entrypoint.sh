@@ -273,6 +273,42 @@ STUB
         "$(grep -o '"spawns":[0-9]*' "${DOLPHIN_WORKER_SPAWN_STATE}" 2>/dev/null | head -1)"
 }
 
+# ------------------------------------- DAH-2843: a respawn is spaced out like a cold start
+test_respawns_are_staggered() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export DOLPHIN_WORKER_SPAWN_STATE="${SANDBOX}/spawns.json"
+    mkdir -p "${DOLPHIN_HOME}"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<'STUB'
+#!/usr/bin/env bash
+sleep 30
+STUB
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+    load_entrypoint
+    GPU_SETS=("0,1" "2,3")
+    INSTANCE_HOMES=("${SANDBOX}/home" "${SANDBOX}/home")
+
+    # Before anything ran, the gate must let the first worker through.
+    assert_eq "the first spawn is never held back" "yes" \
+        "$(if (( SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS )); then echo yes; else echo no; fi)"
+
+    spawn_instance 0
+    kill "${WORKER_PIDS[0]}" 2>/dev/null
+    # Four workers that die together used to come back together and read the same 23 GB at once.
+    assert_eq "a sibling waits its turn in the same cycle" "no" \
+        "$(if (( SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS )); then echo yes; else echo no; fi)"
+
+    # The gate is a timestamp, so the wait costs nothing: a later cycle lets the sibling in.
+    LAST_SPAWN_AT=$(( SECONDS - SPLIT_STAGGER_SECONDS ))
+    assert_eq "a later cycle lets the sibling in" "yes" \
+        "$(if (( SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS )); then echo yes; else echo no; fi)"
+
+    # Driving the expression here would still pass if someone dropped it from the loop.
+    assert_eq "the supervisor gates every respawn on it" "1" \
+        "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
+            | grep -c 'SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS')"
+}
+
 # ------------------------------------- backoff keys on "served", not on how long the worker lived
 test_backoff_counts_a_long_dead_download_as_failed() {
     make_sandbox
@@ -673,7 +709,8 @@ test_hf_offline_wiring() {
     DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
     local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
-
+    install_stub_python
+    touch "${SANDBOX}/topped_up"
     offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
 
     # Cold node: the cache must be seeded from the Hub, so the Hub stays reachable.
@@ -693,6 +730,8 @@ test_hf_offline_is_re_evaluated_later() {
     DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
     local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    touch "${SANDBOX}/topped_up"
     offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
 
     # Measured on a real cold node 2026-08-21: the worker opens its engine socket about 30 s after
@@ -719,6 +758,180 @@ test_hf_offline_is_re_evaluated_later() {
     assert_eq "the supervisor re-checks it every cycle" "1" \
         "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
             | grep -c 'sync_hf_offline_with_cache_and_engines')"
+}
+
+# --- DAH-2843: the library, not our file list, decides whether offline mode may arm ------------
+
+# A stand-in for the runtime interpreter. It answers like huggingface_hub 1.29 does: the local
+# cache is refused until an online pass has run once. The mode is read from HF_HUB_OFFLINE, and
+# the online pass leaves a marker, so the sequence check -> top-up -> check is observable.
+install_stub_python() {
+    local runtime_bin="${DOLPHIN_HOME}/runtimes/text-v/bin"
+    mkdir -p "${runtime_bin}"
+    cat >"${runtime_bin}/python" <<EOF
+#!/usr/bin/env bash
+echo "\${HF_HUB_OFFLINE}:\${HF_HOME}" >>"${SANDBOX}/hf_calls"
+if [[ "\${HF_HUB_OFFLINE}" == "0" ]]; then
+    echo "revision=\${DOLPHIN_HF_REVISION} ignore=\${DOLPHIN_HF_IGNORE}" >>"${SANDBOX}/hf_calls"
+    ${1:-touch "${SANDBOX}/topped_up"}
+    exit \${ONLINE_EXIT:-0}
+fi
+[[ -f "${SANDBOX}/topped_up" ]]
+EOF
+    chmod +x "${runtime_bin}/python"
+}
+
+test_hf_offline_waits_for_the_library() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
+    install_stub_python
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # The weights are all there, so the old check said "complete" and armed the switch at once.
+    # The library still refuses the cache until the small files of the commit are fetched.
+    sync_hf_offline_with_cache
+    assert_eq "the missing small files are fetched once" "yes" \
+        "$([[ -f "${SANDBOX}/topped_up" ]] && echo yes || echo no)"
+    assert_eq "offline mode arms after the library accepts the cache" "yes" "$(offline_mode_on)"
+    # Two offline calls, one before the top-up and one after, both against the cache ROOT: the
+    # library resolves <HF_HOME>/hub/models--<repo> itself and cannot be handed the repo dir.
+    assert_eq "HF_HOME is the cache root, not the repo dir" "2" \
+        "$(grep -c "1:${SHARED_CACHE}/dolphinpod-worker/cache\$" "${SANDBOX}/hf_calls")"
+    # Unpinned, the online call resolves `main` at call time. A commit published upstream in that
+    # moment would make it fetch the new weights — 23 GB, past the disk floor.
+    # Pinned, and unable to fetch a shard even so: a commit that lands between the check and the
+    # call must never cost 23 GB of weights.
+    assert_eq "the top-up is pinned and cannot fetch weights" \
+        "revision=deadbeef ignore=*.safetensors,*.bin,*.pth,*.pt,*.ckpt,*.gguf,*.h5,*.msgpack,*.onnx" \
+        "$(grep '^revision=' "${SANDBOX}/hf_calls" | head -1)"
+
+    # Armed AND an engine serves: the files are proven good, so no interpreter runs on later cycles.
+    mkdir -p "${SANDBOX}/dp-1/" && touch "${SANDBOX}/dp-1/v.sock"
+    local calls_before
+    calls_before="$(wc -l <"${SANDBOX}/hf_calls")"
+    sync_hf_offline_with_cache
+    assert_eq "an armed switch with a serving engine costs no python start" "${calls_before}" \
+        "$(wc -l <"${SANDBOX}/hf_calls")"
+
+    # The 2026-09-02 shape: the switch survives in the runtime from an earlier container and no
+    # engine serves. The library must be asked again, or the node stays offline against a cache it
+    # rejects for the whole life of the container.
+    rm -f "${SANDBOX}/dp-1/v.sock" "${SANDBOX}/topped_up"
+    sync_hf_offline_with_cache
+    assert_eq "an armed switch with no engine is checked again" "yes" \
+        "$([[ "$(wc -l <"${SANDBOX}/hf_calls")" -gt "${calls_before}" ]] && echo yes || echo no)"
+}
+
+test_a_half_installed_runtime_never_arms() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    # site-packages already on disk, the interpreter not yet. The switch is written into
+    # site-packages, so arming here would put it into a runtime that never approved the cache.
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    sync_hf_offline_with_cache
+    assert_eq "a runtime with no interpreter keeps the Hub" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+
+    # A second runtime that CAN be asked does not excuse the first: the switch is written into
+    # every site-packages, so a runtime nothing asked would still receive it.
+    local old_runtime="${DOLPHIN_HOME}/runtimes/text-old"
+    mkdir -p "${old_runtime}/lib/python3.12/site-packages" "${old_runtime}/bin"
+    cat >"${old_runtime}/bin/python" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "${old_runtime}/bin/python"
+    sync_hf_offline_with_cache
+    assert_eq "one runnable runtime does not excuse a half-installed sibling" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+
+    # A runtime the worker has just installed carries no switch yet. Reading "armed" off the old
+    # one would skip the new one for good, and its first engine start would go back to the Hub.
+    touch "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    assert_eq "a runtime without the switch means not armed" "no" \
+        "$(hf_offline_is_armed && echo yes || echo no)"
+}
+
+test_hf_offline_top_up_respects_the_disk_floor() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # A full shared volume takes every filler container on the node down with it, so the one
+    # download that was not behind the floor is behind it now.
+    mock_df_free_gb 1
+    sync_hf_offline_with_cache
+    assert_eq "a full disk holds back the top-up" "no" \
+        "$([[ -f "${SANDBOX}/topped_up" ]] && echo yes || echo no)"
+    assert_eq "a held-back top-up keeps the Hub" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+
+    mock_df_free_gb 900
+    sync_hf_offline_with_cache
+    assert_eq "room on the disk lets the top-up run" "yes" \
+        "$([[ -f "${SANDBOX}/topped_up" ]] && echo yes || echo no)"
+}
+
+test_hf_offline_needs_a_cache_the_library_can_read() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # Move the whole cache out of `hub`. The library resolves <HF_HOME>/hub/models--<repo> and
+    # reads nothing here, so arming offline mode would leave the engine with no weights it can open.
+    mv "${SHARED_CACHE}/dolphinpod-worker/cache/hub" "${SHARED_CACHE}/dolphinpod-worker/cache/notahub"
+    sync_hf_offline_with_cache
+    assert_eq "a cache the library cannot read keeps the Hub" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+}
+
+test_hf_offline_stays_off_when_the_top_up_fails() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python "true"
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    export ONLINE_EXIT=1
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # A Hub that answers 429 (the 2026-09-02 outage) must leave the node exactly as it was:
+    # online, able to try again, never armed against a cache the engine cannot open.
+    sync_hf_offline_with_cache
+    assert_eq "a failed top-up keeps the Hub reachable" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+
+    # The top-up blocks the supervisor for as long as it waits. A Hub that keeps answering 429
+    # must not buy that wait again on the very next 30 s cycle.
+    sync_hf_offline_with_cache
+    assert_eq "a failed top-up is not retried on the next cycle" "1" \
+        "$(grep -c '^0:' "${SANDBOX}/hf_calls")"
+    unset ONLINE_EXIT
 }
 
 test_only_the_snapshot_under_the_ref_counts() {
@@ -784,6 +997,8 @@ test_hf_offline_self_heals_when_no_engine_serves() {
     DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
     local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    touch "${SANDBOX}/topped_up"
     offline_mode_on() { [[ -f "${pth_file}" ]] && echo yes || echo no; }
     run_cycles() { local n="$1" i; for (( i = 0; i < n; i++ )); do sync_hf_offline_with_cache_and_engines; done; }
 
@@ -896,8 +1111,14 @@ test_enable_hf_offline
 test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later
 test_hf_offline_self_heals_when_no_engine_serves
+test_hf_offline_waits_for_the_library
+test_hf_offline_needs_a_cache_the_library_can_read
+test_hf_offline_top_up_respects_the_disk_floor
+test_a_half_installed_runtime_never_arms
+test_hf_offline_stays_off_when_the_top_up_fails
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
+test_respawns_are_staggered
 test_worker_logs_are_per_container_and_pruned
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
 test_binary_download_asks_curl_to_retry_within_time_bounds

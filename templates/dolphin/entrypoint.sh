@@ -75,6 +75,17 @@ HF_OFFLINE_PTH_NAME="zz-dolphin-hf-offline.pth"
 # itself is treated as the cause and taken off. 10 cycles is 5 minutes at LIVENESS_INTERVAL — well
 # past a normal engine start (measured 2 min on a warm 8xH100 node) and far short of a shift.
 HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE=10
+# DAH-2843: seconds the two huggingface_hub calls that decide the switch may take. The local check
+# only reads the cache; the top-up fetches the small files of the commit, never the weights.
+HF_OFFLINE_CHECK_TIMEOUT_S=90
+HF_OFFLINE_TOP_UP_TIMEOUT_S=300
+# The top-up runs INSIDE the supervisor cycle, so it holds back every liveness check and respawn
+# while it waits. A Hub that answers 429 would otherwise burn that wait on every 30 s cycle and
+# leave the node's workers unattended most of the time. One attempt per this many seconds.
+HF_OFFLINE_TOP_UP_MIN_INTERVAL_S=600
+# What the top-up may never fetch. Weights in any format the Hub carries, because the top-up exists
+# only to complete a cache whose weights are already there.
+HF_TOP_UP_IGNORE_PATTERNS="*.safetensors,*.bin,*.pth,*.pt,*.ckpt,*.gguf,*.h5,*.msgpack,*.onnx"
 # Worker stdout/stderr go to a file on the shared cache volume. The container log lives on the
 # miner's host, which the platform cannot read, so a failed cold start used to leave no evidence
 # at all (2026-08-24: two prod nodes redownloaded the runtime in a respawn loop for 110 minutes
@@ -377,6 +388,11 @@ WORKER_SERVED=()
 WORKER_FAST_EXITS=()
 WORKER_NEXT_SPAWN_AT=()
 WORKER_EXITED_AT=()
+# DAH-2843: when the last worker of this container was spawned, cold start or respawn.
+# -SPLIT_STAGGER_SECONDS so the very first spawn is never held back.
+LAST_SPAWN_AT=$(( -SPLIT_STAGGER_SECONDS ))
+# When the last online top-up of the HF cache ran. Negative so the first one is never held back.
+LAST_HF_TOP_UP_AT=$(( -HF_OFFLINE_TOP_UP_MIN_INTERVAL_S ))
 WATCHDOG_PIDS=()
 SIDECAR_PID=""
 # Self-heal state for the offline switch: how many cycles have passed with the switch on and no
@@ -560,6 +576,141 @@ worker_runtime_site_packages_dirs() {
     find "${DOLPHIN_HOME}/runtimes" -maxdepth 4 -type d -name site-packages 2>/dev/null
 }
 
+worker_runtime_pythons() {
+    # The interpreter beside every runtime's site-packages. It is the ONLY copy of huggingface_hub
+    # that matters, because it is the one the engine imports.
+    # `-type l` is not optional: the runtime ships `bin/python` as a symlink to `bin/python3.12`
+    # (checked on a prod node 2026-09-02), so a plain `-type f` finds nothing and the whole check
+    # silently turns into "no runtime" — which arms the switch, the very bug this is here to fix.
+    find "${DOLPHIN_HOME}/runtimes" -maxdepth 3 -name python \( -type f -o -type l \) 2>/dev/null
+}
+
+# `timeout` is coreutils, and the test suite also runs outside the image (a Mac has no timeout),
+# so it is used when it is there and skipped when it is not — the same reason the df reader avoids
+# GNU-only flags.
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    # Background + wait, for the same reason interruptible_sleep does it: bash holds the TERM trap
+    # until a FOREGROUND command returns, and `docker stop` gives this container 15 s before the
+    # kill. A library call in the foreground would spend a customer's rent teardown waiting.
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${seconds}" "$@" &
+    else
+        "$@" &
+    fi
+    wait $!
+}
+
+# DAH-2843: whether the LIBRARY accepts the local cache, asked of the library itself.
+# Our own file list cannot answer this. huggingface_hub 1.29 (inside the runtime the worker
+# downloaded on 2026-09-01) also demands the small files of the commit — README.md, .gitattributes
+# — and raises IncompleteSnapshotError without them. The Hub commit of 2026-08-29 changed only
+# README.md, so on 2026-09-02 every node that had armed the switch died on the first engine start
+# while its 23 GB of weights sat complete on disk.
+hf_hub_accepts_local_cache() {
+    local python_bin="$1" hf_home="$2"
+    HF_HOME="${hf_home}" HF_HUB_OFFLINE=1 DOLPHIN_HF_MODEL="${MODEL}" \
+        run_with_timeout "${HF_OFFLINE_CHECK_TIMEOUT_S}" "${python_bin}" -c '
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(os.environ["DOLPHIN_HF_MODEL"], local_files_only=True)
+' >/dev/null 2>&1
+}
+
+# One online pass over the same cache. The weights are already there, so it fetches kilobytes.
+# HF_HUB_OFFLINE is set to 0 explicitly: our .pth uses setdefault, so an existing value wins.
+top_up_hf_cache_from_hub() {
+    # PINNED to the commit the cache already holds. Unpinned, this resolves `main` at call time:
+    # a commit published upstream between the check and this line would make it fetch that commit
+    # instead, which is the full 23 GB of weights, past the disk floor that guards every other
+    # download. The local check above stays unpinned on purpose — it must resolve `main` from the
+    # local ref exactly like the engine does.
+    local python_bin="$1" hf_home="$2" revision="$3"
+    # The weights are NEVER downloaded here. Only a cache whose shards are already complete reaches
+    # this line, so the files it misses are small ones. The patterns are what make the pin safe: a
+    # commit that lands between the check and this call cannot cost gigabytes of weights.
+    # EVERY weight format is listed, not just safetensors: a repo can ship both, and a model that
+    # keeps `original/*.pth` beside its shards would pass our completeness check, be refused by the
+    # library for the missing .pth, and pull those gigabytes here.
+    HF_HOME="${hf_home}" HF_HUB_OFFLINE=0 DOLPHIN_HF_MODEL="${MODEL}" DOLPHIN_HF_REVISION="${revision}" \
+        DOLPHIN_HF_IGNORE="${HF_TOP_UP_IGNORE_PATTERNS}" \
+        run_with_timeout "${HF_OFFLINE_TOP_UP_TIMEOUT_S}" "${python_bin}" -c '
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(os.environ["DOLPHIN_HF_MODEL"], revision=os.environ["DOLPHIN_HF_REVISION"],
+                  ignore_patterns=os.environ["DOLPHIN_HF_IGNORE"].split(","))
+' >/dev/null 2>&1
+}
+
+# EVERY copy of the model must satisfy the library, for the reason model_cache_is_complete demands
+# the same: the copy the engine opens is not knowable from here, and a wrong yes takes the node to
+# zero tokens for the life of the container.
+hf_cache_is_engine_ready() {
+    local python_bin repo_dir hf_home revision free_gb ready=1 asked=0 pythons=()
+    # EVERY runtime, not the first one: the worker leaves the old runtime in place when it updates
+    # itself, and the switch is written into the site-packages of both. An old library that accepts
+    # the cache would then arm the new one against a cache the new one rejects.
+    while read -r python_bin; do
+        [[ -x "${python_bin}" ]] && pythons+=("${python_bin}")
+    done < <(worker_runtime_pythons)
+    # No interpreter to ask. On a cold container there is no site-packages to arm either, so the
+    # answer does not matter — enable_hf_offline writes no file. A HALF-INSTALLED runtime is the
+    # case that does matter: site-packages already on disk, interpreter not yet. Arming there puts
+    # the switch into a runtime whose library never approved the cache, which is this whole bug.
+    if (( ${#pythons[@]} == 0 )); then
+        worker_runtime_site_packages_dirs | grep -q . && return 1
+        return 0
+    fi
+    # The switch is written into EVERY runtime's site-packages, so every one of them must have an
+    # interpreter that could be asked. One runnable runtime beside a half-installed one would
+    # otherwise hand the switch to a library that never approved the cache.
+    local site_dir
+    while read -r site_dir; do
+        # `<runtime>/lib/pythonX.Y/site-packages` -> `<runtime>`.
+        [[ -x "${site_dir%/lib/*}/bin/python" ]] || return 1
+    done < <(worker_runtime_site_packages_dirs)
+    while read -r repo_dir; do
+        # `<HF_HOME>/hub/models--<repo>` is the hf_hub cache layout, so HF_HOME is two levels up.
+        # A copy that is NOT under a `hub` directory is not a copy the library can read, and
+        # handing its parent to snapshot_download would point the top-up at an empty cache root —
+        # a 23 GB download of the weights, past the disk floor that guards every other download.
+        [[ "${repo_dir%/*}" == */hub ]] || continue
+        hf_home="${repo_dir%/*/*}"
+        [[ -f "${repo_dir}/refs/main" ]] || continue
+        revision="$(<"${repo_dir}/refs/main")"
+        asked=1
+        for python_bin in "${pythons[@]}"; do
+            hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" && continue
+            # The wait blocks the supervisor, so it is rationed. Until the next attempt is due the
+            # answer is simply no, and offline mode stays off.
+            if (( SECONDS - LAST_HF_TOP_UP_AT < HF_OFFLINE_TOP_UP_MIN_INTERVAL_S )); then
+                ready=0
+                continue
+            fi
+            # The only download in this file that is not already behind the disk floor. It should
+            # fetch kilobytes, but "should" is what fills a disk, and a full shared volume takes
+            # every filler container on the node down with it.
+            free_gb="$(free_gb_on_shared_cache)"
+            if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
+                echo "[dolphin] only ${free_gb} GB free; not fetching what the HF library misses, so offline mode stays off" >&2
+                ready=0
+                continue
+            fi
+            echo "[dolphin] the HF library refuses the cache under ${hf_home}; fetching what it misses before offline mode arms" >&2
+            LAST_HF_TOP_UP_AT=${SECONDS}
+            # A failed top-up (a rate limit, a Hub outage) leaves the switch off, which is what the
+            # node did before DAH-2743 — never worse than today.
+            top_up_hf_cache_from_hub "${python_bin}" "${hf_home}" "${revision}" || { ready=0; continue; }
+            hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" || ready=0
+        done
+    done < <(model_cache_repo_dirs)
+    # No copy could be asked at all — every one sits outside a `hub` directory, or holds no ref.
+    # Arming on that would be the old file-only decision under a new name, so the answer is no and
+    # the node keeps the Hub: a slower start, never a dead engine.
+    (( asked && ready ))
+}
+
 enable_hf_offline() {
     # Python runs every `import` line of a .pth file in site-packages at interpreter startup, so
     # the switch reaches a child whose environment the worker rebuilt without it.
@@ -605,7 +756,17 @@ disable_hf_offline() {
 }
 
 sync_hf_offline_with_cache() {
-    if model_cache_is_complete; then
+    if ! model_cache_is_complete; then
+        disable_hf_offline
+        return 0
+    fi
+    # An armed switch is trusted only while an engine serves: that proves the local files ARE the
+    # files the engine needs, and it costs no interpreter on a healthy node's 30 s cycle. A node
+    # that carries the switch over from an earlier container — every node broken on 2026-09-02 —
+    # has no engine, so it is checked again and repaired instead of staying offline against a
+    # cache the library rejects.
+    hf_offline_is_armed && engine_socket_present && return 0
+    if hf_cache_is_engine_ready; then
         enable_hf_offline
     else
         disable_hf_offline
@@ -613,11 +774,16 @@ sync_hf_offline_with_cache() {
 }
 
 hf_offline_is_armed() {
-    local site_dir
+    # EVERY runtime, not any of them. The worker leaves the old runtime in place when it installs a
+    # new one, and the new one starts without the switch. Reading "armed" off the old runtime while
+    # its engine still serves would skip the new one for good, and its first engine start would go
+    # back to the Hub — the rate limit this switch exists to avoid.
+    local site_dir found=0
     while read -r site_dir; do
-        [[ -f "${site_dir}/${HF_OFFLINE_PTH_NAME}" ]] && return 0
+        [[ -f "${site_dir}/${HF_OFFLINE_PTH_NAME}" ]] || return 1
+        found=1
     done < <(worker_runtime_site_packages_dirs)
-    return 1
+    (( found ))
 }
 
 # The cache check is one opinion about whether this node can run offline. A serving engine is the
@@ -728,6 +894,7 @@ spawn_instance() {
     echo "[dolphin] worker [${GPU_SETS[$idx]}] spawn #${WORKER_SPAWNS[$idx]}, log ${log}" >&2
     (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) >>"${log}" 2>&1 &
     WORKER_PIDS[idx]=$!
+    LAST_SPAWN_AT=${SECONDS}
 }
 
 # DAH-2551: the wait is BOUNDED. A customer rent blocks on this teardown, and the old
@@ -878,6 +1045,13 @@ supervise_running_workers_until_new_binary_published() {
                 download_floor_blocks_spawn && spawn_is_held_back_by_disk=1
             fi
             (( spawn_is_held_back_by_disk )) && continue
+            # DAH-2843: the cold start spaces the workers out, the respawn used to bring them all
+            # back in one cycle. On 2026-09-02 an 8x RTX 6000 Ada node with 4 workers read the same
+            # 23 GB of weights four times at once: `Loading weights took 278.81 seconds`, and the
+            # worker kills a backend that is not ready in 10 minutes, so the node never left the
+            # loop. Same gate as the cold start, and it is a timestamp rather than a sleep, so a
+            # held-back respawn never delays a sibling's liveness check.
+            (( SECONDS - LAST_SPAWN_AT >= SPLIT_STAGGER_SECONDS )) || continue
             unset "WORKER_EXITED_AT[$i]"
             refresh_binary
             spawn_instance "${i}"
