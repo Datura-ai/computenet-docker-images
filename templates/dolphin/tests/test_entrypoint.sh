@@ -807,7 +807,8 @@ test_hf_offline_waits_for_the_library() {
     # moment would make it fetch the new weights — 23 GB, past the disk floor.
     # Pinned, and unable to fetch a shard even so: a commit that lands between the check and the
     # call must never cost 23 GB of weights.
-    assert_eq "the top-up is pinned and cannot fetch weights" "revision=deadbeef ignore=*.safetensors" \
+    assert_eq "the top-up is pinned and cannot fetch weights" \
+        "revision=deadbeef ignore=*.safetensors,*.bin,*.pth,*.pt,*.ckpt,*.gguf,*.h5,*.msgpack,*.onnx" \
         "$(grep '^revision=' "${SANDBOX}/hf_calls" | head -1)"
 
     # Armed AND an engine serves: the files are proven good, so no interpreter runs on later cycles.
@@ -860,6 +861,32 @@ STUB
     touch "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
     assert_eq "a runtime without the switch means not armed" "no" \
         "$(hf_offline_is_armed && echo yes || echo no)"
+}
+
+test_hf_offline_top_up_respects_the_disk_floor() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+
+    # A full shared volume takes every filler container on the node down with it, so the one
+    # download that was not behind the floor is behind it now.
+    mock_df_free_gb 1
+    sync_hf_offline_with_cache
+    assert_eq "a full disk holds back the top-up" "no" \
+        "$([[ -f "${SANDBOX}/topped_up" ]] && echo yes || echo no)"
+    assert_eq "a held-back top-up keeps the Hub" "no" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+
+    mock_df_free_gb 900
+    sync_hf_offline_with_cache
+    assert_eq "room on the disk lets the top-up run" "yes" \
+        "$([[ -f "${SANDBOX}/topped_up" ]] && echo yes || echo no)"
 }
 
 test_hf_offline_needs_a_cache_the_library_can_read() {
@@ -1086,6 +1113,7 @@ test_hf_offline_is_re_evaluated_later
 test_hf_offline_self_heals_when_no_engine_serves
 test_hf_offline_waits_for_the_library
 test_hf_offline_needs_a_cache_the_library_can_read
+test_hf_offline_top_up_respects_the_disk_floor
 test_a_half_installed_runtime_never_arms
 test_hf_offline_stays_off_when_the_top_up_fails
 test_worker_log_and_spawn_counters

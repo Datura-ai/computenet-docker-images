@@ -83,6 +83,9 @@ HF_OFFLINE_TOP_UP_TIMEOUT_S=300
 # while it waits. A Hub that answers 429 would otherwise burn that wait on every 30 s cycle and
 # leave the node's workers unattended most of the time. One attempt per this many seconds.
 HF_OFFLINE_TOP_UP_MIN_INTERVAL_S=600
+# What the top-up may never fetch. Weights in any format the Hub carries, because the top-up exists
+# only to complete a cache whose weights are already there.
+HF_TOP_UP_IGNORE_PATTERNS="*.safetensors,*.bin,*.pth,*.pt,*.ckpt,*.gguf,*.h5,*.msgpack,*.onnx"
 # Worker stdout/stderr go to a file on the shared cache volume. The container log lives on the
 # miner's host, which the platform cannot read, so a failed cold start used to leave no evidence
 # at all (2026-08-24: two prod nodes redownloaded the runtime in a respawn loop for 110 minutes
@@ -625,16 +628,18 @@ top_up_hf_cache_from_hub() {
     # local ref exactly like the engine does.
     local python_bin="$1" hf_home="$2" revision="$3"
     # The weights are NEVER downloaded here. Only a cache whose shards are already complete reaches
-    # this line, so the files it misses are small ones. The pattern is what makes the pin safe: a
-    # commit that lands between the check and this call cannot cost 23 GB of weights, past the disk
-    # floor that guards every other download.
+    # this line, so the files it misses are small ones. The patterns are what make the pin safe: a
+    # commit that lands between the check and this call cannot cost gigabytes of weights.
+    # EVERY weight format is listed, not just safetensors: a repo can ship both, and a model that
+    # keeps `original/*.pth` beside its shards would pass our completeness check, be refused by the
+    # library for the missing .pth, and pull those gigabytes here.
     HF_HOME="${hf_home}" HF_HUB_OFFLINE=0 DOLPHIN_HF_MODEL="${MODEL}" DOLPHIN_HF_REVISION="${revision}" \
-        DOLPHIN_HF_IGNORE="*.safetensors" \
+        DOLPHIN_HF_IGNORE="${HF_TOP_UP_IGNORE_PATTERNS}" \
         run_with_timeout "${HF_OFFLINE_TOP_UP_TIMEOUT_S}" "${python_bin}" -c '
 import os
 from huggingface_hub import snapshot_download
 snapshot_download(os.environ["DOLPHIN_HF_MODEL"], revision=os.environ["DOLPHIN_HF_REVISION"],
-                  ignore_patterns=[os.environ["DOLPHIN_HF_IGNORE"]])
+                  ignore_patterns=os.environ["DOLPHIN_HF_IGNORE"].split(","))
 ' >/dev/null 2>&1
 }
 
@@ -642,7 +647,7 @@ snapshot_download(os.environ["DOLPHIN_HF_MODEL"], revision=os.environ["DOLPHIN_H
 # the same: the copy the engine opens is not knowable from here, and a wrong yes takes the node to
 # zero tokens for the life of the container.
 hf_cache_is_engine_ready() {
-    local python_bin repo_dir hf_home revision ready=1 asked=0 pythons=()
+    local python_bin repo_dir hf_home revision free_gb ready=1 asked=0 pythons=()
     # EVERY runtime, not the first one: the worker leaves the old runtime in place when it updates
     # itself, and the switch is written into the site-packages of both. An old library that accepts
     # the cache would then arm the new one against a cache the new one rejects.
@@ -680,6 +685,15 @@ hf_cache_is_engine_ready() {
             # The wait blocks the supervisor, so it is rationed. Until the next attempt is due the
             # answer is simply no, and offline mode stays off.
             if (( SECONDS - LAST_HF_TOP_UP_AT < HF_OFFLINE_TOP_UP_MIN_INTERVAL_S )); then
+                ready=0
+                continue
+            fi
+            # The only download in this file that is not already behind the disk floor. It should
+            # fetch kilobytes, but "should" is what fills a disk, and a full shared volume takes
+            # every filler container on the node down with it.
+            free_gb="$(free_gb_on_shared_cache)"
+            if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
+                echo "[dolphin] only ${free_gb} GB free; not fetching what the HF library misses, so offline mode stays off" >&2
                 ready=0
                 continue
             fi
