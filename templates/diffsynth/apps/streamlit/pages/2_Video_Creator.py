@@ -9,7 +9,9 @@ import gc
 logging.getLogger("streamlit.runtime.scriptrunner").setLevel(logging.ERROR)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from video_paths import VIDEO_DIR, resolve_video_path
 from diffsynth import ModelManager, save_video, VideoData, download_models, CogVideoPipeline
 from diffsynth.extensions.RIFE import RIFEInterpolater
 
@@ -111,29 +113,46 @@ with st.expander("Generate Video", expanded=True):
     prompt = st.text_area("Prompt", value="An astronaut riding a horse on Mars.")
     seed = st.number_input("Seed", min_value=0, max_value=10**9, step=1, value=0)
     num_inference_steps = st.slider("Inference steps", min_value=1, max_value=100, value=10, key="generate_steps")
-    output_path = st.text_input("Output Path", value="output_video.mp4")
+    output_name = st.text_input("Output file name", value="output_video.mp4", help=f"Saved inside {VIDEO_DIR}")
     if st.button("Generate"):
-        text_to_video(model_manager, prompt, seed, output_path, num_inference_steps)
-        st.success(f"Video generated at {output_path}")
-        # Ensure video is playable by reloading it
-        with open(output_path, "rb") as video_file:
-            st.video(video_file.read())
+        try:
+            output_path = resolve_video_path(output_name)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            text_to_video(model_manager, prompt, seed, output_path, num_inference_steps)
+            st.success(f"Video generated at {output_path}")
+            # Ensure video is playable by reloading it
+            with open(output_path, "rb") as video_file:
+                st.video(video_file.read())
 
 with st.expander("Edit Video", expanded=False):
     prompt = st.text_area("Edit Prompt", value="A white robot riding a horse on Mars.")
     seed = st.number_input("Edit Seed", min_value=0, max_value=10**9, step=1, value=1)
-    input_path = st.text_input("Input Video Path", value="output_video.mp4")
-    output_path = st.text_input("Edited Output Path", value="edited_video.mp4")
+    input_name = st.text_input("Input video file name", value="output_video.mp4", help=f"Read from {VIDEO_DIR}")
+    output_name = st.text_input("Edited output file name", value="edited_video.mp4", help=f"Saved inside {VIDEO_DIR}")
     num_inference_steps = st.slider("Inference steps", min_value=1, max_value=100, value=10, key="edit_steps")
     if st.button("Edit"):
-        edit_video(model_manager, prompt, seed, input_path, output_path, num_inference_steps)
-        st.success(f"Video edited at {output_path}")
-        st.video(output_path)
+        try:
+            input_path = resolve_video_path(input_name, must_exist=True)
+            output_path = resolve_video_path(output_name)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            edit_video(model_manager, prompt, seed, input_path, output_path, num_inference_steps)
+            st.success(f"Video edited at {output_path}")
+            st.video(output_path)
 
 with st.expander("Interpolate Video", expanded=False):
-    input_path = st.text_input("Interpolation Input Path", value="edited_video.mp4")
-    output_path = st.text_input("Interpolated Output Path", value="interpolated_video.mp4")
+    input_name = st.text_input("Interpolation input file name", value="edited_video.mp4", help=f"Read from {VIDEO_DIR}")
+    output_name = st.text_input("Interpolated output file name", value="interpolated_video.mp4", help=f"Saved inside {VIDEO_DIR}")
     if st.button("Interpolate"):
-        interpolate_video(model_manager, input_path, output_path)
-        st.success(f"Video interpolated at {output_path}")
-        st.video(output_path)
+        try:
+            input_path = resolve_video_path(input_name, must_exist=True)
+            output_path = resolve_video_path(output_name)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            interpolate_video(model_manager, input_path, output_path)
+            st.success(f"Video interpolated at {output_path}")
+            st.video(output_path)
