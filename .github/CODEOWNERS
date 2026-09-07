@@ -1,0 +1,33 @@
+# Code owners — GitHub requests a review from the people on the LAST matching line when a PR touches the path.
+# Two owners per path so one absence does not block; one approval satisfies the branch rule.
+# Proposal from 180-day commit/line evidence per path and 90-day merged-PR review data (DAH-3022);
+# lines marked "TODO owner: confirm" are the ones where the evidence is thin or disagrees with the reviewer map.
+# How reviews work here: .github/REVIEWING.md
+
+# taiberium 25 (10 active) template commits, arhangel66 24 approvals
+*                                           @taiberium @arhangel66
+
+# as above
+/templates/                                 @taiberium @arhangel66
+
+# jam6099 3 commits (Jul), fortunelucky777 5 (0 in 30 d); Docker images → jam6099 / pixel29913 per the 5 Sep map
+# TODO owner: confirm — nobody active here in 30 d
+/templates/pytorch/                         @jam6099 @taiberium
+
+# 0 commits in 180 d; validator → jam6099 / pixel29913 per the 5 Sep map; DAH-2969 proposes deleting this copy
+# TODO owner: confirm — untouched 180 d — owner decides
+/templates/lium-validator/                  @jam6099 @pixel29913
+
+# arhangel66 3 commits (May), nobody since
+# TODO owner: confirm — bus factor 1, untouched 90 d
+/templates/docker-dind/                     @arhangel66 @taiberium
+
+# taiberium 3 commits (Aug); arhangel66 3 approvals
+/templates/lium-cluster/                    @taiberium @arhangel66
+
+# as lium-cluster
+/templates/lium-rdma-probe/                 @taiberium @arhangel66
+
+# fortunelucky777 3 commits (Jul, 0 in 30 d); approvers pixel29913 / taiberium / arhangel66
+# TODO owner: confirm — bus factor 1 — confirm
+/scripts/                                   @pixel29913 @taiberium
