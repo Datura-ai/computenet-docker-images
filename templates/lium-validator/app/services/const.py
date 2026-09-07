@@ -3,6 +3,7 @@ MIN_JOB_TAKEN_TIME = 20
 GPU_MODEL_RATES = {
     "NVIDIA B200": .05,
     "NVIDIA H200": .56,
+    "NVIDIA H200 NVL": .56,
     "NVIDIA H100 80GB HBM3": .10,
     "NVIDIA H100 NVL": .01,
     "NVIDIA H100 PCIe": .01,
@@ -33,6 +34,7 @@ GPU_MODEL_RATES = {
 REQUIRED_DEPOSIT_AMOUNT = {
     'NVIDIA B200': 0.223,
     'NVIDIA H200': 0.158,
+    'NVIDIA H200 NVL': 0.131,
     'NVIDIA H100 80GB HBM3': 0.103,
     'NVIDIA H100 NVL': 0.086,
     'NVIDIA H100 PCIe': 0.086,
@@ -358,6 +360,19 @@ HASHCAT_CONFIGS = {
         ],
     },
     "NVIDIA H200": {
+        "digits": 11,
+        "average_time": [
+            13.78846188,
+            13.20821786,
+            14.69337816,
+            17.86422935,
+            19.47975516,
+            21.64789315,
+            22.24125861,
+            25.43047319,
+        ],
+    },
+    "NVIDIA H200 NVL": {
         "digits": 11,
         "average_time": [
             13.78846188,
