@@ -64,7 +64,8 @@ build_one() {  # <template>
 }
 
 boot_one() {  # <template>: start the image with its own CMD, then look inside
-  local t=$1 img="lium-smoke/$t:latest" cid gpu_flags=""
+  local t=$1 cid gpu_flags=""
+  local img="lium-smoke/$t:latest"
   [ -n "${E2E_GPU:-}" ] && gpu_flags="--gpus all"
   cid=$(docker run -d --rm $gpu_flags --name "smoke-$t-$$" "$img") || return 1
   sleep 5
