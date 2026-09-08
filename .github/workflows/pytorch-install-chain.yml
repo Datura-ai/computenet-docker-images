@@ -5,6 +5,9 @@ name: pytorch template — install chain can fail
 # the Dockerfile on a plain ubuntu base — no CUDA pull, ~20 s — once broken (must fail) and once
 # complete (must pass). See templates/pytorch/tests/test-install-chain.sh.
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths:
