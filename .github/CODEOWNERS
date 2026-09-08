@@ -14,10 +14,6 @@
 # TODO owner: confirm — nobody active here in 30 d
 /templates/pytorch/                         @jam6099 @taiberium
 
-# 0 commits in 180 d; validator → jam6099 / pixel29913 per the 5 Sep map; DAH-2969 proposes deleting this copy
-# TODO owner: confirm — untouched 180 d — owner decides
-/templates/lium-validator/                  @jam6099 @pixel29913
-
 # arhangel66 3 commits (May), nobody since
 # TODO owner: confirm — bus factor 1, untouched 90 d
 /templates/docker-dind/                     @arhangel66 @taiberium
