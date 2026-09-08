@@ -22,11 +22,9 @@ group "default" {
         # "ubuntu2204-py313",
         # "ubuntu2204-py311",
         # "ubuntu2204-py39",
-        
-        # Ubuntu 20.04
-        "ubuntu2004-py313",
-        "ubuntu2004-py311",
-        "ubuntu2004-py39",
+
+        # Ubuntu 20.04: targets removed 8 Sep 2026 — focal is end-of-life and the deadsnakes PPA no longer publishes
+        # python for it (`E: Couldn't find any package by glob 'python3.11-venv'`); the published 20.04-* tags on Docker Hub are unchanged.
     ]
 }
 
@@ -110,42 +108,6 @@ target "ubuntu2204-py39" {
     }
     args = {
         BASE_IMAGE = "ubuntu:22.04"
-        PYTHON_VERSION = "3.9"
-    }
-}
-
-target "ubuntu2004-py313" {
-    dockerfile = "Dockerfile"
-    tags = ["${PUBLISHER}/ubuntu:20.04-py3.13"]
-    contexts = {
-        scripts = "../../scripts"
-    }
-    args = {
-        BASE_IMAGE = "ubuntu:20.04"
-        PYTHON_VERSION = "3.13"
-    }
-}
-
-target "ubuntu2004-py311" {
-    dockerfile = "Dockerfile"
-    tags = ["${PUBLISHER}/ubuntu:20.04-py3.11"]
-    contexts = {
-        scripts = "../../scripts"
-    }
-    args = {
-        BASE_IMAGE = "ubuntu:20.04"
-        PYTHON_VERSION = "3.11"
-    }
-}
-
-target "ubuntu2004-py39" {
-    dockerfile = "Dockerfile"
-    tags = ["${PUBLISHER}/ubuntu:20.04-py3.9"]
-    contexts = {
-        scripts = "../../scripts"
-    }
-    args = {
-        BASE_IMAGE = "ubuntu:20.04"
         PYTHON_VERSION = "3.9"
     }
 }
