@@ -17,9 +17,9 @@ A=artifacts; mkdir -p "$A"; : > "$A/timings.txt"
 T_BAKE=${T_BAKE:-2m}; T_BUILD=${T_BUILD:-40m}; T_BOOT=${T_BOOT:-5m}
 FAILED=""
 
-step() {  # step <name> <timeout> <cmd...>
+step() {  # step <name> <timeout> <function-or-cmd...>  (functions below are exported, so timeout can run them)
   local name=$1 t=$2; shift 2; local t0=$SECONDS rc status
-  echo "::group::$name"; timeout -k 30 "$t" "$@"; rc=$?; echo "::endgroup::"
+  echo "::group::$name"; timeout -k 30 "$t" bash -c '"$@"' _ "$@"; rc=$?; echo "::endgroup::"
   case $rc in 0) status=pass ;; 124|137) status="TIMEOUT(>$t)" ;; *) status="FAIL(rc=$rc)" ;; esac
   printf '%s\t%ds\t%s\n' "$name" "$((SECONDS - t0))" "$status" >> "$A/timings.txt"
   echo "smoke: $name $status in $((SECONDS - t0))s"; [ $rc -eq 0 ] || FAILED="$FAILED $name"; return $rc
@@ -87,6 +87,8 @@ summary() {
   cat "$A/summary.md"
 }
 
+export -f bake_print_all pick_target build_one boot_one
+export A E2E_GPU
 step bake-print-all "$T_BAKE" bake_print_all
 TEMPLATES=$(changed_templates "$@")
 if [ -z "$TEMPLATES" ]; then echo "no template changed vs $BASE — bake --print of every template is the whole check"; summary; [ -z "$FAILED" ]; exit $?; fi
