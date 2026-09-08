@@ -35,7 +35,7 @@ RUN if [ -n "${PYTHON_VERSION}" ]; then \
         rm /usr/bin/python3 && \
         ln -s /usr/bin/python${PYTHON_VERSION} /usr/bin/python3 && \
         curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && \
-        python get-pip.py; \
+        python get-pip.py --ignore-installed; \
     fi
 
 
