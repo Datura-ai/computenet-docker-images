@@ -29,7 +29,11 @@ RUN apt-get update --yes && \
     rm -rf /var/lib/apt/lists/* && \
     echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 
-# Set up Python and pip only if PYTHON_VERSION is specified
+# Set up Python and pip only if PYTHON_VERSION is specified.
+# --ignore-installed: on Python < 3.12 get-pip.py also installs setuptools and wheel, and wheel depends on `packaging`.
+# The deadsnakes python shares /usr/lib/python3/dist-packages with the distro python, where Ubuntu 24.04 keeps
+# python3-packaging 24.0 (installed by the apt-get step above) without a pip RECORD, so pip stopped with
+# "Cannot uninstall packaging 24.0" (uninstall-no-record-file). Its own copy goes under /usr/local and shadows Debian's.
 RUN if [ -n "${PYTHON_VERSION}" ]; then \
         ln -s /usr/bin/python${PYTHON_VERSION} /usr/bin/python && \
         rm /usr/bin/python3 && \
