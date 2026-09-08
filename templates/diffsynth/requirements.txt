@@ -11,7 +11,7 @@ sentencepiece
 protobuf
 modelscope
 ftfy
-streamlit==1.40.0
+streamlit==1.54.0
 streamlit-drawable-canvas
 huggingface_hub
 hf_xet
