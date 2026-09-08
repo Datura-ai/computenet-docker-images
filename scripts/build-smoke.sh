@@ -41,8 +41,10 @@ bake_print_all() {  # every bake file must resolve — a broken HCL or a missing
   return $rc
 }
 
-pick_target() {  # <template> → the target to build: group smoke's first, else group default's first
-  local t=$1 json; json=$(docker buildx bake -f "templates/$t/docker-bake.hcl" --print 2>/dev/null) || return 1
+pick_target() {  # <template> → the target to build: group smoke's first (when the bake file defines one), else default's first
+  local t=$1 json
+  if json=$(docker buildx bake -f "templates/$t/docker-bake.hcl" --print smoke 2>/dev/null); then :
+  else json=$(docker buildx bake -f "templates/$t/docker-bake.hcl" --print 2>/dev/null) || return 1; fi
   python3 - "$json" <<'PY'
 import json, sys
 d = json.loads(sys.argv[1]); g = d.get("group", {})
