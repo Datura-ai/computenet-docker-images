@@ -139,7 +139,10 @@ RUN rm -f /etc/ssh/ssh_host_* && \
     # /etc/profile.d script (sourced by login shells, i.e. the renter's ssh
     # session) and strip the base image's /root/.bashrc copy so it can't
     # double-print on paths where /root is NOT shadowed (partial rentals, local).
-    sed -i '/cat \/etc\/computenet\.txt/d; /made with .* by Datura/d' /root/.bashrc 2>/dev/null || true; \
+    # The `|| true` is scoped to the sed alone (a base image without /root/.bashrc
+    # is fine); left bare it would swallow the exit status of every install above
+    # and the RUN could not fail (DAH-2433).
+    { sed -i '/cat \/etc\/computenet\.txt/d; /made with .* by Datura/d' /root/.bashrc 2>/dev/null || true; } && \
     printf '%s\n' \
         'case "$-" in' \
         '  *i*)' \
