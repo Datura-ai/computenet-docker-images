@@ -1,4 +1,4 @@
-gdown==4.7.1
+gdown==5.2.2
 ipywidgets==8.0.7
 jupyterlab==3.6.7
 jupyter-archive==3.3.4
