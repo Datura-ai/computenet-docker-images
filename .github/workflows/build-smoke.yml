@@ -1,10 +1,10 @@
 name: build-smoke
 
 # Every template's bake file resolves on every PR; every template the PR touches is built (one target) and booted:
-# python3, /workspace, `import torch` for the PyTorch images, the template's own smoke.sh when present. On a GPU
-# host (`E2E_GPU=1 scripts/build-smoke.sh pytorch`, run by the loop on a Lium pod) the same script also requires
-# nvidia-smi and torch.cuda inside the container. Nothing is pushed: images are tagged lium-smoke/<template> and
-# removed. Stable job name so it can be required.
+# python3 (/workspace is reported, not required), `import torch` for the `pytorch` template, the template's own smoke.sh when present. On a GPU
+# host (`E2E_GPU=1 scripts/build-smoke.sh <template>`, run by the loop on a Lium pod) the same script also requires
+# nvidia-smi inside every container and torch.cuda where torch imports. Nothing is pushed: images are tagged lium-smoke/<template> and
+# removed. A push to master only resolves the bake files (its diff against origin/master is empty). Stable job name so it can be required.
 on:
   pull_request:
   push:
@@ -26,20 +26,32 @@ jobs:
     timeout-minutes: 90
     concurrency:
       group: build-smoke-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: true
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # a superseded PR push cancels the old run; master runs finish
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker   # the engine's own builder: --load is free (the docker-container driver re-imports the image as a tarball)
       - name: room for a CUDA image
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h / | tail -1
+      - name: self-test — a missing Dockerfile and an unknown template name must fail the script
+        run: |
+          mv templates/ubuntu/Dockerfile /tmp/ubuntu.Dockerfile
+          out=$(BASE=HEAD scripts/build-smoke.sh 2>&1) && { echo "$out"; echo "a hidden Dockerfile did not fail the check"; exit 1; }
+          mv /tmp/ubuntu.Dockerfile templates/ubuntu/Dockerfile
+          grep -q "missing Dockerfile for target(s): ubuntu2404" <<<"$out"
+          out=$(scripts/build-smoke.sh nosuch 2>&1) && { echo "$out"; echo "an unknown template did not fail the check"; exit 1; }
+          grep -q "templates/nosuch has no docker-bake.hcl" <<<"$out"
+          rm -rf artifacts
       - name: bake --print every template; build + boot the changed ones
         id: smoke
         timeout-minutes: 85
         env:
           BASE: origin/${{ github.event.pull_request.base.ref || 'master' }}
-        run: scripts/build-smoke.sh ${{ github.event.inputs.templates }}
+          TEMPLATES: ${{ github.event.inputs.templates }}
+        run: scripts/build-smoke.sh $TEMPLATES
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -61,7 +73,7 @@ jobs:
               : `**image smoke: FAIL** — no summary written (outcome ${process.env.OUTCOME}); see the run log.`;
             const body = [marker, `### image smoke · ${context.payload.pull_request.head.sha.slice(0, 8)} · [run](${runUrl})`, '', summary.trim(), '',
               '<sub>bake --print of every template; build + boot of the templates this PR touches (scripts/build-smoke.sh). GPU check: `E2E_GPU=1 scripts/build-smoke.sh <template>` on a GPU host.</sub>'].join('\n');
-            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number, per_page: 100 });
+            const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: context.issue.number, per_page: 100 });
             const mine = comments.find(c => c.body?.startsWith(marker));
             if (mine) await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
             else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });

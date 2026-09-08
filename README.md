@@ -11,4 +11,4 @@ a different image.)
 
 ## Checks
 
-`scripts/build-smoke.sh [template …]` resolves every template's bake file (`docker buildx bake --print`) and builds and boots the templates a change touches; the CI job `build-smoke` runs it on every PR. `E2E_GPU=1 scripts/build-smoke.sh pytorch` on a GPU host also requires `nvidia-smi` and `torch.cuda` inside the container.
+`scripts/build-smoke.sh [template …]` resolves every template's bake file (`docker buildx bake --print`, and each default target's Dockerfile must exist) and builds and boots the templates a change touches; the CI job `build-smoke` runs it on every PR. `E2E_GPU=1 scripts/build-smoke.sh pytorch` on a GPU host also requires `nvidia-smi` and `torch.cuda` inside the container. Linux only: the script needs GNU `timeout` and `python3`.
