@@ -56,7 +56,8 @@ PY
 build_one() {  # <template>
   local t=$1 target; target=$(pick_target "$t") || { echo "no target in templates/$t"; return 1; }
   echo "building templates/$t target $target"
-  ( cd "templates/$t" && docker buildx bake --load --set "*.tags=lium-smoke/$t:latest" "$target" ) 2>&1 | tail -40
+  # the bake files read ../../scripts (a context outside the template dir): newer buildx wants that allowed explicitly
+  ( cd "templates/$t" && BUILDX_BAKE_ENTITLEMENTS_FS=0 docker buildx bake --load --set "*.tags=lium-smoke/$t:latest" "$target" ) 2>&1 | tail -40
   return "${PIPESTATUS[0]}"
 }
 
