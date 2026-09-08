@@ -71,8 +71,14 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
   sleep 5
   docker ps -q --no-trunc | grep -q "$cid" || { echo "container exited within 5 s:"; docker logs "$cid" 2>&1 | tail -20; return 1; }
   local rc=0
-  docker exec "$cid" sh -c 'command -v python3 >/dev/null && python3 --version' || { echo "no python3"; rc=1; }
-  docker exec "$cid" sh -c 'test -d /workspace' || { echo "no /workspace"; rc=1; }
+  # a POD template ships the lium /start.sh (scripts/start.sh): python3 and /workspace are its contract with renters.
+  # Infrastructure images (redis, docker-dind, verifier…) only have to boot and pass their own smoke.sh.
+  if docker exec "$cid" sh -c 'test -e /start.sh'; then
+    docker exec "$cid" sh -c 'command -v python3 >/dev/null && python3 --version' || { echo "pod template without python3"; rc=1; }
+    docker exec "$cid" sh -c 'test -d /workspace' || { echo "pod template without /workspace"; rc=1; }
+  else
+    echo "infrastructure image (no /start.sh): boot check only"
+  fi
   if docker exec "$cid" sh -c 'python3 -c "import torch" 2>/dev/null'; then
     docker exec "$cid" python3 -c 'import torch; print("torch", torch.__version__, "cuda build", torch.version.cuda)' || rc=1
     if [ -n "${E2E_GPU:-}" ]; then
