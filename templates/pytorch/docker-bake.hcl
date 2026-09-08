@@ -2,6 +2,12 @@ variable "PUBLISHER" {
     default = "daturaai"
 }
 
+# The one target scripts/build-smoke.sh builds and boots when this template changes (the image lium-platform's default template points at). Every target's
+# bake definition is still resolved on every PR (bake --print); a GPU host runs the same script with E2E_GPU=1.
+group "smoke" {
+    targets = ["2120-py312-cuda1302-devel-ubuntu2404-dind"]
+}
+
 group "default" {
     targets = [
         ### CUDA ###

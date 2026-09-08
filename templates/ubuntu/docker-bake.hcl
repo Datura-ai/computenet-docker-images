@@ -2,6 +2,12 @@ variable "PUBLISHER" {
     default = "daturaai"
 }
 
+# The one target scripts/build-smoke.sh builds and boots when this template changes (24.04 with Python 3.11 — the image the lium-io validator preflight is built FROM). Every target's
+# bake definition is still resolved on every PR (bake --print); a GPU host runs the same script with E2E_GPU=1.
+group "smoke" {
+    targets = ["ubuntu2404-py311"]
+}
+
 group "default" {
     targets = [
         # Ubuntu 24.10
