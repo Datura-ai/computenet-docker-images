@@ -74,9 +74,13 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
   local t=$1 cid gpu_flags=""
   local img="lium-smoke/$t:latest"
   [ -n "${E2E_GPU:-}" ] && gpu_flags="--gpus all"
+  # A template that needs environment to start at all declares it in templates/<t>/smoke.env —
+  # the dolphin filler refuses to run without its API key, and refusing is correct behaviour.
+  local env_flag=""
+  [ -f "templates/$t/smoke.env" ] && env_flag="--env-file templates/$t/smoke.env"
   # no --rm: a container that dies inside the 5 s wait must still have its logs; the main loop removes `smoke-<template>`
   docker rm -f "smoke-$t" >/dev/null 2>&1 || true
-  cid=$(docker run -d $gpu_flags --name "smoke-$t" "$img") || return 1
+  cid=$(docker run -d $gpu_flags $env_flag --name "smoke-$t" "$img") || return 1
   sleep 5
   docker ps -q --no-trunc | grep -q "$cid" || { echo "container exited within 5 s:"; docker logs "$cid" 2>&1 | tail -20; return 1; }
   local rc=0

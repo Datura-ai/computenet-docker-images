@@ -58,6 +58,29 @@ make_sandbox() {
     export HOME="${SANDBOX}/home"
     export DOLPHIN_WATCHDOG_STATE_DIR="${SANDBOX}/state"
     mkdir -p "${HOME}" "${DOLPHIN_WATCHDOG_STATE_DIR}"
+    mock_curl
+    engine_answers_health yes
+}
+
+mock_curl() {
+    # ONE curl for the whole suite. A /health request over a unix socket succeeds when the socket
+    # exists AND the test marked the engine healthy; every other curl fails, which is what the
+    # inline stubs did before DAH-3341 made "serving" a health answer instead of a socket file.
+    cat >"${SANDBOX}/bin/curl" <<EOF
+#!/usr/bin/env bash
+socket=""
+for (( i = 1; i <= \$#; i++ )); do
+    [[ "\${!i}" == "--unix-socket" ]] && { j=\$((i + 1)); socket="\${!j}"; }
+done
+[[ -n "\${socket}" && -e "\${socket}" && -f "${SANDBOX}/engine_healthy" ]] && exit 0
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/curl"
+}
+
+engine_answers_health() {
+    # Args: yes|no. The socket file alone no longer means serving (DAH-3341).
+    if [[ "$1" == "yes" ]]; then touch "${SANDBOX}/engine_healthy"; else rm -f "${SANDBOX}/engine_healthy"; fi
 }
 
 mock_nvidia_smi() {
@@ -180,11 +203,7 @@ test_spawn_smoke() {
     export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}"
     mock_nvidia_smi "0:97887" "1:97887"
-    cat >"${SANDBOX}/bin/curl" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-    chmod +x "${SANDBOX}/bin/curl"
+    mock_curl
     # Worker mock records each start's HOME + visible config, then sleeps.
     cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<EOF
 #!/usr/bin/env bash
@@ -193,6 +212,7 @@ if [[ "\$1" == "start" ]]; then
     # A real worker opens its engine socket once the runtime + weights are on disk; that is
     # the signal siblings wait for, so the mock must produce it or instance 1 never launches.
     mkdir -p "${SANDBOX}/dp-\$\$" && touch "${SANDBOX}/dp-\$\$/v.sock"
+    touch "${SANDBOX}/engine_healthy"
     # exec, not a plain call: bash defers TERM until a foreground command returns, so a
     # non-exec sleep would outlive the test by its full duration and hang the suite.
     exec sleep 300
@@ -414,11 +434,7 @@ test_split_sidecar_and_watchdog_wiring() {
     export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}"
     mock_nvidia_smi "0:97887" "1:97887"
-    cat >"${SANDBOX}/bin/curl" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-    chmod +x "${SANDBOX}/bin/curl"
+    mock_curl
     touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
     # Record which helper was launched and what engine count it was told about.
     cat >"${SANDBOX}/bin/python3" <<EOF
@@ -460,11 +476,7 @@ test_per_engine_watchdog_in_split_mode() {
     export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}"
     mock_nvidia_smi "0:97887" "1:97887"
-    cat >"${SANDBOX}/bin/curl" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-    chmod +x "${SANDBOX}/bin/curl"
+    mock_curl
     touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
     cat >"${SANDBOX}/bin/python3" <<EOF
 #!/usr/bin/env bash
@@ -508,11 +520,7 @@ test_single_engine_watchdog() {
     export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
     mkdir -p "${DOLPHIN_HOME}"
     mock_nvidia_smi "0:97887"
-    cat >"${SANDBOX}/bin/curl" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-    chmod +x "${SANDBOX}/bin/curl"
+    mock_curl
     touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
     # A restarted container keeps its /tmp, so a previous run's split leaves state files
     # behind. They would publish as dead watchdogs for bundles that no longer exist.
@@ -660,6 +668,58 @@ test_model_cache_is_complete() {
     MODEL="nvidia/SomeOtherModel"
     assert_eq "another model's cache does not count" "no" \
         "$(model_cache_is_complete && echo yes || echo no)"
+}
+
+test_the_cache_check_follows_the_model_the_worker_launches() {
+    # DAH-3341, 2026-09-10: Dolphin's forced update to worker v2.4.2 moved the served model from
+    # nvidia/Qwen3.6-35B-A3B-NVFP4 to unsloth/Qwen3.8-27B-NVFP4. DOLPHIN_MODEL still named the old
+    # one, its cache was complete, the switch armed on it, and the engine could not download the
+    # new weights on 32 prod nodes. The model the engine was STARTED with decides.
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/bin"
+
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "with no engine running, DOLPHIN_MODEL still decides" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # An engine serving ANOTHER model. Its cache holds config + tokenizer and no shard, exactly
+    # what a fresh model looks like the moment hf_hub wrote its ref.
+    local other="unsloth/Qwen3.8-27B-NVFP4"
+    engine_launched_models() { echo "${other}"; }
+    local other_repo="${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${other}")"
+    mkdir -p "${other_repo}/refs" "${other_repo}/snapshots/beefdead"
+    printf '%s' beefdead >"${other_repo}/refs/main"
+    printf '%s' '{"weight_map":{"a":"model-00001-of-00001.safetensors"}}' \
+        >"${other_repo}/snapshots/beefdead/model.safetensors.index.json"
+    touch "${other_repo}/snapshots/beefdead/config.json" "${other_repo}/snapshots/beefdead/tokenizer.json"
+
+    assert_eq "a complete cache for the OLD model licenses nothing" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    touch "${other_repo}/snapshots/beefdead/model-00001-of-00001.safetensors"
+    assert_eq "the launched model's own cache is what counts" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+}
+
+test_a_socket_that_answers_nothing_is_not_serving() {
+    # DAH-3341: vLLM opened its unix socket at the END of the weight load, so the socket meant
+    # serving. Aphrodite 0.24 (worker v2.4.2) opens it BEFORE loading, so a crash-looping engine
+    # holds a socket that answers nothing — and the offline switch's self-heal never fired.
+    make_sandbox
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    load_entrypoint
+
+    mkdir -p "${SANDBOX}/dp-abc"
+    touch "${SANDBOX}/dp-abc/v.sock"
+    engine_answers_health no
+    assert_eq "a socket is present" "yes" "$(engine_socket_present && echo yes || echo no)"
+    assert_eq "but it is not serving" "no" "$(engine_is_serving && echo yes || echo no)"
+
+    engine_answers_health yes
+    assert_eq "an answering engine is serving" "yes" "$(engine_is_serving && echo yes || echo no)"
 }
 
 test_enable_hf_offline() {
@@ -1107,6 +1167,8 @@ test_terminate_workers_is_bounded
 test_model_cache_is_complete
 test_only_the_snapshot_under_the_ref_counts
 test_a_stale_copy_under_another_root_does_not_count
+test_the_cache_check_follows_the_model_the_worker_launches
+test_a_socket_that_answers_nothing_is_not_serving
 test_enable_hf_offline
 test_hf_offline_wiring
 test_hf_offline_is_re_evaluated_later
