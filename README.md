@@ -18,6 +18,8 @@ docker buildx bake --print            # the resolved targets and tags
 docker buildx bake <target> --push    # or `docker buildx bake --push` for every default target
 ```
 
+The bake files read `../../scripts`, a context outside the template directory; buildx 0.20+ stops `--push`/`--load` at an entitlement prompt for it (and fails without a TTY), so prefix the command with `BUILDX_BAKE_ENTITLEMENTS_FS=0` as `build-smoke.sh` does, or pass `--allow fs.read=../../scripts`.
+
 `daturaai/lium-validator` (the provider preflight check run by `lium mine`) is not built here. Its
 Dockerfile is `neurons/validators/Dockerfile.preflight` in [lium-io](https://github.com/Datura-ai/lium-io);
 no workflow in any repository builds or pushes it yet — every Docker Hub tag so far was pushed by hand.
