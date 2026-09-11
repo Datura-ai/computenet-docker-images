@@ -89,6 +89,21 @@ HF_OFFLINE_TOP_UP_MIN_INTERVAL_S=600
 # What the top-up may never fetch. Weights in any format the Hub carries, because the top-up exists
 # only to complete a cache whose weights are already there.
 HF_TOP_UP_IGNORE_PATTERNS="*.safetensors,*.bin,*.pth,*.pt,*.ckpt,*.gguf,*.h5,*.msgpack,*.onnx"
+# DAH-3393: the worker gives its engine 10 minutes to become ready, and the engine downloads the
+# weights itself on the way. The model served since v2.4.2 is ONE 21 GiB file, so a node must hold
+# 37.6 MB/s for ten minutes with no pause; below that the worker kills the engine, huggingface_hub
+# 1.18+ does not resume the file, and the next try starts at byte 0. On 2026-09-10 ten prod nodes
+# (62 GPUs) looped like that for a day. So while no engine answers /health, THIS process fetches the
+# missing weights in the background — with no deadline, with the runtime's own python and into the
+# engine's own cache root. huggingface_hub takes a per-file lock with no timeout around every
+# download, so an engine that starts meanwhile queues behind our fetch instead of racing it, and its
+# next start finds the file on disk.
+# How long a "<model>@<revision>" slot stays held after its fetch ended (either way) or the disk floor
+# refused it, before another fetch may start for it: a Hub answering 429 is not asked again on the
+# next 30 s cycle — hammering a throttling source extends the throttle.
+WEIGHTS_FETCH_RETRY_SECONDS="${DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS:-300}"
+# 0 turns the background fetch off; the engine is then the only downloader, as before DAH-3393.
+WEIGHTS_FETCH_ENABLED="${DOLPHIN_WEIGHTS_FETCH_ENABLED:-1}"
 # Worker stdout/stderr go to a file on the shared cache volume. The container log lives on the
 # miner's host, which the platform cannot read, so a failed cold start used to leave no evidence
 # at all (2026-08-24: two prod nodes redownloaded the runtime in a respawn loop for 110 minutes
@@ -327,6 +342,11 @@ wait_for_cache_seed() {
             echo "[dolphin] shared cache seeded after ${waited}s; releasing siblings" >&2
             return 0
         fi
+        # Nor is the supervisor's fetch running yet, and instance 0 is exactly the engine that
+        # cannot land the file on a slow node (DAH-3393): drive it from here at the same cadence.
+        if (( waited % 30 == 0 )); then
+            ensure_weights_fetch 0
+        fi
     done
     echo "[dolphin] cache not seeded after ${SEED_WAIT_SECONDS}s; starting siblings anyway" >&2
 }
@@ -416,6 +436,18 @@ SIDECAR_PID=""
 # engine serving, and whether the switch is being held off until an engine proves the cache good.
 HF_OFFLINE_CYCLES_WITHOUT_ENGINE=0
 HF_OFFLINE_HELD_OFF=0
+# DAH-3393: what the engines of this container were started with, read off their command lines and
+# kept once seen, so the revision is still known in the moments between the worker killing an
+# engine and starting the next. Parallel arrays, indexed alike: the test suite runs on a developer
+# Mac whose bash 3.2 has no associative arrays.
+LAUNCHED_MODELS=()
+LAUNCHED_REVISIONS=()
+LAUNCHED_RUNTIMES=()
+# The background fetches: one slot per "<model>@<revision>", its pid (empty once it ended or the disk
+# floor refused it), and when the slot may be reused.
+WEIGHTS_FETCH_KEYS=()
+WEIGHTS_FETCH_PIDS=()
+WEIGHTS_FETCH_NEXT_AT=()
 BASE_HOME="${HOME:-/root}"
 SHARED_CACHE="${BASE_HOME}/.cache"
 
@@ -534,31 +566,68 @@ hf_cache_dir_name() {
     echo "models--${1//\//--}"
 }
 
-snapshot_under_ref_is_complete() {
-    # Complete = the snapshot that `refs/main` NAMES holds the index, every shard the index names,
-    # and the two files the tokenizer/config load needs.
-    #
-    # The ref decides, never "some complete snapshot on disk". The cache is keyed by commit sha, so
-    # a new commit upstream gives the model a SECOND, half-downloaded snapshot beside the complete
-    # old one — and hf_hub writes the new sha into refs/main BEFORE it fetches one byte (verified in
-    # file_download.py). vLLM resolves `main` through that same ref, so a check that accepted the
-    # old snapshot would take the node offline against a snapshot the engine never opens.
-    local repo_dir="$1"
-    local ref_file="${repo_dir}/refs/main"
-    local revision snapshot index shard missing=0 listed=0
+# Index of <needle> in the array whose elements follow it, or 1 with nothing printed.
+index_of() {
+    local needle="$1" i
+    shift
+    for (( i = 1; i <= $#; i++ )); do
+        if [[ "${!i}" == "${needle}" ]]; then
+            echo $(( i - 1 ))
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The revision the engine opens for <model> in <repo_dir>, or 1 with nothing printed when nothing
+# on this node says.
+#
+# The worker's own `serve --revision <sha>` decides (DAH-3393). The worker pins the weights to a
+# commit sha, and huggingface_hub writes NO ref for a sha — `refs/main` is written only when it
+# resolved the unpinned `main` itself — so on every node running v2.4.2 the ref this check used to
+# read does not exist, and the check said "not complete" against a complete cache for good.
+# `refs/main` stays the fallback for an engine that carries no `--revision` (the shape before
+# v2.4.2, where the ref is what the engine resolves `main` through).
+#
+# The revision decides, never "some complete snapshot on disk". The cache is keyed by commit sha, so
+# a new commit gives the model a SECOND, half-downloaded snapshot beside the complete old one, and a
+# check that accepted the old one would take the node offline against a snapshot the engine never
+# opens. The ref is followed one step: a `--revision main` would make hf_hub write refs/main and
+# lay the snapshot out under the sha it names.
+model_revision() {
+    local model="$1" repo_dir="$2" revision="" i
+    if i="$(index_of "${model}" ${LAUNCHED_MODELS[@]+"${LAUNCHED_MODELS[@]}"})"; then
+        revision="${LAUNCHED_REVISIONS[$i]}"
+    fi
     # `$(<file)`, not `read`: hf_hub writes the sha with NO trailing newline, and `read` then
     # returns non-zero at EOF, which would reject every real cache on a real node.
-    [[ -f "${ref_file}" ]] || return 1
-    revision="$(<"${ref_file}")"
-    [[ -n "${revision}" ]] || return 1
-    snapshot="${repo_dir}/snapshots/${revision}/"
+    if [[ -z "${revision}" && -f "${repo_dir}/refs/main" ]]; then
+        revision="$(<"${repo_dir}/refs/main")"
+    elif [[ -n "${revision}" && -f "${repo_dir}/refs/${revision}" ]]; then
+        revision="$(<"${repo_dir}/refs/${revision}")"
+    fi
+    [[ -n "${revision}" ]] && echo "${revision}"
+}
+
+snapshot_is_complete() {
+    # Complete = the snapshot of <revision> holds the two files the tokenizer/config load needs and
+    # every `*.safetensors` its index names — or, with no index, the single `model.safetensors` a
+    # one-file repo ships. Every name the index carries, not the `model-NNNNN-of-NNNNN` mask
+    # (DAH-3393): the model served since v2.4.2 is one `model.safetensors` plus `model_mtp.safetensors`,
+    # and the mask matched neither.
+    local repo_dir="$1" revision="$2"
+    local snapshot="${repo_dir}/snapshots/${revision}/" index weight missing=0 listed=0
+    [[ -f "${snapshot}config.json" && -f "${snapshot}tokenizer.json" ]] || return 1
     index="${snapshot}model.safetensors.index.json"
-    [[ -f "${index}" && -f "${snapshot}config.json" && -f "${snapshot}tokenizer.json" ]] || return 1
-    while read -r shard; do
+    if [[ ! -f "${index}" ]]; then
+        [[ -f "${snapshot}model.safetensors" ]]
+        return
+    fi
+    while read -r weight; do
         listed=$((listed + 1))
-        [[ -f "${snapshot}${shard}" ]] || missing=1
-    done < <(grep -oE '"model-[^"]+\.safetensors"' "${index}" | tr -d '"' | sort -u)
-    # A truncated index names no shard at all. Counting it as complete would take the node offline
+        [[ -f "${snapshot}${weight}" ]] || missing=1
+    done < <(grep -oE '"[^"]+\.safetensors"' "${index}" | tr -d '"' | sort -u)
+    # A truncated index names no file at all. Counting it as complete would take the node offline
     # against a cache the engine cannot load, so an empty list is a NO like any gap.
     (( listed > 0 && ! missing ))
 }
@@ -574,39 +643,87 @@ model_cache_repo_dirs() {
         -type d -name "$(hf_cache_dir_name "${1:-${MODEL}}")" -print 2>/dev/null
 }
 
-# The models the offline switch has to be complete for: the ones the RUNNING engines were started
-# with, and DOLPHIN_MODEL only while no engine runs.
+# The models the offline switch has to be complete for: the ones the engines of this container were
+# started with (running, or lately running — hf_offline_models below), and DOLPHIN_MODEL only before
+# the first engine ever ran.
 #
 # DOLPHIN_MODEL is fixed when the container starts; the model is Dolphin's to choose, and their
 # worker changes it under us on a forced update. On 2026-09-10 v2.4.2 moved from
 # nvidia/Qwen3.6-35B-A3B-NVFP4 to unsloth/Qwen3.8-27B-NVFP4: the old cache was complete, the switch
 # armed on it, and the engine could not download the new weights on 32 nodes (DAH-3341). So the
 # engine's own command line decides, and DOLPHIN_MODEL is only the cold-start guess.
-engine_launched_models() {
-    pgrep -af "${DOLPHIN_HOME}/runtimes/.*[ /]serve " 2>/dev/null |
-        sed -nE 's#.*[ /]serve +([^ -][^ ]*).*#\1#p' | sort -u
+# One line per running engine: "<model> <revision> <runtime dir>", read off the worker's own command
+# line — `<DOLPHIN_HOME>/runtimes/<runtime>/... serve <model> --revision <sha> --uds <socket>`. The
+# revision field is empty for an engine started without `--revision`.
+engine_serve_command_lines() {
+    local line model revision runtime
+    # `|| true`: pgrep exits 1 with no engine running, and under the entrypoint's pipefail that status
+    # would end a `$(...)` caller under `set -e` — `hf_offline_models` never reached its DOLPHIN_MODEL
+    # fallback in the gap between an engine's death and the next start.
+    { pgrep -af "${DOLPHIN_HOME}/runtimes/.*[ /]serve " 2>/dev/null || true; } | while IFS= read -r line; do
+        model="$(sed -nE 's#.*[ /]serve +([^ -][^ ]*).*#\1#p' <<<"${line}")"
+        [[ -n "${model}" ]] || continue
+        revision="$(sed -nE 's#.*--revision[= ]+([^ ]+).*#\1#p' <<<"${line}")"
+        runtime="$(sed -nE "s#.*[ =](${DOLPHIN_HOME}/runtimes/[^/ ]+)/.*#\1#p" <<<"${line}")"
+        echo "${model} ${revision:--} ${runtime:--}"
+    done | sort -u
 }
 
+engine_launched_models() {
+    engine_serve_command_lines | cut -d' ' -f1 | sort -u
+}
+
+# Keep what the running engines were started with. The set is REPLACED by every non-empty reading,
+# never added to: after a worker update moves the model, the old one must not stay on the list and
+# earn a fetch of its own. In the gap between an engine's death and the next start (pgrep prints
+# nothing) the last reading stands. Called where the cycle reads it, never through a `$(...)`: an
+# assignment inside a subshell is lost.
+remember_launched_engines() {
+    local lines model revision runtime i
+    lines="$(engine_serve_command_lines)"
+    [[ -n "${lines}" ]] || return 0
+    LAUNCHED_MODELS=()
+    LAUNCHED_REVISIONS=()
+    LAUNCHED_RUNTIMES=()
+    while read -r model revision runtime; do
+        [[ -n "${model}" ]] || continue
+        i=${#LAUNCHED_MODELS[@]}
+        LAUNCHED_MODELS[i]="${model}"
+        LAUNCHED_REVISIONS[i]="${revision#-}"
+        LAUNCHED_RUNTIMES[i]="${runtime#-}"
+    done <<<"${lines}"
+}
+
+# The models every cache decision is about: the running engines' — in the gap between a kill and
+# the next start, the lately running engines' (DAH-3393: that IS the model the next engine opens,
+# and a DOLPHIN_MODEL that still names the previous model would arm the switch against a cache no
+# engine reads, the DAH-3341 shape) — and DOLPHIN_MODEL only before the first engine ever started.
 hf_offline_models() {
     local models
     models="$(engine_launched_models)"
     [[ -n "${models}" ]] && { echo "${models}"; return 0; }
+    if (( ${#LAUNCHED_MODELS[@]} > 0 )); then
+        printf '%s\n' "${LAUNCHED_MODELS[@]}"
+        return 0
+    fi
     echo "${MODEL}"
 }
 
 model_cache_is_complete() {
+    remember_launched_engines
     # EVERY copy must be complete, not merely one of them: a stale complete copy under an old cache
     # root can sit beside the half-downloaded copy the engine actually reads, and accepting the stale
     # one takes the node offline while the real download can never finish. Demanding all of them only
     # ever errs towards staying online, which is what the node did before DAH-2743.
     # EVERY model too, for the same reason (DAH-3341): one complete model licenses nothing while the
     # engine serves another.
-    local model repo_dir found=0
+    local model repo_dir revision found=0
     while read -r model; do
         [[ -n "${model}" ]] || continue
         while read -r repo_dir; do
             found=1
-            snapshot_under_ref_is_complete "${repo_dir}" || return 1
+            revision="$(model_revision "${model}" "${repo_dir}")" || return 1
+            snapshot_is_complete "${repo_dir}" "${revision}" || return 1
         done < <(model_cache_repo_dirs "${model}")
     done < <(hf_offline_models)
     (( found ))
@@ -650,13 +767,16 @@ run_with_timeout() {
 # — and raises IncompleteSnapshotError without them. The Hub commit of 2026-08-29 changed only
 # README.md, so on 2026-09-02 every node that had armed the switch died on the first engine start
 # while its 23 GB of weights sat complete on disk.
+# Asked about the revision the engine opens (DAH-3393): the worker pins its engine to a commit sha,
+# and an unpinned call here would resolve `main` through a ref the worker never writes.
 hf_hub_accepts_local_cache() {
-    local python_bin="$1" hf_home="$2" model="${3:-${MODEL}}"
-    HF_HOME="${hf_home}" HF_HUB_OFFLINE=1 DOLPHIN_HF_MODEL="${model}" \
+    local python_bin="$1" hf_home="$2" model="${3:-${MODEL}}" revision="${4:-}"
+    HF_HOME="${hf_home}" HF_HUB_OFFLINE=1 DOLPHIN_HF_MODEL="${model}" DOLPHIN_HF_REVISION="${revision}" \
         run_with_timeout "${HF_OFFLINE_CHECK_TIMEOUT_S}" "${python_bin}" -c '
 import os
 from huggingface_hub import snapshot_download
-snapshot_download(os.environ["DOLPHIN_HF_MODEL"], local_files_only=True)
+snapshot_download(os.environ["DOLPHIN_HF_MODEL"], revision=os.environ["DOLPHIN_HF_REVISION"] or None,
+                  local_files_only=True)
 ' >/dev/null 2>&1
 }
 
@@ -666,8 +786,7 @@ top_up_hf_cache_from_hub() {
     # PINNED to the commit the cache already holds. Unpinned, this resolves `main` at call time:
     # a commit published upstream between the check and this line would make it fetch that commit
     # instead, which is the full 23 GB of weights, past the disk floor that guards every other
-    # download. The local check above stays unpinned on purpose — it must resolve `main` from the
-    # local ref exactly like the engine does.
+    # download.
     local python_bin="$1" hf_home="$2" revision="$3" model="${4:-${MODEL}}"
     # The weights are NEVER downloaded here. Only a cache whose shards are already complete reaches
     # this line, so the files it misses are small ones. The patterns are what make the pin safe: a
@@ -722,11 +841,10 @@ hf_cache_is_engine_ready() {
         # a 23 GB download of the weights, past the disk floor that guards every other download.
         [[ "${repo_dir%/*}" == */hub ]] || continue
         hf_home="${repo_dir%/*/*}"
-        [[ -f "${repo_dir}/refs/main" ]] || continue
-        revision="$(<"${repo_dir}/refs/main")"
+        revision="$(model_revision "${model}" "${repo_dir}")" || continue
         asked=1
         for python_bin in "${pythons[@]}"; do
-            hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" "${model}" && continue
+            hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" "${model}" "${revision}" && continue
             # The wait blocks the supervisor, so it is rationed. Until the next attempt is due the
             # answer is simply no, and offline mode stays off.
             if (( SECONDS - LAST_HF_TOP_UP_AT < HF_OFFLINE_TOP_UP_MIN_INTERVAL_S )); then
@@ -747,11 +865,12 @@ hf_cache_is_engine_ready() {
             # A failed top-up (a rate limit, a Hub outage) leaves the switch off, which is what the
             # node did before DAH-2743 — never worse than today.
             top_up_hf_cache_from_hub "${python_bin}" "${hf_home}" "${revision}" "${model}" || { ready=0; continue; }
-            hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" "${model}" || ready=0
+            hf_hub_accepts_local_cache "${python_bin}" "${hf_home}" "${model}" "${revision}" || ready=0
         done
     done < <(model_cache_repo_dirs "${model}")
     done < <(hf_offline_models)
-    # No copy could be asked at all — every one sits outside a `hub` directory, or holds no ref.
+    # No copy could be asked at all — every one sits outside a `hub` directory, or nothing names its
+    # revision (no `--revision` on a serve line, no ref).
     # Arming on that would be the old file-only decision under a new name, so the answer is no and
     # the node keeps the Hub: a slower start, never a dead engine.
     (( asked && ready ))
@@ -910,11 +1029,161 @@ free_gb_on_shared_cache() {
 # while HERE a wrong no parks a healthy node for as long as the disk stays full. One stale half-copy
 # under an old cache root (the worker has moved its cache directory before) would be enough.
 model_cache_has_a_complete_copy() {
-    local repo_dir
+    local repo_dir revision snapshot_dir
     while read -r repo_dir; do
-        snapshot_under_ref_is_complete "${repo_dir}" && return 0
+        if revision="$(model_revision "${MODEL}" "${repo_dir}")"; then
+            snapshot_is_complete "${repo_dir}" "${revision}" && return 0
+            continue
+        fi
+        # Nothing names the revision yet: before the first engine of this container starts there is
+        # no command line, and the worker writes no ref. Any complete snapshot says the weights are
+        # here and no download is coming — the yes this check is biased towards; the alternative
+        # parks a restarted container with the full 21 GiB on disk for as long as the disk is full.
+        for snapshot_dir in "${repo_dir}"/snapshots/*/; do
+            [[ -d "${snapshot_dir}" ]] || continue
+            snapshot_is_complete "${repo_dir}" "$(basename "${snapshot_dir}")" && return 0
+        done
     done < <(model_cache_repo_dirs)
     return 1
+}
+
+# DAH-3393: the background fetch of the weights. See WEIGHTS_FETCH_RETRY_SECONDS for why it exists.
+
+# The pid of the fetch for <model> <revision>; empty for one that ended and is holding its slot for
+# WEIGHTS_FETCH_RETRY_SECONDS; 1 when none is known.
+weights_fetch_pid_for() {
+    local i
+    i="$(index_of "$1@$2" ${WEIGHTS_FETCH_KEYS[@]+"${WEIGHTS_FETCH_KEYS[@]}"})" || return 1
+    echo "${WEIGHTS_FETCH_PIDS[$i]}"
+}
+
+# Hold the slot of <model>@<revision> with no process for the retry time.
+hold_weights_fetch_slot() {
+    local i=${#WEIGHTS_FETCH_KEYS[@]}
+    WEIGHTS_FETCH_KEYS[i]="$1@$2"
+    WEIGHTS_FETCH_PIDS[i]=""
+    WEIGHTS_FETCH_NEXT_AT[i]=$(( SECONDS + WEIGHTS_FETCH_RETRY_SECONDS ))
+}
+
+# The interpreter of the runtime the engine was started from, so the fetch runs the same
+# huggingface_hub the engine runs — same cache layout, same lock files. Any other runtime's
+# interpreter when that one is not on disk yet.
+weights_fetch_python() {
+    local model="$1" i python_bin
+    if i="$(index_of "${model}" ${LAUNCHED_MODELS[@]+"${LAUNCHED_MODELS[@]}"})" \
+        && [[ -n "${LAUNCHED_RUNTIMES[$i]}" && -x "${LAUNCHED_RUNTIMES[$i]}/bin/python" ]]; then
+        echo "${LAUNCHED_RUNTIMES[$i]}/bin/python"
+        return 0
+    fi
+    # Sorted, so the fallback is the same interpreter on every filesystem, not whatever `find` lists first.
+    while read -r python_bin; do
+        [[ -x "${python_bin}" ]] || continue
+        echo "${python_bin}"
+        return 0
+    done < <(worker_runtime_pythons | sort)
+    return 1
+}
+
+start_weights_fetch() {
+    local python_bin="$1" hf_home="$2" model="$3" revision="$4"
+    local log="${WORKER_LOG_DIR}/worker-weights-fetch.log"
+    mkdir -p "${WORKER_LOG_DIR}"
+    echo "[dolphin] no engine serves and ${model}@${revision:0:12} is incomplete under ${hf_home}; fetching it in the background with ${python_bin} (log ${log})" >&2
+    # No timeout, on purpose: a deadline here is the worker's ten minutes under another name, and
+    # the slow link this exists for needs however long it needs. The whole snapshot, not the weights
+    # alone: the library refuses a cache that misses any file of the commit (DAH-2843), so this is
+    # what lets offline mode arm once the fetch lands. HF_HUB_OFFLINE=0 outranks our .pth (setdefault).
+    HF_HOME="${hf_home}" HF_HUB_OFFLINE=0 HF_HUB_DISABLE_PROGRESS_BARS=1 \
+        DOLPHIN_HF_MODEL="${model}" DOLPHIN_HF_REVISION="${revision}" \
+        "${python_bin}" -c '
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(os.environ["DOLPHIN_HF_MODEL"], revision=os.environ["DOLPHIN_HF_REVISION"] or None)
+' >>"${log}" 2>&1 &
+    local i=${#WEIGHTS_FETCH_KEYS[@]}
+    WEIGHTS_FETCH_KEYS[i]="${model}@${revision}"
+    WEIGHTS_FETCH_PIDS[i]=$!
+    WEIGHTS_FETCH_NEXT_AT[i]=0
+}
+
+# A fetch that ended, either way, holds its slot for the retry time before another may start for the
+# same revision: a failed one so a Hub answering 429 is not asked again on the next cycle, a finished
+# one so a snapshot the library calls complete and this file's check still rejects (a repo without
+# tokenizer.json) cannot turn into one Hub API call per 30 s.
+reap_finished_weights_fetches() {
+    local i pid keys=() pids=() next_at=()
+    for (( i = 0; i < ${#WEIGHTS_FETCH_KEYS[@]}; i++ )); do
+        pid="${WEIGHTS_FETCH_PIDS[$i]}"
+        if [[ -n "${pid}" ]]; then
+            if kill -0 "${pid}" 2>/dev/null; then
+                keys+=("${WEIGHTS_FETCH_KEYS[$i]}"); pids+=("${pid}"); next_at+=(0)
+                continue
+            fi
+            if wait "${pid}" 2>/dev/null; then
+                echo "[dolphin] background fetch of ${WEIGHTS_FETCH_KEYS[$i]} finished" >&2
+            else
+                echo "[dolphin] background fetch of ${WEIGHTS_FETCH_KEYS[$i]} failed; next attempt in ${WEIGHTS_FETCH_RETRY_SECONDS}s" >&2
+            fi
+            keys+=("${WEIGHTS_FETCH_KEYS[$i]}"); pids+=(""); next_at+=($(( SECONDS + WEIGHTS_FETCH_RETRY_SECONDS )))
+            continue
+        fi
+        # A slot held with no process: kept until its time is up.
+        if (( SECONDS < WEIGHTS_FETCH_NEXT_AT[i] )); then
+            keys+=("${WEIGHTS_FETCH_KEYS[$i]}"); pids+=(""); next_at+=("${WEIGHTS_FETCH_NEXT_AT[$i]}")
+        fi
+    done
+    WEIGHTS_FETCH_KEYS=(${keys[@]+"${keys[@]}"})
+    WEIGHTS_FETCH_PIDS=(${pids[@]+"${pids[@]}"})
+    WEIGHTS_FETCH_NEXT_AT=(${next_at[@]+"${next_at[@]}"})
+}
+
+# Once per supervisor cycle while no engine serves: for every model an engine of this container was
+# started with (hf_offline_models), every copy of it the engine has begun under a `hub` root, and
+# no fetch for that revision in flight or holding its slot, start one.
+# Arg: 1 when the caller's engine_is_serving said yes this cycle, 0 when it said no. The caller
+# passes what it measured rather than this asking again: the health round trip costs up to
+# ENGINE_HEALTH_TIMEOUT_S per socket that accepts and never answers — the looping node's normal state.
+ensure_weights_fetch() {
+    local serving="$1"
+    [[ "${WEIGHTS_FETCH_ENABLED}" != "0" ]] || return 0
+    remember_launched_engines
+    reap_finished_weights_fetches
+    (( serving )) && return 0
+    local model repo_dir revision hf_home python_bin free_gb
+    while read -r model; do
+        [[ -n "${model}" ]] || continue
+        while read -r repo_dir; do
+            # `<HF_HOME>/hub/models--<repo>`: the root the library reads (see hf_cache_is_engine_ready).
+            [[ "${repo_dir%/*}" == */hub ]] || continue
+            hf_home="${repo_dir%/*/*}"
+            # No revision known means no pin, and an unpinned fetch could land a commit the engine
+            # does not open. The engine's own download is all there is then, as before DAH-3393.
+            revision="$(model_revision "${model}" "${repo_dir}")" || continue
+            # Only a copy the engine has begun: it creates snapshots/<sha>/ (config, tokenizer) within
+            # seconds of starting, before the first byte of weights. A copy under a root the worker no
+            # longer uses has no such directory and gets no 21 GiB of its own.
+            [[ -d "${repo_dir}/snapshots/${revision}" ]] || continue
+            snapshot_is_complete "${repo_dir}" "${revision}" && continue
+            weights_fetch_pid_for "${model}" "${revision}" >/dev/null && continue
+            # DAH-2805: a download that fills the shared volume takes every filler on the node down.
+            # Said once per retry time, not once per cycle.
+            free_gb="$(free_gb_on_shared_cache)"
+            if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
+                echo "[dolphin] only ${free_gb} GB free; not fetching ${model}@${revision:0:12} for ${WEIGHTS_FETCH_RETRY_SECONDS}s" >&2
+                hold_weights_fetch_slot "${model}" "${revision}"
+                continue
+            fi
+            python_bin="$(weights_fetch_python "${model}")" || continue
+            start_weights_fetch "${python_bin}" "${hf_home}" "${model}" "${revision}"
+        done < <(model_cache_repo_dirs "${model}")
+    done < <(hf_offline_models)
+}
+
+terminate_weights_fetches() {
+    local pid
+    for pid in ${WEIGHTS_FETCH_PIDS[@]+"${WEIGHTS_FETCH_PIDS[@]}"}; do
+        [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
+    done
 }
 
 # True when spawning a worker now would fill the disk. The cheap question comes first: on a node with
@@ -986,6 +1255,8 @@ on_term() {
     for watchdog_pid in ${WATCHDOG_PIDS[@]+"${WATCHDOG_PIDS[@]}"}; do
         kill -TERM "${watchdog_pid}" 2>/dev/null || true
     done
+    # A half-fetched file is left as hf_hub's `.incomplete`, which the validator sweeps (DAH-2805).
+    terminate_weights_fetches
     terminate_workers
     exit 0
 }
@@ -1052,6 +1323,9 @@ supervise_running_workers_until_new_binary_published() {
         # leaves the container on the Hub for the rest of its life. The same call takes the switch
         # off again when it is on and no engine serves.
         sync_hf_offline_with_cache_and_engines
+        # DAH-3393: while no engine serves, the weights an engine was started with and has not
+        # landed are fetched here, with no deadline, so the worker's ten minutes stop deciding.
+        ensure_weights_fetch "${engine_serving}"
         # Measured at most once per cycle, and only if some worker actually wants respawning: the
         # answer cannot change inside a cycle, and on a healthy node nobody asks the question at all.
         spawn_is_held_back_by_disk=""
