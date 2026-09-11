@@ -5,6 +5,9 @@ name: build-smoke
 # host (`E2E_GPU=1 scripts/build-smoke.sh <template>`, run by the loop on a Lium pod) the same script also requires
 # nvidia-smi inside every container and torch.cuda where torch imports. Nothing is pushed: images are tagged lium-smoke/<template> and
 # removed. A push to master only resolves the bake files (its diff against origin/master is empty). Stable job name so it can be required.
+# Each build pulls its base images first (3 tries of T_PULL=8m each, all within T_PULL_TOTAL=25m — a stalled registry ends with a
+# message instead of eating the 40-minute build budget, DAH-3409)
+# and writes its full log to artifacts/build-<template>.log, kept by the upload below even when the step times out.
 on:
   pull_request:
   push:
@@ -44,6 +47,11 @@ jobs:
           grep -q "missing Dockerfile for target(s): ubuntu2404" <<<"$out"
           out=$(scripts/build-smoke.sh nosuch 2>&1) && { echo "$out"; echo "an unknown template did not fail the check"; exit 1; }
           grep -q "templates/nosuch has no docker-bake.hcl" <<<"$out"
+          # the pre-pull list: better-a1111's Dockerfile has four FROM lines, three of them stage references (`base`, `a1111-install` twice) —
+          # exactly one registry image must come out, and it must be a `${BASE_IMAGE}` that resolved to a repo:tag, not the literal
+          bases=$(scripts/build-smoke.sh --bases better-a1111) || { echo "--bases failed"; exit 1; }
+          [ "$(wc -l <<<"$bases")" -eq 1 ] || { printf 'stage aliases leaked into the pull list:\n%s\n' "$bases"; exit 1; }
+          grep -Eq '^[a-z0-9./-]+:[A-Za-z0-9._-]+$' <<<"$bases" || { echo "not an image reference: $bases"; exit 1; }
           rm -rf artifacts
       - name: bake --print every template; build + boot the changed ones
         id: smoke
