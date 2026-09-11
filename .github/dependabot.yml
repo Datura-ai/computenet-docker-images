@@ -1,0 +1,26 @@
+# Dependabot: one grouped PR per week for the one pip manifest whose image is still built and shipped (batch-port-verifier,
+# the executor's port check). Security fixes grouped too, at most 2 open PRs, no automatic rebases (build-smoke rebuilds
+# the template on every PR push, so a rebase nobody asked for costs a full image build). Major version bumps are left out of
+# the weekly group on purpose — they need a human decision. The other two requirements.txt templates, diffsynth and
+# fast-stable-diffusion, are not listed: neither image is in the live template set (jam6099, #60, 8 Sep 2026) and their
+# alerts are dismissed as not_used.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /templates/batch-port-verifier
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 2
+    rebase-strategy: disabled
+    labels: [dependencies]
+    groups:
+      batch-port-verifier:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
+      batch-port-verifier-security:
+        applies-to: security-updates
+        patterns: ["*"]
