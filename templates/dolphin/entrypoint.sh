@@ -442,7 +442,7 @@ HF_OFFLINE_HELD_OFF=0
 # Mac whose bash 3.2 has no associative arrays.
 LAUNCHED_MODELS=()
 LAUNCHED_REVISIONS=()
-LAUNCHED_RUNTIMES=()
+LAUNCHED_RUNTIME_DIRS=()
 # The background fetches: one slot per "<model>@<revision>", its pid (empty once it ended or the disk
 # floor refused it), and when the slot may be reused.
 WEIGHTS_FETCH_KEYS=()
@@ -684,13 +684,13 @@ remember_launched_engines() {
     [[ -n "${lines}" ]] || return 0
     LAUNCHED_MODELS=()
     LAUNCHED_REVISIONS=()
-    LAUNCHED_RUNTIMES=()
+    LAUNCHED_RUNTIME_DIRS=()
     while read -r model revision runtime; do
         [[ -n "${model}" ]] || continue
         i=${#LAUNCHED_MODELS[@]}
         LAUNCHED_MODELS[i]="${model}"
         LAUNCHED_REVISIONS[i]="${revision#-}"
-        LAUNCHED_RUNTIMES[i]="${runtime#-}"
+        LAUNCHED_RUNTIME_DIRS[i]="${runtime#-}"
     done <<<"${lines}"
 }
 
@@ -1058,7 +1058,7 @@ weights_fetch_pid_for() {
 }
 
 # Hold the slot of <model>@<revision> with no process for the retry time.
-hold_weights_fetch_slot() {
+defer_weights_fetch() {
     local i=${#WEIGHTS_FETCH_KEYS[@]}
     WEIGHTS_FETCH_KEYS[i]="$1@$2"
     WEIGHTS_FETCH_PIDS[i]=""
@@ -1071,8 +1071,8 @@ hold_weights_fetch_slot() {
 weights_fetch_python() {
     local model="$1" i python_bin
     if i="$(index_of "${model}" ${LAUNCHED_MODELS[@]+"${LAUNCHED_MODELS[@]}"})" \
-        && [[ -n "${LAUNCHED_RUNTIMES[$i]}" && -x "${LAUNCHED_RUNTIMES[$i]}/bin/python" ]]; then
-        echo "${LAUNCHED_RUNTIMES[$i]}/bin/python"
+        && [[ -n "${LAUNCHED_RUNTIME_DIRS[$i]}" && -x "${LAUNCHED_RUNTIME_DIRS[$i]}/bin/python" ]]; then
+        echo "${LAUNCHED_RUNTIME_DIRS[$i]}/bin/python"
         return 0
     fi
     # Sorted, so the fallback is the same interpreter on every filesystem, not whatever `find` lists first.
@@ -1170,7 +1170,7 @@ ensure_weights_fetch() {
             free_gb="$(free_gb_on_shared_cache)"
             if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
                 echo "[dolphin] only ${free_gb} GB free; not fetching ${model}@${revision:0:12} for ${WEIGHTS_FETCH_RETRY_SECONDS}s" >&2
-                hold_weights_fetch_slot "${model}" "${revision}"
+                defer_weights_fetch "${model}" "${revision}"
                 continue
             fi
             python_bin="$(weights_fetch_python "${model}")" || continue
