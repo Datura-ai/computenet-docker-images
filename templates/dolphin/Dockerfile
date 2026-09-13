@@ -60,7 +60,8 @@ COPY watchdog.py ${DOLPHIN_HOME}/watchdog.py
 
 # entrypoint.sh renders worker.json from env, ensures the binary is present, then supervises
 # `dolphinpod-worker update && dolphinpod-worker start` in a restart loop: when the worker exits
-# for a self-update (or crashes) it is restarted onto the freshly fetched binary, and an etag
-# poll on the download URL forces that restart if the worker's own self-update never fires.
+# for a self-update (or crashes) it is restarted onto the freshly fetched binary, and a poll on the
+# download URL's change token (the first header present of `x-bz-info-sha256`, `ETag`,
+# `x-bz-file-id`, `Last-Modified`) forces that restart if the worker's own self-update never fires.
 # `docker stop` still ends the worker cleanly (SIGTERM is forwarded).
 CMD ["/usr/local/bin/entrypoint.sh"]

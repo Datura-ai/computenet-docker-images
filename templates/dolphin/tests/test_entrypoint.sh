@@ -6,7 +6,9 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENTRYPOINT="${HERE}/../entrypoint.sh"
+# Overridable so the suite can be pointed at another revision of the entrypoint as a negative
+# control: `ENTRYPOINT=<path> bash tests/test_entrypoint.sh`.
+ENTRYPOINT="${ENTRYPOINT:-${HERE}/../entrypoint.sh}"
 FAILURES=0
 
 assert_eq() {
@@ -1683,6 +1685,210 @@ test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete() {
         "$(download_floor_blocks_spawn && echo yes || echo no)"
 }
 
+# ---------------------------------------------------------------- DAH-3455 forced-update change token
+mock_head_headers() {
+    # Args: the response headers of a HEAD on WORKER_URL, one per argument, `\r\n`-terminated like
+    # a real one. The stub answers `curl -I` with them and fails every other call, so no engine is
+    # serving. Written whole and moved into place: a supervisor in the background reads the file
+    # once a second and must never see half a header set.
+    local headers_file="${SANDBOX}/head-headers.txt" line
+    : >"${headers_file}.tmp"
+    for line in "$@"; do
+        printf '%s\r\n' "${line}" >>"${headers_file}.tmp"
+    done
+    printf '\r\n' >>"${headers_file}.tmp"
+    mv -f "${headers_file}.tmp" "${headers_file}"
+    [[ -x "${SANDBOX}/bin/curl" && -f "${SANDBOX}/curl-answers-head" ]] && return 0
+    cat >"${SANDBOX}/bin/curl" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+    [[ "\${arg}" == "-fsSI" || "\${arg}" == "-I" ]] && { cat "${headers_file}"; exit 0; }
+done
+exit 1
+EOF
+    chmod +x "${SANDBOX}/bin/curl"
+    touch "${SANDBOX}/curl-answers-head"
+}
+
+B2_SHA256_HEADERS=(
+    "HTTP/2 200"
+    "content-length: 10571900"
+    "x-bz-file-name: dolphinpod-worker-v2_linux_amd64"
+    "x-bz-file-id: 4_z6b1c27010dcbad5c92f70b13_f104b9f1357ac04e8_d20260912_m210729"
+    "x-bz-content-sha1: unverified:c249b2e28945573b2c4197e3309837cdc66dd1f6"
+    "x-bz-upload-timestamp: 1789247249050"
+    "x-bz-info-sha256: 8985df64123b9e72b9682958416142816c00955809adb1272084f13bf84967b2"
+    "x-bz-info-worker-version: v2.4.3"
+    "cf-cache-status: DYNAMIC"
+)
+
+test_update_token_reads_the_headers_the_server_sends() {
+    make_sandbox
+    load_entrypoint
+
+    # The regression: updates.dphn.ai (B2 behind Cloudflare) sends no ETag, and the poll read the
+    # ETag alone. The headers of 2026-09-13 22:55Z minus the request-specific ones, the file id
+    # shortened.
+    mock_head_headers "${B2_SHA256_HEADERS[@]}"
+    assert_eq "B2 headers yield the published sha256" \
+        "8985df64123b9e72b9682958416142816c00955809adb1272084f13bf84967b2" "$(published_etag)"
+
+    # The sha256 outranks an ETag when both are present: it names the bytes, the ETag names the
+    # server's opinion of them, and a CDN may rewrite the latter.
+    mock_head_headers "HTTP/1.1 200 OK" 'ETag: "cdn-1"' \
+        "X-Bz-Info-Sha256: aaaa" "Last-Modified: Fri, 12 Sep 2026 21:07:29 GMT"
+    assert_eq "the sha256 wins over the etag, case-insensitively" "aaaa" "$(published_etag)"
+
+    # A plain HTTP server without B2 headers still works the way the poll always did.
+    mock_head_headers "HTTP/1.1 200 OK" 'ETag: "abc-123"' "Content-Length: 5"
+    assert_eq "etag only yields the etag" '"abc-123"' "$(published_etag)"
+
+    # RFC 9110 makes the space after the colon optional; the name is the line up to the colon.
+    mock_head_headers "HTTP/1.1 200 OK" 'etag:"tight"'
+    assert_eq "no space after the colon still matches" '"tight"' "$(published_etag)"
+
+    mock_head_headers "HTTP/1.1 200 OK" "x-bz-file-id: 4_zfile" "Last-Modified: Fri, 12 Sep 2026 21:07:29 GMT"
+    assert_eq "the file id outranks last-modified" "4_zfile" "$(published_etag)"
+
+    # Last-Modified holds spaces: the value is the rest of the line, not the second word.
+    mock_head_headers "HTTP/1.1 200 OK" "Last-Modified: Fri, 12 Sep 2026 21:07:29 GMT"
+    assert_eq "last-modified is the last resort, whole value" "Fri, 12 Sep 2026 21:07:29 GMT" "$(published_etag)"
+
+    mock_head_headers "HTTP/1.1 200 OK" "Content-Length: 5"
+    assert_eq "no token header yields an empty token" "" "$(published_etag)"
+    assert_eq "an empty token is said out loud" \
+        "[dolphin] no change token from WORKER_URL; forced-update fallback inactive" \
+        "$(warn_if_no_update_token "" 2>&1)"
+    assert_eq "a token is not" "" "$(warn_if_no_update_token "8985df64" 2>&1)"
+
+    # A failed HEAD (server down, 429) is an empty token, never a stray exit under pipefail.
+    rm -f "${SANDBOX}/curl-answers-head"
+    cat >"${SANDBOX}/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 22
+EOF
+    assert_eq "a failed HEAD is an empty token" "" "$(published_etag || true)"
+
+    # No binary on the volume yet: nothing to compare a published sha256 against, and no error
+    # either, so the caller's `|| true` is not what keeps the supervisor alive.
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    WORKER_BIN="${DOLPHIN_HOME}/dolphinpod-worker"
+    assert_eq "no binary hashes to nothing, quietly" "ok" "$(worker_binary_sha256 && echo ok)"
+}
+
+supervise_for_the_test() {
+    # Runs the supervisor over one live worker in the background, LIVENESS_INTERVAL=1 and
+    # CHECK_INTERVAL=1 so a poll happens about every second; stderr goes to a file. Sets
+    # SUPERVISE_PID and SUPERVISE_LOG.
+    SUPERVISE_LOG="${SANDBOX}/supervise.log"
+    ( LIVENESS_INTERVAL=1; CHECK_INTERVAL=1
+      supervise_running_workers_until_new_binary_published "$1" ) 2>"${SUPERVISE_LOG}" &
+    SUPERVISE_PID=$!
+}
+
+supervisor_returned_within() {
+    # Args: seconds. yes when the supervisor exited (restart path taken) inside that window.
+    local waited=0
+    while kill -0 "${SUPERVISE_PID}" 2>/dev/null && (( waited < $1 * 2 )); do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    if kill -0 "${SUPERVISE_PID}" 2>/dev/null; then echo no; else echo yes; fi
+}
+
+stop_supervisor() {
+    # A supervisor that (wrongly) never returned would outlive the suite and hold its stdout open.
+    kill "${SUPERVISE_PID}" 2>/dev/null
+    wait "${SUPERVISE_PID}" 2>/dev/null
+}
+
+test_a_changed_update_token_restarts_the_workers() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export DOLPHIN_WORKER_SPAWN_STATE="${SANDBOX}/spawns.json"
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    mkdir -p "${DOLPHIN_HOME}"
+    load_entrypoint
+    GPU_SETS=("all")
+    INSTANCE_HOMES=("${SANDBOX}/home")
+    # Outlives every deadline below with margin: a stand-in that exited mid-test would make the
+    # supervisor respawn it and re-baseline, changing what the later phases test.
+    sleep 600 &
+    WORKER_PIDS=($!)
+
+    # On master the loop compared two empty strings forever: with the real headers the token was
+    # empty on both sides and the restart path was unreachable. Same token on both sides: no restart.
+    mock_head_headers "${B2_SHA256_HEADERS[@]}"
+    supervise_for_the_test "$(published_etag)"
+    assert_eq "an unchanged token keeps the workers running" "no" "$(supervisor_returned_within 3)"
+
+    # Dolphin publishes a new binary: the sha256 changes and the supervisor returns so
+    # run_worker_supervisor_loop restarts every worker onto it.
+    mock_head_headers "HTTP/2 200" "x-bz-info-sha256: 1111111111111111111111111111111111111111111111111111111111111111" \
+        "x-bz-info-worker-version: v2.4.4"
+    assert_eq "a changed token takes the restart path" "yes" "$(supervisor_returned_within 6)"
+    assert_eq "and says which token moved" "1" \
+        "$(grep -c 'new worker binary published (8985df64.* -> 1111.*); restarting workers to update' "${SUPERVISE_LOG}")"
+    stop_supervisor
+
+    # A HEAD that fails at start left the baseline empty. The published sha256 is the sha256 of
+    # the file, and refresh_binary remembers the sha of the bytes it spawned the workers from, so
+    # the two say whether the workers run the published binary: the same bytes → the token
+    # becomes the baseline, no restart, and the NEXT change restarts.
+    printf '#!/usr/bin/env bash\n# dolphinpod-worker v2.4.3 stand-in: `update` succeeds and changes nothing.\nexit 0\n' >"${WORKER_BIN}"
+    chmod +x "${WORKER_BIN}"
+    local spawned_sha="62b43325f9b4ef4750bade884c1788934079f4f06f197b7b508df4c4f5c1087a"
+    # Through the real writer: a `local`, a rename or a `set -u` slip on that line would leave the
+    # variable empty in production and every empty-baseline poll would silently adopt.
+    refresh_binary
+    assert_eq "refresh_binary records the sha of the bytes it leaves" "${spawned_sha}" "${RUNNING_BIN_SHA:-}"
+    mock_head_headers "HTTP/2 200" "x-bz-info-sha256: ${spawned_sha}"
+    supervise_for_the_test ""
+    assert_eq "an empty baseline is filled by the token of the bytes the workers run, no restart" "no" \
+        "$(supervisor_returned_within 3)"
+    assert_eq "the late baseline is logged" "yes" \
+        "$(grep -q "change token baseline set on a later poll: ${spawned_sha}" "${SUPERVISE_LOG}" && echo yes || echo no)"
+    mock_head_headers "HTTP/2 200" "x-bz-info-sha256: 2222222222222222222222222222222222222222222222222222222222222222"
+    assert_eq "a change after the late baseline restarts" "yes" "$(supervisor_returned_within 6)"
+    stop_supervisor
+
+    # Different bytes: a publish landed between `update` and the first poll that could read a
+    # token (or `update` failed at spawn). Taking it as the baseline would park the workers on
+    # the old binary until the publish after that one; the restart path is taken instead.
+    mock_head_headers "${B2_SHA256_HEADERS[@]}"
+    supervise_for_the_test ""
+    assert_eq "an empty baseline against other bytes than the workers run restarts" "yes" "$(supervisor_returned_within 6)"
+    assert_eq "and names both" "1" \
+        "$(grep -c "new worker binary published (running ${spawned_sha}, published 8985df64.*); restarting workers to update" "${SUPERVISE_LOG}")"
+    stop_supervisor
+
+    # A token that is not a sha256 cannot be checked against the disk: it is taken as the baseline.
+    mock_head_headers "HTTP/1.1 200 OK" 'ETag: "cdn-7"'
+    supervise_for_the_test ""
+    assert_eq "an empty baseline takes a non-sha token as is, no restart" "no" "$(supervisor_returned_within 3)"
+    stop_supervisor
+    assert_eq "and logs it" "yes" \
+        "$(grep -q 'change token baseline set on a later poll: "cdn-7"' "${SUPERVISE_LOG}" && echo yes || echo no)"
+
+    # No token header at all: the fallback is inactive and every poll says so, so a server that
+    # stops sending the headers shows up in the logs rather than silently disabling the fallback.
+    # The count gets its own deadline: two polls take a little over 2 s on an idle box and longer
+    # on a loaded one, and the assertion is about the count, not the speed.
+    mock_head_headers "HTTP/1.1 200 OK" "Content-Length: 5"
+    supervise_for_the_test ""
+    assert_eq "no token never restarts" "no" "$(supervisor_returned_within 3)"
+    local waited=0
+    while (( $(grep -c 'no change token from WORKER_URL; forced-update fallback inactive' "${SUPERVISE_LOG}") < 2 && waited < 20 )); do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    stop_supervisor
+    assert_eq "every poll without a token warns" "yes" \
+        "$(if (( $(grep -c 'no change token from WORKER_URL; forced-update fallback inactive' "${SUPERVISE_LOG}") >= 2 )); then echo yes; else echo no; fi)"
+
+    kill "${WORKER_PIDS[0]}" 2>/dev/null; wait "${WORKER_PIDS[0]}" 2>/dev/null
+}
+
 test_plan
 test_render
 test_prepare_instance_home
@@ -1719,6 +1925,8 @@ test_respawns_are_staggered
 test_worker_logs_are_per_container_and_pruned
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
 test_binary_download_asks_curl_to_retry_within_time_bounds
+test_update_token_reads_the_headers_the_server_sends
+test_a_changed_update_token_restarts_the_workers
 
 if [[ ${FAILURES} -gt 0 ]]; then
     echo "${FAILURES} test(s) failed"
