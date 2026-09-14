@@ -10,8 +10,10 @@
 # the template's `smoke` group when it defines one, else the first target of `default` — and the image is booted
 # with its own CMD (its base images are pulled first, each try under T_PULL, 3 tries, all of them within T_PULL_TOTAL,
 # so a stalled registry ends with a message instead of eating the build budget): pod templates (they ship /start.sh) must answer python3; the `pytorch` template must `import torch`; on a GPU host
-# nvidia-smi must list the GPU in every image and torch.cuda must be available where torch imports; templates/<name>/smoke.sh runs inside the container when present. Every step under `timeout`;
-# artifacts/ gets timings.txt and summary.md (the CI job posts it). Exit 0 only when every step passed.
+# nvidia-smi must list the GPU in every image and torch.cuda must be available where torch imports; templates/<name>/smoke.sh runs inside the container when present.
+# A template whose entrypoint exits without a GPU (pearl-miner: exit 1 at its wallet guard, then at "no NVIDIA GPUs visible") declares it in
+# templates/<name>/smoke.gpu: it is still built everywhere, but booted only under E2E_GPU=1 — on a CPU host its boot row reads SKIP, not FAIL. Every step under `timeout`;
+# artifacts/ gets timings.txt and summary.md (the CI job posts it). Exit 0 only when every step passed or was skipped this way.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BASE=${BASE:-origin/master}
@@ -25,6 +27,10 @@ step() {  # step <name> <timeout> <function-or-cmd...>  (functions below are exp
   case $rc in 0) status=pass ;; 124|137) status="TIMEOUT(>$t)" ;; *) status="FAIL(rc=$rc)" ;; esac
   printf '%s\t%ds\t%s\n' "$name" "$((SECONDS - t0))" "$status" >> "$A/timings.txt"
   echo "smoke: $name $status in $((SECONDS - t0))s"; [ $rc -eq 0 ] || FAILED="${FAILED:+$FAILED }$name"; return $rc
+}
+
+skip() {  # skip <name> <reason>: a step this host cannot run gets its own row — neither a pass nor a failure
+  printf '%s\t0s\tSKIP(%s)\n' "$1" "$2" >> "$A/timings.txt"; echo "smoke: $1 SKIP($2)"
 }
 
 changed_templates() {
@@ -171,7 +177,10 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
 
 summary() {
   { echo "**image smoke: $([ -z "$FAILED" ] && echo PASS || echo "FAIL ($FAILED)")**"; echo; echo "| step | result | time |"; echo "|---|---|---|"
-    while IFS=$'\t' read -r n s st; do echo "| $n | $([ "$st" = pass ] && echo ✅ || echo ❌) $st | $s |"; done < "$A/timings.txt"; } > "$A/summary.md"
+    while IFS=$'\t' read -r n s st; do
+      case $st in pass) icon=✅ ;; SKIP*) icon=⏭️ ;; *) icon=❌ ;; esac
+      echo "| $n | $icon $st | $s |"
+    done < "$A/timings.txt"; } > "$A/summary.md"
   cat "$A/summary.md"
 }
 
@@ -191,7 +200,14 @@ for t in $TEMPLATES; do
     if [ $# -gt 0 ]; then echo "templates/$t has no docker-bake.hcl"; FAILED="${FAILED:+$FAILED }build-$t"; printf '%s\t0s\tFAIL(no bake file)\n' "build-$t" >> "$A/timings.txt"; else echo "templates/$t has no docker-bake.hcl — skipped"; fi
     continue
   fi
-  step "build-$t" "$T_BUILD" build_one "$t" && step "boot-$t" "$T_BOOT" boot_one "$t"
+  if step "build-$t" "$T_BUILD" build_one "$t"; then
+    if [ -f "templates/$t/smoke.gpu" ] && [ -z "${E2E_GPU:-}" ]; then
+      # GPU-only template on a CPU host: the build is the check; the boot would only prove the entrypoint's guards fire
+      skip "boot-$t" "GPU-only template, boots under E2E_GPU=1"
+    else
+      step "boot-$t" "$T_BOOT" boot_one "$t"
+    fi
+  fi
   docker rm -f "smoke-$t" >/dev/null 2>&1 || true                    # also after a boot timeout, when boot_one never reached docker stop
   docker image rm -f "lium-smoke/$t:latest" >/dev/null 2>&1 || true   # runners have ~14 GB free; one image at a time
 done
