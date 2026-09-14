@@ -364,20 +364,37 @@ test_backoff_counts_a_long_dead_download_as_failed() {
 }
 
 # ------------------------------------------------- DAH-3475: the container gives up after N unserved spawns
-test_unserved_spawn_cap_is_reached_only_by_a_worker_that_never_served() {
+test_unserved_spawn_cap_is_reached_only_when_no_worker_serves() {
     make_sandbox
     export DOLPHIN_MAX_UNSERVED_SPAWNS=3
     load_entrypoint
 
     # Regression: before the cap the supervisor respawned a worker that never served forever; the
     # seven 10 Sep 2026 fillers sat RUNNING 12 h at 36-69 spawns each.
+    WORKER_PIDS=(1)
+    WORKER_SERVED=(0)
     WORKER_FAST_EXITS=(2)
-    assert_eq "one short of the cap keeps respawning" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
+    assert_eq "one short of the cap keeps respawning" "1" "$(unserved_spawn_cap_reached; echo $?)"
     WORKER_FAST_EXITS=(3)
-    assert_eq "the cap is reached at N failed exits in a row" "0" "$(unserved_spawn_cap_reached 0; echo $?)"
-    WORKER_FAST_EXITS=(0 3)
-    assert_eq "the cap is per worker" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
-    assert_eq "a sibling at the cap trips it" "0" "$(unserved_spawn_cap_reached 1; echo $?)"
+    assert_eq "the cap is reached at N failed exits in a row" "0" "$(unserved_spawn_cap_reached; echo $?)"
+
+    # Regression (review of #71): the cap was per worker, so one dead worker on an 8-GPU node took
+    # the seven serving siblings down with it. The trip is container-wide.
+    WORKER_PIDS=(1 2 3 4 5 6 7 8)
+    WORKER_SERVED=(0 1 1 1 1 1 1 1)
+    WORKER_FAST_EXITS=(3 0 0 0 0 0 0 0)
+    assert_eq "one dead worker among 8 does not exit the container" "1" "$(unserved_spawn_cap_reached; echo $?)"
+    WORKER_SERVED=(0 0 0 0 0 0 0 0)
+    WORKER_FAST_EXITS=(3 3 3 3 3 3 3 2)
+    assert_eq "one sibling short of the cap keeps the container up" "1" "$(unserved_spawn_cap_reached; echo $?)"
+    WORKER_FAST_EXITS=(3 3 3 3 3 3 3 3)
+    assert_eq "all 8 dead trips the cap" "0" "$(unserved_spawn_cap_reached; echo $?)"
+    # A worker at the cap that is serving on its current spawn has WORKER_SERVED set and its counter
+    # not yet reset (the reset happens on exit); it keeps the container up.
+    WORKER_SERVED=(0 0 0 0 0 0 0 1)
+    assert_eq "a worker serving now keeps the container up" "1" "$(unserved_spawn_cap_reached; echo $?)"
+    WORKER_PIDS=()
+    assert_eq "no workers is not a dead node" "1" "$(unserved_spawn_cap_reached; echo $?)"
 
     # Driving the predicate here would still pass if someone dropped it from the loop: the supervisor
     # must ask it after every failed exit and leave the container on a yes.
@@ -390,8 +407,10 @@ test_unserved_spawn_cap_is_reached_only_by_a_worker_that_never_served() {
 
     export DOLPHIN_MAX_UNSERVED_SPAWNS=0
     load_entrypoint
+    WORKER_PIDS=(1)
+    WORKER_SERVED=(0)
     WORKER_FAST_EXITS=(50)
-    assert_eq "0 disables the cap" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
+    assert_eq "0 disables the cap" "1" "$(unserved_spawn_cap_reached; echo $?)"
     unset DOLPHIN_MAX_UNSERVED_SPAWNS
 }
 
@@ -1747,7 +1766,7 @@ test_a_throttled_node_reaches_serving_through_the_background_fetch
 test_hf_offline_arms_on_a_cache_the_worker_pinned_by_revision
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
-test_unserved_spawn_cap_is_reached_only_by_a_worker_that_never_served
+test_unserved_spawn_cap_is_reached_only_when_no_worker_serves
 test_respawns_are_staggered
 test_worker_logs_are_per_container_and_pruned
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete

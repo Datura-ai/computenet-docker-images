@@ -124,13 +124,15 @@ WORKER_LOG_RETENTION_DAYS="${DOLPHIN_WORKER_LOG_RETENTION_DAYS:-7}"
 # catch a crash loop would call those attempts healthy and leave the backoff at zero in the very
 # incident it was written for. An engine socket is the one signal that cannot be wrong about it.
 WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS:-600}"
-# DAH-3475: after this many failed exits IN A ROW of one worker (the same counter the backoff and
-# the sidecar's dolphin_worker_fast_exits read) the container exits non-zero instead of respawning
-# forever. The backend's reconciler then closes the run as FAILED, which is a launch strike for its
-# DAH-2475 ladder, so a node the image cannot bring up is handed to the next strategy instead of
-# looping as RUNNING (7 fillers, 46 GPUs, 12 h on 10 Sep 2026). With the backoff above (0, 60, 120,
-# 240, 480, 600, 600 s) plus each worker's own backend timeout, 8 unserved spawns take about two
-# hours. 0 disables the cap.
+# DAH-3475: when EVERY worker has this many failed exits IN A ROW (the same counter the backoff and
+# the sidecar's dolphin_worker_fast_exits read) and none is serving, the container exits non-zero
+# instead of respawning forever. The backend's reconciler then closes the run as FAILED, which is a
+# launch strike for its DAH-2475 ladder, so a node the image cannot bring up is handed to the next
+# strategy instead of looping as RUNNING (7 fillers, 46 GPUs, 12 h on 10 Sep 2026). The trip is
+# container-wide, not per worker: one dead worker on an 8-GPU node keeps respawning on its own
+# while the seven serving siblings keep earning. With the backoff above (0, 60, 120, 240, 480, 600,
+# 600 s) plus each worker's own backend timeout, 8 unserved spawns take about two hours. 0 disables
+# the cap.
 WORKER_MAX_UNSERVED_SPAWNS="${DOLPHIN_MAX_UNSERVED_SPAWNS:-8}"
 # Spawn counters for the metrics sidecar: a node redownloading in a loop must stop looking
 # identical (engines_up 0) to a node patiently loading.
@@ -991,12 +993,19 @@ sync_hf_offline_with_cache_and_engines() {
 }
 
 # Atomic (tmp + mv): the sidecar reads this file on every scrape and must never see half a JSON.
-# DAH-3475: true when worker `idx` has failed WORKER_MAX_UNSERVED_SPAWNS spawns in a row without an
-# engine ever answering. A served worker resets its counter, so only a node that never came up trips it.
+# DAH-3475: true when EVERY worker has failed WORKER_MAX_UNSERVED_SPAWNS spawns in a row without an
+# engine answering, and none is serving right now. Container-wide on purpose: a single worker at the
+# cap keeps respawning on its own, the siblings that serve keep the node earning. A served worker
+# resets its counter on exit and carries WORKER_SERVED while alive, so either one keeps the container up.
 unserved_spawn_cap_reached() {
-    local idx="$1"
+    local i
     (( WORKER_MAX_UNSERVED_SPAWNS > 0 )) || return 1
-    (( ${WORKER_FAST_EXITS[$idx]:-0} >= WORKER_MAX_UNSERVED_SPAWNS ))
+    (( ${#WORKER_PIDS[@]} > 0 )) || return 1
+    for i in "${!WORKER_PIDS[@]}"; do
+        (( ${WORKER_SERVED[$i]:-0} )) && return 1
+        (( ${WORKER_FAST_EXITS[$i]:-0} >= WORKER_MAX_UNSERVED_SPAWNS )) || return 1
+    done
+    return 0
 }
 
 write_spawn_state() {
@@ -1371,9 +1380,9 @@ supervise_running_workers_until_new_binary_published() {
                 echo "[dolphin] worker [${GPU_SETS[$i]}] exited" \
                     "(served: ${WORKER_SERVED[$i]:-0}, failed exits in a row:" \
                     "${WORKER_FAST_EXITS[$i]}); respawn in ${backoff}s" >&2
-                if unserved_spawn_cap_reached "${i}"; then
-                    echo "[dolphin] worker [${GPU_SETS[$i]}] failed ${WORKER_FAST_EXITS[$i]} spawns in a row" \
-                        "without ever serving (cap ${WORKER_MAX_UNSERVED_SPAWNS}); giving the node back" >&2
+                if unserved_spawn_cap_reached; then
+                    echo "[dolphin] every worker failed ${WORKER_MAX_UNSERVED_SPAWNS} or more spawns in a row" \
+                        "and none is serving (cap ${WORKER_MAX_UNSERVED_SPAWNS}); giving the node back" >&2
                     terminate_workers
                     exit 3
                 fi
