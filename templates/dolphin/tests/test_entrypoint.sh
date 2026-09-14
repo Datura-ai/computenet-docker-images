@@ -379,12 +379,14 @@ test_unserved_spawn_cap_is_reached_only_by_a_worker_that_never_served() {
     assert_eq "the cap is per worker" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
     assert_eq "a sibling at the cap trips it" "0" "$(unserved_spawn_cap_reached 1; echo $?)"
 
-    # A worker that served resets its counter (the existing backoff rule), so a node that came up
-    # and later crashes once never trips the cap.
-    WORKER_SERVED=(1)
-    WORKER_FAST_EXITS=(3)
-    WORKER_FAST_EXITS[0]=$(( ${WORKER_SERVED[0]} ? 0 : WORKER_FAST_EXITS[0] + 1 ))
-    assert_eq "a served worker's exit resets the streak" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
+    # Driving the predicate here would still pass if someone dropped it from the loop: the supervisor
+    # must ask it after every failed exit and leave the container on a yes.
+    assert_eq "the supervisor checks the cap" "1" \
+        "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
+            | grep -c 'if unserved_spawn_cap_reached')"
+    assert_eq "the supervisor exits the container at the cap" "1" \
+        "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
+            | grep -c '^ *exit 3$')"
 
     export DOLPHIN_MAX_UNSERVED_SPAWNS=0
     load_entrypoint

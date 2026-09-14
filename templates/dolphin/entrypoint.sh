@@ -128,8 +128,9 @@ WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS
 # the sidecar's dolphin_worker_fast_exits read) the container exits non-zero instead of respawning
 # forever. The backend's reconciler then closes the run as FAILED, which is a launch strike for its
 # DAH-2475 ladder, so a node the image cannot bring up is handed to the next strategy instead of
-# looping as RUNNING (7 fillers, 46 GPUs, 12 h on 10 Sep 2026). With the capped backoff above, 8
-# unserved spawns take about two hours. 0 disables the cap.
+# looping as RUNNING (7 fillers, 46 GPUs, 12 h on 10 Sep 2026). With the backoff above (0, 60, 120,
+# 240, 480, 600, 600 s) plus each worker's own backend timeout, 8 unserved spawns take about two
+# hours. 0 disables the cap.
 WORKER_MAX_UNSERVED_SPAWNS="${DOLPHIN_MAX_UNSERVED_SPAWNS:-8}"
 # Spawn counters for the metrics sidecar: a node redownloading in a loop must stop looking
 # identical (engines_up 0) to a node patiently loading.
