@@ -363,6 +363,36 @@ test_backoff_counts_a_long_dead_download_as_failed() {
     assert_eq "no socket reads as not serving" "1" "$(engine_socket_present; echo $?)"
 }
 
+# ------------------------------------------------- DAH-3475: the container gives up after N unserved spawns
+test_unserved_spawn_cap_is_reached_only_by_a_worker_that_never_served() {
+    make_sandbox
+    export DOLPHIN_MAX_UNSERVED_SPAWNS=3
+    load_entrypoint
+
+    # Regression: before the cap the supervisor respawned a worker that never served forever; the
+    # seven 10 Sep 2026 fillers sat RUNNING 12 h at 36-69 spawns each.
+    WORKER_FAST_EXITS=(2)
+    assert_eq "one short of the cap keeps respawning" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
+    WORKER_FAST_EXITS=(3)
+    assert_eq "the cap is reached at N failed exits in a row" "0" "$(unserved_spawn_cap_reached 0; echo $?)"
+    WORKER_FAST_EXITS=(0 3)
+    assert_eq "the cap is per worker" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
+    assert_eq "a sibling at the cap trips it" "0" "$(unserved_spawn_cap_reached 1; echo $?)"
+
+    # A worker that served resets its counter (the existing backoff rule), so a node that came up
+    # and later crashes once never trips the cap.
+    WORKER_SERVED=(1)
+    WORKER_FAST_EXITS=(3)
+    WORKER_FAST_EXITS[0]=$(( ${WORKER_SERVED[0]} ? 0 : WORKER_FAST_EXITS[0] + 1 ))
+    assert_eq "a served worker's exit resets the streak" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
+
+    export DOLPHIN_MAX_UNSERVED_SPAWNS=0
+    load_entrypoint
+    WORKER_FAST_EXITS=(50)
+    assert_eq "0 disables the cap" "1" "$(unserved_spawn_cap_reached 0; echo $?)"
+    unset DOLPHIN_MAX_UNSERVED_SPAWNS
+}
+
 # ------------------------------------------------- per-container log dir + pruning of dead ones
 test_worker_logs_are_per_container_and_pruned() {
     make_sandbox
@@ -1715,6 +1745,7 @@ test_a_throttled_node_reaches_serving_through_the_background_fetch
 test_hf_offline_arms_on_a_cache_the_worker_pinned_by_revision
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
+test_unserved_spawn_cap_is_reached_only_by_a_worker_that_never_served
 test_respawns_are_staggered
 test_worker_logs_are_per_container_and_pruned
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
