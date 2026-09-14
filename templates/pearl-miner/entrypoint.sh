@@ -47,7 +47,8 @@ mkdir -p "${LOG_DIR}"
 # One process for every GPU: PeakMiner drives them all itself and reports each card separately in
 # its stats API, so there is nothing left for per-GPU processes to buy. The flip side is that one
 # crash takes all the node's cards down, so the miner is supervised here rather than left to the
-# platform: nothing sets a docker restart policy on a filler container, and the backend only
+# platform: the validator's `restart: on-failure:5` (lium-io#1370, DAH-3475; `unless-stopped` until
+# it ships) restarts a non-zero exit at most five times in a row, and the backend only
 # relaunches on its own scheduling cycle (self-heal is off by default), so an unsupervised crash
 # costs the whole node until a cycle notices.
 #
@@ -58,8 +59,14 @@ mkdir -p "${LOG_DIR}"
 RESTART_DELAY_SECONDS="${PEARL_MINER_RESTART_DELAY_SECONDS:-10}"
 # Crash-loop ceiling: a miner that dies for a reason restarting cannot fix (bad wallet, pool
 # rejecting us, a card gone) must NOT be hidden behind a forever-loop — past the cap the container
-# exits non-zero so the platform sees a failed filler instead of a node that looks alive and earns
-# nothing. That is the failure mode this whole image exists to end.
+# exits 0 and stays `exited`, the validator reports it missing, and the backend's reconciler
+# closes the run as FAILED with a launch strike (lium-platform#409), so the node goes to the next
+# strategy instead of looking alive and earning nothing. That is the failure mode this whole image
+# exists to end. Zero on purpose, the same contract as the Dolphin image (DAH-3475): under
+# `restart: on-failure` every non-zero exit is restarted and every restart begins with the counter
+# below at zero (it lives in this process), so a non-zero cap exit ended nothing and restarted five
+# times before the run closed with a misleading code. Genuine failures of this script (no wallet, no
+# GPU, the supervisor itself dying) still exit non-zero.
 MAX_RESTARTS="${PEARL_MINER_MAX_RESTARTS:-5}"
 RESTART_WINDOW_SECONDS="${PEARL_MINER_RESTART_WINDOW_SECONDS:-600}"
 
@@ -85,10 +92,10 @@ supervise_miner() {
         restarts=$(( restarts + 1 ))
 
         if (( restarts > MAX_RESTARTS )); then
-            echo "peakminer exited with code ${exit_code}; ${restarts} restarts in ${RESTART_WINDOW_SECONDS}s — giving up" >&2
-            # Non-zero even when the miner exited 0: a perpetual miner that stops is a failure, and a
-            # zero here would read to the platform as a filler that finished its work.
-            return "$(( exit_code == 0 ? 1 : exit_code ))"
+            echo "peakminer exited with code ${exit_code}; ${restarts} exits in ${RESTART_WINDOW_SECONDS}s," \
+                "cap ${MAX_RESTARTS} reached; giving the node back, exiting 0 so the reconciler closes the run" >&2
+            # 0, not the miner's code: see the crash-loop ceiling comment above.
+            return 0
         fi
         echo "peakminer exited with code ${exit_code}, restarting in ${RESTART_DELAY_SECONDS}s" >&2
         sleep "${RESTART_DELAY_SECONDS}"
@@ -114,8 +121,9 @@ fi
 
 # The supervisor only returns once it has given up on the miner, so reaching this line means the
 # container really is done. Waited on BY PID (not `wait -n`): the sidecar loop is also a child, and
-# a bare `wait -n` would return the moment anything else finished.
+# a bare `wait -n` would return the moment anything else finished. The code is passed through: 0 is
+# the cap, anything else is the supervisor itself dying (errexit in the loop, a signal).
 exit_code=0
 wait "${miner_pid}" || exit_code=$?
-echo "peakminer supervisor gave up (code ${exit_code}), shutting down" >&2
-exit "$(( exit_code == 0 ? 1 : exit_code ))"
+echo "peakminer supervisor ended (code ${exit_code}), shutting down" >&2
+exit "${exit_code}"
