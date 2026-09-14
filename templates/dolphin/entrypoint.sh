@@ -125,10 +125,16 @@ WORKER_LOG_RETENTION_DAYS="${DOLPHIN_WORKER_LOG_RETENTION_DAYS:-7}"
 # incident it was written for. An engine socket is the one signal that cannot be wrong about it.
 WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS:-600}"
 # DAH-3475: when EVERY worker has this many failed exits IN A ROW (the same counter the backoff and
-# the sidecar's dolphin_worker_fast_exits read) and none is serving, the container exits non-zero
-# instead of respawning forever. The backend's reconciler then closes the run as FAILED, which is a
-# launch strike for its DAH-2475 ladder, so a node the image cannot bring up is handed to the next
-# strategy instead of looping as RUNNING (7 fillers, 46 GPUs, 12 h on 10 Sep 2026). The trip is
+# the sidecar's dolphin_worker_fast_exits read) and none is serving, the container exits 0 instead
+# of respawning forever. Zero on purpose: the validator moves fillers to `restart: on-failure`
+# (lium-io#1370, DAH-3475; until it ships they run `unless-stopped`), which restarts every
+# non-zero exit — a crash, an OOM kill — and leaves a zero exit alone, this one and on_term's
+# alike. A non-zero cap exit is restarted under either policy, and every restart begins with the
+# counters below at zero (they are this process's arrays), so the cap never ended anything. With
+# a zero exit the container sits in `exited`, the validator reports it missing, and the backend's
+# reconciler closes the run as FAILED, which is a launch strike for its DAH-2475 ladder, so a node
+# the image cannot bring up is handed to the next strategy instead of looping as RUNNING
+# (7 fillers, 46 GPUs, 12 h on 10 Sep 2026). The trip is
 # container-wide, not per worker: one dead worker on an 8-GPU node keeps respawning on its own
 # while the seven serving siblings keep earning. With the backoff above (0, 60, 120, 240, 480, 600,
 # 600 s) plus each worker's own backend timeout, 8 unserved spawns take about two hours. 0 disables
@@ -1384,7 +1390,8 @@ supervise_running_workers_until_new_binary_published() {
                     echo "[dolphin] every worker failed ${WORKER_MAX_UNSERVED_SPAWNS} or more spawns in a row" \
                         "and none is serving (cap ${WORKER_MAX_UNSERVED_SPAWNS}); giving the node back" >&2
                     terminate_workers
-                    exit 3
+                    # 0, not an error code: `restart: on-failure` would bring back anything else.
+                    exit 0
                 fi
             fi
             # The gate is a timestamp, not a sleep: a backed-off worker must not delay the

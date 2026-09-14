@@ -401,9 +401,14 @@ test_unserved_spawn_cap_is_reached_only_when_no_worker_serves() {
     assert_eq "the supervisor checks the cap" "1" \
         "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
             | grep -c 'if unserved_spawn_cap_reached')"
-    assert_eq "the supervisor exits the container at the cap" "1" \
+    # Exit 0 is the contract with the validator's `restart: on-failure` (lium-io DAH-3475): a
+    # non-zero code here is restarted with fresh counters and the cap ends nothing.
+    assert_eq "the supervisor exits the container with 0 at the cap" "1" \
         "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
-            | grep -c '^ *exit 3$')"
+            | grep -c '^ *exit 0$')"
+    assert_eq "no non-zero exit remains in the supervisor" "0" \
+        "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
+            | grep -c '^ *exit [1-9]')"
 
     export DOLPHIN_MAX_UNSERVED_SPAWNS=0
     load_entrypoint
