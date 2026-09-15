@@ -124,6 +124,24 @@ WORKER_LOG_RETENTION_DAYS="${DOLPHIN_WORKER_LOG_RETENTION_DAYS:-7}"
 # catch a crash loop would call those attempts healthy and leave the backoff at zero in the very
 # incident it was written for. An engine socket is the one signal that cannot be wrong about it.
 WORKER_RESPAWN_BACKOFF_MAX_SECONDS="${DOLPHIN_WORKER_RESPAWN_BACKOFF_MAX_SECONDS:-600}"
+# DAH-3475: when EVERY worker has this many failed exits IN A ROW (the same counter the backoff and
+# the sidecar's dolphin_worker_fast_exits read) and none is serving, the container exits 0 instead
+# of respawning forever. Zero on purpose: the validator moves fillers to `restart: on-failure`
+# (lium-io#1370, DAH-3475), which restarts every non-zero exit — a crash, an OOM kill — and leaves
+# a zero exit alone, this one and on_term's alike. A non-zero cap exit is restarted under either
+# policy, and every restart begins with the counters below at zero (they are this process's
+# arrays), so the cap never ended anything. With a zero exit the container sits in `exited`, the
+# validator reports it missing, and the backend's reconciler closes the run as FAILED, which is a
+# launch strike for its DAH-2475 ladder, so a node the image cannot bring up is handed to the next
+# strategy instead of looping as RUNNING (7 fillers, 46 GPUs, 12 h on 10 Sep 2026). The trip is
+# container-wide, not per worker: one dead worker on an 8-GPU node keeps respawning on its own
+# while the seven serving siblings keep earning. With the backoff above (0, 60, 120, 240, 480, 600,
+# 600 s) plus each worker's own backend timeout, 8 unserved spawns take about two hours.
+# Default 0 = off (review of #71): fillers run `restart: unless-stopped` until lium-io#1370 ships,
+# and under that policy dockerd restarts a zero exit too, so the cap would only trade the worker
+# respawn loop for a container restart loop that also zeroes dolphin_worker_fast_exits every round.
+# The default becomes 8 in the image roll that follows lium-io#1370's deploy (same ticket).
+WORKER_MAX_UNSERVED_SPAWNS="${DOLPHIN_MAX_UNSERVED_SPAWNS:-0}"
 # Spawn counters for the metrics sidecar: a node redownloading in a loop must stop looking
 # identical (engines_up 0) to a node patiently loading.
 WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.json}"
@@ -983,6 +1001,21 @@ sync_hf_offline_with_cache_and_engines() {
 }
 
 # Atomic (tmp + mv): the sidecar reads this file on every scrape and must never see half a JSON.
+# DAH-3475: true when EVERY worker has failed WORKER_MAX_UNSERVED_SPAWNS spawns in a row without an
+# engine answering, and none is serving right now. Container-wide on purpose: a single worker at the
+# cap keeps respawning on its own, the siblings that serve keep the node earning. A served worker
+# resets its counter on exit and carries WORKER_SERVED while alive, so either one keeps the container up.
+unserved_spawn_cap_reached() {
+    local i
+    (( WORKER_MAX_UNSERVED_SPAWNS > 0 )) || return 1
+    (( ${#WORKER_PIDS[@]} > 0 )) || return 1
+    for i in "${!WORKER_PIDS[@]}"; do
+        (( ${WORKER_SERVED[$i]:-0} )) && return 1
+        (( ${WORKER_FAST_EXITS[$i]:-0} >= WORKER_MAX_UNSERVED_SPAWNS )) || return 1
+    done
+    return 0
+}
+
 write_spawn_state() {
     local i entries=()
     for i in "${!GPU_SETS[@]}"; do
@@ -1355,6 +1388,13 @@ supervise_running_workers_until_new_binary_published() {
                 echo "[dolphin] worker [${GPU_SETS[$i]}] exited" \
                     "(served: ${WORKER_SERVED[$i]:-0}, failed exits in a row:" \
                     "${WORKER_FAST_EXITS[$i]}); respawn in ${backoff}s" >&2
+                if unserved_spawn_cap_reached; then
+                    echo "[dolphin] every worker failed ${WORKER_MAX_UNSERVED_SPAWNS} or more spawns in a row" \
+                        "and none is serving (cap ${WORKER_MAX_UNSERVED_SPAWNS}); giving the node back" >&2
+                    terminate_workers
+                    # 0, not an error code: `restart: on-failure` would bring back anything else.
+                    exit 0
+                fi
             fi
             # The gate is a timestamp, not a sleep: a backed-off worker must not delay the
             # liveness checks and respawns of its siblings.
