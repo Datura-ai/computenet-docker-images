@@ -416,7 +416,18 @@ test_unserved_spawn_cap_is_reached_only_when_no_worker_serves() {
     WORKER_SERVED=(0)
     WORKER_FAST_EXITS=(50)
     assert_eq "0 disables the cap" "1" "$(unserved_spawn_cap_reached; echo $?)"
+
+    # Regression (review of #71): fillers run `restart: unless-stopped` until lium-io#1370 ships,
+    # and under that policy dockerd restarts a zero exit too, so a cap that is on by default only
+    # trades the respawn loop for a restart loop. The image ships with the cap off.
     unset DOLPHIN_MAX_UNSERVED_SPAWNS
+    load_entrypoint
+    assert_eq "the cap is off by default until lium-io#1370 ships" "0" "${WORKER_MAX_UNSERVED_SPAWNS}"
+    WORKER_PIDS=(1)
+    WORKER_SERVED=(0)
+    WORKER_FAST_EXITS=(50)
+    assert_eq "off by default means 50 unserved spawns do not exit the container" "1" \
+        "$(unserved_spawn_cap_reached; echo $?)"
 }
 
 # ------------------------------------------------- per-container log dir + pruning of dead ones
