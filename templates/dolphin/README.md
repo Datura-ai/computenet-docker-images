@@ -26,13 +26,9 @@ down with it: the metrics sidecar and the engine watchdog (both below).
 The worker's own self-update exits expecting an external supervisor to restart it (systemd in
 Dolphin's reference install); the loop plays that role, re-running `update` before every start
 so the worker comes back on the freshly published binary. As a fallback, the loop polls the
-download URL every `DOLPHIN_UPDATE_CHECK_SECONDS` (default 3600) for a change token and gracefully
-restarts the worker when it changes — so long-lived containers pick up Dolphin rollouts within
-about an hour even if the worker's self-update never fires (DAH-2457). The token is the first
-header a HEAD on the URL carries, in this order: `x-bz-info-sha256` (the file's sha256; updates.dphn.ai
-is Backblaze B2 behind Cloudflare and sends no `ETag`), `ETag`, `x-bz-file-id`, `Last-Modified`
-(DAH-3455). When none is present the entrypoint logs `no change token from WORKER_URL;
-forced-update fallback inactive` at start and once per poll. `docker stop` still ends
+download URL's etag every `DOLPHIN_UPDATE_CHECK_SECONDS` (default 3600) and gracefully restarts
+the worker when a new binary appears — so long-lived containers pick up Dolphin rollouts within
+about an hour even if the worker's self-update never fires (DAH-2457). `docker stop` still ends
 the worker cleanly: SIGTERM is forwarded and the container exits.
 
 ## Environment variables

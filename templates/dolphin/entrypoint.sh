@@ -43,7 +43,7 @@ WORKER_URL="${DOLPHIN_WORKER_URL:-https://updates.dphn.ai/dolphinpod-worker-v2_l
 
 # How often (seconds) to check WORKER_URL for a newly published binary while workers run.
 CHECK_INTERVAL="${DOLPHIN_UPDATE_CHECK_SECONDS:-3600}"
-# Worker liveness is checked this often; the change-token poll fires once per CHECK_INTERVAL.
+# Worker liveness is checked this often; the etag poll fires once per CHECK_INTERVAL.
 LIVENESS_INTERVAL=30
 
 # Delay between initial worker spawns, AFTER the shared cache is seeded.
@@ -358,54 +358,8 @@ interruptible_sleep() {
     wait $! || true
 }
 
-# A token that changes when a new binary is published at WORKER_URL, read from the HEAD response.
-# The name predates the token: updates.dphn.ai is Backblaze B2 behind Cloudflare and sends NO
-# `ETag` and no `Last-Modified` (checked 2026-09-13), so a poll on the etag alone never fired and
-# the forced-update fallback below did not exist in practice. B2 publishes the file's sha256 in
-# `x-bz-info-sha256`; the first header present wins, in this order:
-#   x-bz-info-sha256, etag, x-bz-file-id, last-modified
-# The name is the line up to the first colon, lower-cased (a space after the colon is optional);
-# the value is the rest of the line (`Last-Modified` holds spaces); `\r` is stripped. Empty when
-# none is present or the HEAD fails.
 published_etag() {
-    curl -fsSI --max-time 30 "${WORKER_URL}" | tr -d '\r' | awk '
-        {
-            name = $0
-            sub(/:.*/, "", name)
-            name = tolower(name)
-            value = $0
-            sub(/^[^:]*:[ \t]*/, "", value)
-            sub(/[ \t]+$/, "", value)
-        }
-        name == "x-bz-info-sha256" && token[1] == "" { token[1] = value }
-        name == "etag"             && token[2] == "" { token[2] = value }
-        name == "x-bz-file-id"     && token[3] == "" { token[3] = value }
-        name == "last-modified"    && token[4] == "" { token[4] = value }
-        END {
-            for (i = 1; i <= 4; i++) {
-                if (token[i] != "") { print token[i]; exit }
-            }
-        }'
-}
-
-# Said at start and once per poll while the token is empty, so a server that stops sending every
-# header above shows up in the logs instead of silently switching the fallback off again.
-warn_if_no_update_token() {
-    [[ -n "$1" ]] && return 0
-    echo "[dolphin] no change token from WORKER_URL; forced-update fallback inactive" >&2
-}
-
-# sha256 of the binary on the shared volume; empty when it is missing or nothing here can hash it.
-# B2's `x-bz-info-sha256` is the sha256 of the published file (checked against a download,
-# 2026-09-13), so the two are comparable. The callers add `|| true`: a hasher that fails must
-# not end the supervisor under `set -e`.
-worker_binary_sha256() {
-    [[ -f "${WORKER_BIN}" ]] || return 0
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "${WORKER_BIN}" | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "${WORKER_BIN}" | awk '{print $1}'
-    fi
+    curl -fsSI --max-time 30 "${WORKER_URL}" | awk 'tolower($1) == "etag:" {print $2}' | tr -d '\r'
 }
 
 with_dolphin_lock() {
@@ -459,10 +413,6 @@ ensure_worker_binary() {
 refresh_binary() {
     with_dolphin_lock "${WORKER_BIN}" update \
         || echo "[dolphin] update failed; starting current version" >&2
-    # The bytes on the volume now are the bytes the next spawn runs. Read here, not at poll time:
-    # DOLPHIN_HOME is shared by every filler container on the node, and a sibling's `update` may
-    # move the file on while these workers still run the old one.
-    RUNNING_BIN_SHA="$(worker_binary_sha256 || true)"
 }
 
 # The plan's outputs are read by the supervisor loop, by its traps and by the watchdogs alike, so
@@ -475,10 +425,6 @@ WORKER_SERVED=()
 WORKER_FAST_EXITS=()
 WORKER_NEXT_SPAWN_AT=()
 WORKER_EXITED_AT=()
-# sha256 of the binary as refresh_binary last left it, i.e. of the bytes the workers were spawned
-# from; empty until the first refresh or when nothing here can hash. The empty-baseline branch of
-# the update poll compares a published sha256 against it.
-RUNNING_BIN_SHA=""
 # DAH-2843: when the last worker of this container was spawned, cold start or respawn.
 # -SPLIT_STAGGER_SECONDS so the very first spawn is never held back.
 LAST_SPAWN_AT=$(( -SPLIT_STAGGER_SECONDS ))
@@ -1431,7 +1377,7 @@ supervise_running_workers_until_new_binary_published() {
             refresh_binary
             spawn_instance "${i}"
             # A worker exits to self-update onto a freshly published binary; refresh_binary
-            # just pulled it, so re-baseline the token — otherwise the poll below still sees the
+            # just pulled it, so re-baseline the etag — otherwise the poll below still sees the
             # old baseline and forces a redundant full restart of every worker.
             running_etag="$(published_etag || true)"
         done
@@ -1442,28 +1388,8 @@ supervise_running_workers_until_new_binary_published() {
         fi
         elapsed=0
         latest_etag="$(published_etag || true)"
-        warn_if_no_update_token "${latest_etag}"
-        if [[ -n "${latest_etag}" && -z "${running_etag}" ]]; then
-            # The HEAD at start failed (or the server sent no token then), so nothing says which
-            # binary the workers run; without this branch that switched the fallback off for the
-            # container's life. When the token is the file's sha256, the sha of the bytes the
-            # workers were spawned from answers: a mismatch is a publish they missed (or an
-            # `update` that failed at spawn; either way the restart re-runs `update`), and takes
-            # the restart path. Any other token is taken as the baseline, standing for the binary
-            # `update` fetched at the last spawn.
-            if [[ "${latest_etag}" =~ ^[0-9a-f]{64}$ && -n "${RUNNING_BIN_SHA}" \
-                    && "${RUNNING_BIN_SHA}" != "${latest_etag}" ]]; then
-                echo "[dolphin] new worker binary published (running ${RUNNING_BIN_SHA}," \
-                    "published ${latest_etag}); restarting workers to update" >&2
-                return 0
-            fi
-            running_etag="${latest_etag}"
-            echo "[dolphin] change token baseline set on a later poll: ${running_etag}" >&2
-            continue
-        fi
         if [[ -n "${latest_etag}" && -n "${running_etag}" && "${latest_etag}" != "${running_etag}" ]]; then
-            echo "[dolphin] new worker binary published (${running_etag} -> ${latest_etag});" \
-                "restarting workers to update" >&2
+            echo "[dolphin] new worker binary published; restarting workers to update" >&2
             return 0
         fi
     done
@@ -1471,14 +1397,13 @@ supervise_running_workers_until_new_binary_published() {
 
 # The worker's own self-update downloads a new binary and then exits expecting an external
 # supervisor to restart it (systemd in Dolphin's reference install) — so every (re)spawn goes
-# through `update` (DAH-2457). The token poll is the fallback for when no instance's self-update
-# fires: a changed token on WORKER_URL (see published_etag) restarts them all.
+# through `update` (DAH-2457). The etag poll is the fallback for when no instance's self-update
+# fires: a changed etag on WORKER_URL restarts them all.
 run_worker_supervisor_loop() {
     local running_etag
     while true; do
         refresh_binary
         running_etag="$(published_etag || true)"
-        warn_if_no_update_token "${running_etag}"
         spawn_all_instances
         supervise_running_workers_until_new_binary_published "${running_etag}"
         terminate_workers
