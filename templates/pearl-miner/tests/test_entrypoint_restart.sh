@@ -6,8 +6,10 @@
 # The entrypoint runs for real against stub `peakminer` and `nvidia-smi` binaries on PATH, so the
 # restart loop and its crash-loop ceiling are exercised as production runs them.
 #
-# Covered: a miner that dies is restarted, and a miner that keeps dying makes the container exit
-# non-zero instead of hiding the crash-loop behind a forever-restart.
+# Covered: a miner that dies is restarted; a miner that keeps dying ends the container with exit 0
+# at the cap (DAH-3475: `restart: on-failure` leaves a zero exit alone, so the reconciler closes the
+# run) instead of a forever-restart; the script's own failures (no wallet, no GPU, the supervisor
+# dying) stay non-zero.
 set -uo pipefail
 
 ENTRYPOINT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/entrypoint.sh"
@@ -36,14 +38,14 @@ STUB
 }
 
 run_entrypoint() {
-    local stub_dir="$1" max_restarts="$2"
+    local stub_dir="$1" max_restarts="$2" restart_delay="${3:-0}"
     PATH="${stub_dir}:${PATH}" \
     PEARL_POOL_HOST=prl.kryptex.network \
     PEARL_POOL_PORT=7048 \
     PEARL_POOL_WALLET=prl1test \
     PEARL_POOL_WORKER=test-worker \
     PEARL_LOG_DIR="${stub_dir}/logs" \
-    PEARL_MINER_RESTART_DELAY_SECONDS=0 \
+    PEARL_MINER_RESTART_DELAY_SECONDS="${restart_delay}" \
     PEARL_MINER_MAX_RESTARTS="${max_restarts}" \
     PEARL_MINER_RESTART_WINDOW_SECONDS=600 \
     PEARL_MINER_AUTO_UPDATE=0 \
@@ -52,7 +54,9 @@ run_entrypoint() {
     echo $?
 }
 
-test_crash_loop_gives_up_non_zero() {
+# Regression: the cap used to `return` the miner's code (3 here), which `restart: on-failure`
+# restarts five times before the run closes with a misleading code (DAH-3475).
+test_crash_loop_cap_exits_zero() {
     echo "crash loop"
     local stub_dir
     stub_dir="$(mktemp -d)"
@@ -62,10 +66,29 @@ test_crash_loop_gives_up_non_zero() {
     local launches
     launches="$(wc -l < "${stub_dir}/launches" | tr -d ' ')"
 
-    check "$([[ "${status}" != "0" ]] && echo pass)" "a miner that keeps dying exits the container non-zero (got ${status})"
+    check "$([[ "${status}" == "0" ]] && echo pass)" "a miner that keeps dying ends the container with exit 0 at the cap (got ${status})"
     check "$([[ "${launches}" -eq 3 ]] && echo pass)" "a cap of 2 restarts means 3 launches, then abandoned (got ${launches})"
-    check "$(grep -q "giving up" "${stub_dir}/out" && echo pass)" "the give-up is logged"
+    check "$(grep -q "cap 2 reached; giving the node back, exiting 0 so the reconciler closes the run" "${stub_dir}/out" && echo pass)" "the cap exit is logged with the reason"
+    check "$(grep -q "exited with code 3; 3 exits in 600s" "${stub_dir}/out" && echo pass)" "the cap line carries the miner's last code and the count"
     check "$(grep -q "restarting in" "${stub_dir}/out" && echo pass)" "each restart is logged"
+    rm -rf "${stub_dir}"
+}
+
+# Negative control for the zero exit: only the cap is 0. A supervisor that dies for its own reason
+# (here `sleep` refusing a bad delay under errexit) must not read as a finished run.
+test_supervisor_failure_stays_non_zero() {
+    echo "supervisor failure"
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    make_stubs "${stub_dir}" 3 0
+    local status
+    status="$(run_entrypoint "${stub_dir}" 5 not-a-number)"
+    local launches
+    launches="$(wc -l < "${stub_dir}/launches" | tr -d ' ')"
+
+    check "$([[ "${status}" != "0" ]] && echo pass)" "a supervisor that dies before the cap exits the container non-zero (got ${status})"
+    check "$([[ "${launches}" -eq 1 ]] && echo pass)" "the miner was launched once, then the supervisor died on the delay (got ${launches})"
+    check "$(! grep -q "exiting 0" "${stub_dir}/out" && echo pass)" "no cap line is logged"
     rm -rf "${stub_dir}"
 }
 
@@ -76,13 +99,25 @@ test_single_crash_is_restarted() {
     # Dies instantly the first times, so within a 5-restart cap the run is still alive after several
     # launches — the point being that ONE death does not end the container.
     make_stubs "${stub_dir}" 1 0
-    local status
-    status="$(run_entrypoint "${stub_dir}" 5)"
+    run_entrypoint "${stub_dir}" 5 > /dev/null
     local launches
     launches="$(wc -l < "${stub_dir}/launches" | tr -d ' ')"
 
     check "$([[ "${launches}" -gt 1 ]] && echo pass)" "the miner is relaunched after it dies (got ${launches} launches)"
-    check "$([[ "${status}" != "0" ]] && echo pass)" "the container still fails once the cap is reached"
+    rm -rf "${stub_dir}"
+}
+
+test_no_gpu_fails_fast() {
+    echo "no gpu"
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    make_stubs "${stub_dir}" 0 0
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${stub_dir}/nvidia-smi"
+    local status
+    status="$(run_entrypoint "${stub_dir}" 5)"
+
+    check "$([[ "${status}" != "0" ]] && echo pass)" "no visible GPU is a hard failure, not a cap exit (got ${status})"
+    check "$([[ ! -f "${stub_dir}/launches" ]] && echo pass)" "the miner is never launched without a GPU"
     rm -rf "${stub_dir}"
 }
 
@@ -100,9 +135,11 @@ test_missing_wallet_fails_fast() {
     rm -rf "${stub_dir}"
 }
 
-test_crash_loop_gives_up_non_zero
+test_crash_loop_cap_exits_zero
+test_supervisor_failure_stays_non_zero
 test_single_crash_is_restarted
 test_missing_wallet_fails_fast
+test_no_gpu_fails_fast
 
 echo
 if (( failures )); then
