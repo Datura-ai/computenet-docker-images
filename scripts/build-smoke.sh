@@ -4,17 +4,19 @@
 #   scripts/build-smoke.sh                 # templates changed vs $BASE (default origin/master); scripts/** → ubuntu + pytorch
 #   scripts/build-smoke.sh ubuntu pytorch  # named templates
 #   E2E_GPU=1 scripts/build-smoke.sh …     # on a GPU host: run the built image with --gpus all and require torch.cuda
+#   scripts/build-smoke.sh --bases dolphin  # print the base image(s) the smoke target pulls; nothing is built
 #
 # For each template: `docker buildx bake --print` (the HCL resolves; every default target's Dockerfile exists), then ONE target is built with --load —
 # the template's `smoke` group when it defines one, else the first target of `default` — and the image is booted
-# with its own CMD: pod templates (they ship /start.sh) must answer python3; the `pytorch` template must `import torch`; on a GPU host
+# with its own CMD (its base images are pulled first, each try under T_PULL, 3 tries, all of them within T_PULL_TOTAL,
+# so a stalled registry ends with a message instead of eating the build budget): pod templates (they ship /start.sh) must answer python3; the `pytorch` template must `import torch`; on a GPU host
 # nvidia-smi must list the GPU in every image and torch.cuda must be available where torch imports; templates/<name>/smoke.sh runs inside the container when present. Every step under `timeout`;
 # artifacts/ gets timings.txt and summary.md (the CI job posts it). Exit 0 only when every step passed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BASE=${BASE:-origin/master}
 A=artifacts; mkdir -p "$A"; : > "$A/timings.txt"
-T_BAKE=${T_BAKE:-2m}; T_BUILD=${T_BUILD:-40m}; T_BOOT=${T_BOOT:-5m}
+T_BAKE=${T_BAKE:-2m}; T_BUILD=${T_BUILD:-40m}; T_BOOT=${T_BOOT:-5m}; T_PULL=${T_PULL:-8m}; T_PULL_TOTAL=${T_PULL_TOTAL:-25m}   # one base-image pull attempt (3 attempts) / all pulls of a template
 FAILED=""
 
 step() {  # step <name> <timeout> <function-or-cmd...>  (functions below are exported, so timeout can run them)
@@ -61,13 +63,77 @@ print(next(iter(d["target"])))
 PY
 }
 
+base_images() {  # <template> <target> → the registry images the target's Dockerfile starts FROM, one per line
+  # bake --print gives the dockerfile and the args; the Dockerfile's own `ARG X=default` lines fill what the bake
+  # file leaves unset. `FROM <earlier stage>` and `FROM scratch` are not images and are skipped.
+  local t=$1 target=$2 json
+  json=$(cd "templates/$t" && docker buildx bake --print "$target" 2>/dev/null) || return 1
+  python3 - "templates/$t" "$json" <<'PY'
+import json, os, re, sys
+tdir, d = sys.argv[1], json.loads(sys.argv[2])
+seen = []
+for tgt in d["target"].values():
+    ctx = os.path.join(tdir, tgt.get("context", "."))
+    df = os.path.join(ctx, tgt.get("dockerfile", "Dockerfile"))
+    if not os.path.isfile(df):
+        continue
+    args = {}
+    stages = set((tgt.get("contexts") or {}).keys())   # bake named contexts (`contexts = { base = "target:x" }`) are not registry images either
+    for line in open(df):
+        line = line.strip()
+        m = re.match(r"ARG\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if m:
+            args.setdefault(m.group(1), m.group(2).strip().strip('"\''))
+        m = re.match(r"FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+[Aa][Ss]\s+(\S+))?", line)
+        if not m:
+            continue
+        ref = m.group(1)
+        merged = {**args, **{k: v for k, v in (tgt.get("args") or {}).items()}}
+        ref = re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", lambda mm: merged.get(mm.group(1), ""), ref)
+        if ref and ref != "scratch" and ref not in stages and ref not in seen:
+            seen.append(ref)
+        if m.group(2):   # after the check: `FROM redis AS redis` still pulls redis
+            stages.add(m.group(2))
+print("\n".join(seen))
+PY
+}
+
+secs() { case $1 in *h) echo $(( ${1%h} * 3600 )) ;; *m) echo $(( ${1%m} * 60 )) ;; *s) echo "${1%s}" ;; *) echo "$1" ;; esac; }
+
+pull_base_images() {  # <template> <target>: docker pull each base image, up to 3 tries of T_PULL each, all within T_PULL_TOTAL
+  # 11 Sep 2026, run 34584117479 attempt 1: build-dolphin produced no output for the whole 40-minute budget (the log
+  # was lost to `| tail -40`) — a stalled pull or a stalled apt mirror; attempt 2 built the same image in 181 s. The
+  # pull half is retried here under its own timeout instead of consuming the build budget; layers already extracted
+  # are kept between tries, the layer in flight is fetched again. An apt stall still times out, with its log kept.
+  # T_PULL_TOTAL (default 25m, below T_BUILD) caps the pulls of one template together, so a template with several
+  # FROM images (fast-stable-diffusion has two) still ends with a message rather than the step's TIMEOUT.
+  local img rc tries start=$SECONDS left per_try total; total=$(secs "$T_PULL_TOTAL"); per_try=$(secs "$T_PULL")
+  while read -r img; do
+    [ -n "$img" ] || continue
+    rc=1
+    for tries in 1 2 3; do
+      left=$(( total - (SECONDS - start) ))
+      [ "$left" -gt 0 ] || { echo "base image $img: pull budget $T_PULL_TOTAL spent"; return 1; }
+      [ "$left" -lt "$per_try" ] || left=$per_try
+      echo "pull $img (try $tries, limit ${left}s)"
+      if timeout -k 15 "$left" docker pull --quiet --platform linux/amd64 "$img"; then rc=0; break; fi
+    done
+    [ $rc -eq 0 ] || { echo "base image $img did not pull in 3 tries"; return 1; }
+  done < <(base_images "$1" "$2")
+}
+
 build_one() {  # <template>
   local t=$1 target; target=$(pick_target "$t") || { echo "no target in templates/$t"; return 1; }
   echo "building templates/$t target $target"
+  pull_base_images "$t" "$target" || return 1
   # the bake files read ../../scripts (a context outside the template dir): newer buildx wants that allowed explicitly.
   # One platform: --load cannot import a multi-platform target (empty-job lists amd64 + arm64); executors and runners are amd64.
-  ( cd "templates/$t" && BUILDX_BAKE_ENTITLEMENTS_FS=0 docker buildx bake --load --set "*.tags=lium-smoke/$t:latest" --set "*.platform=linux/amd64" "$target" ) 2>&1 | tail -40
-  return "${PIPESTATUS[0]}"
+  # The full plain-progress log goes to artifacts/build-<template>.log — a build the timeout kills still leaves it
+  # (piping through `tail` printed nothing for the 40-minute stall above); the last 40 lines are echoed here.
+  ( cd "templates/$t" && BUILDX_BAKE_ENTITLEMENTS_FS=0 docker buildx bake --progress=plain --load --set "*.tags=lium-smoke/$t:latest" --set "*.platform=linux/amd64" "$target" ) > "$A/build-$t.log" 2>&1
+  local rc=$?
+  tail -40 "$A/build-$t.log"
+  return $rc
 }
 
 boot_one() {  # <template>: start the image with its own CMD, then look inside
@@ -109,8 +175,13 @@ summary() {
   cat "$A/summary.md"
 }
 
-export -f bake_print_all pick_target build_one boot_one
-export A E2E_GPU
+export -f bake_print_all pick_target base_images secs pull_base_images build_one boot_one
+export A E2E_GPU T_PULL T_PULL_TOTAL
+if [ "${1:-}" = --bases ]; then  # --bases <template>: print the images the smoke target pulls (the CI self-test reads it)
+  [ -n "${2:-}" ] || { echo "usage: build-smoke.sh --bases <template>"; exit 2; }
+  target=$(pick_target "$2") || { echo "no target in templates/$2"; exit 1; }
+  base_images "$2" "$target"; exit $?
+fi
 step bake-print-all "$T_BAKE" bake_print_all
 TEMPLATES=$(changed_templates "$@")
 if [ -z "$TEMPLATES" ]; then echo "no template changed vs $BASE — bake --print of every template is the whole check"; summary; [ -z "$FAILED" ]; exit $?; fi
