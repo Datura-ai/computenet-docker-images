@@ -10,9 +10,22 @@ set -euo pipefail
 # and the nested-container runtime. Written only while the pod is a cluster member.
 CLUSTER_ENV_FILE=/etc/lium-cluster.env
 
-# The group's shared SSH login, kept under names of our own so a restored backup's ~/.ssh survives.
-CLUSTER_SSH_KEY_FILE=/root/.ssh/lium_cluster_ed25519
-CLUSTER_SSH_CONFIG_MARKER="# DAH-2664: the Lium cluster overlay"
+# The group's shared SSH login. Everything lives under /etc, nothing under /root (DAH-3060): on an
+# encrypted rental (the validator's default) the ciphertext volume is at /lium-cipher and the
+# validator FUSE-mounts the gocryptfs plaintext OVER /root (`-nonempty`) with a `docker exec` after
+# this entrypoint has run, so a key, an authorized key or a Host block written to /root/.ssh here is
+# hidden the moment the mount lands. /root/.ssh then holds only the renter's authorized_keys, which
+# the validator writes after the mount. /etc stays on the container's own layer. The renter's own
+# ~/.ssh is never touched, so a restored backup survives too.
+CLUSTER_SSH_DIR=/etc/lium
+CLUSTER_SSH_KEY_FILE=$CLUSTER_SSH_DIR/cluster_ed25519
+CLUSTER_SSH_AUTHORIZED_KEYS_FILE=$CLUSTER_SSH_DIR/cluster_authorized_keys
+CLUSTER_SSH_CLIENT_CONF=/etc/ssh/ssh_config.d/lium-cluster.conf
+CLUSTER_SSHD_CONF=/etc/ssh/sshd_config.d/lium-cluster.conf
+CLUSTER_SSH_CHECK_LOG=/var/log/lium-cluster-ssh-check.log
+# How long the start-up peer check keeps trying before it writes its verdict. The peers raise their
+# overlay and start sshd on their own clock, so the first tries are expected to fail.
+CLUSTER_SSH_CHECK_WAIT_SECONDS="${LIUM_CLUSTER_SSH_CHECK_WAIT_SECONDS:-300}"
 
 # How long the fabric gate waits before refusing the pod. A card whose driver is still loading or
 # whose link is renegotiating reports no ACTIVE port for a few seconds after boot, and refusing
@@ -135,19 +148,30 @@ install_cluster_ssh_identity() {
         return 0
     fi
 
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-    # Its own filename, not id_ed25519: a rental can restore a backup into this home directory
-    # before the container starts, and the customer's own key must not be overwritten by ours.
-    # Restricted before it holds anything — ssh refuses a private key other users can read.
+    # Root-owned, world-readable directory: sshd's StrictModes accepts an AuthorizedKeysFile only
+    # when the file and every directory above it are owned by root or the user and writable by
+    # nobody else. The private key inside is restricted before it holds anything — ssh refuses a
+    # private key other users can read.
+    mkdir -p "$CLUSTER_SSH_DIR"
+    chmod 755 "$CLUSTER_SSH_DIR"
     install -m 600 /dev/null "$CLUSTER_SSH_KEY_FILE"
     echo "$key_b64" | base64 -d > "$CLUSTER_SSH_KEY_FILE"
 
-    # Appended, never written over: the validator puts the renter's own key in the same file, and
-    # the two execs race.
-    touch /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-    grep -qxF "$authorized_key" /root/.ssh/authorized_keys || echo "$authorized_key" >> /root/.ssh/authorized_keys
+    # The peers' login, in a file of its own. The renter's authorized_keys under /root/.ssh is left
+    # to the validator: it writes that file after the mount, and it lands in the mounted volume.
+    install -m 644 /dev/null "$CLUSTER_SSH_AUTHORIZED_KEYS_FILE"
+    echo "$authorized_key" > "$CLUSTER_SSH_AUTHORIZED_KEYS_FILE"
+
+    # sshd reads the drop-in directory before the rest of sshd_config (Ubuntu's file opens with
+    # `Include /etc/ssh/sshd_config.d/*.conf`), and the FIRST value of an option wins, so this
+    # keeps the renter's own authorized_keys and adds ours. The validator's hardening only appends
+    # PasswordAuthentication lines at the end of sshd_config, which this does not touch.
+    mkdir -p "$(dirname "$CLUSTER_SSHD_CONF")"
+    cat > "$CLUSTER_SSHD_CONF" <<EOF
+# DAH-2664 / DAH-3060: the Lium cluster login, kept outside /root (see lium-cluster-entrypoint).
+AuthorizedKeysFile .ssh/authorized_keys $CLUSTER_SSH_AUTHORIZED_KEYS_FILE
+EOF
+    chmod 644 "$CLUSTER_SSHD_CONF"
 
     # A launcher fails outright on an unknown host key, and nothing on this private mesh can be
     # impersonated — the peers are exactly the pods WireGuard let in. The subnet is read off wg0
@@ -163,25 +187,79 @@ install_cluster_ssh_identity() {
     fi
     overlay_host_pattern="${overlay_address%.*}.*"
 
-    # PREPENDED, and only once: ssh takes the FIRST value it finds for an option, so a restored
-    # config opening with `Host *` would otherwise keep its own StrictHostKeyChecking and the
-    # launcher would still stop at the fingerprint prompt. The customer's file is kept below ours.
-    touch /root/.ssh/config
-    chmod 600 /root/.ssh/config
-    if ! grep -q "$CLUSTER_SSH_CONFIG_MARKER" /root/.ssh/config; then
-        local existing_config
-        existing_config="$(cat /root/.ssh/config)"
-        cat > /root/.ssh/config <<EOF
-$CLUSTER_SSH_CONFIG_MARKER
+    # The client side goes to the system-wide drop-in directory (`/etc/ssh/ssh_config` opens with
+    # `Include /etc/ssh/ssh_config.d/*.conf`). ssh reads ~/.ssh/config before the system file, so a
+    # restored backup whose config opens with `Host *` + `StrictHostKeyChecking yes` keeps its own
+    # value; that file lives in the mounted volume and cannot be edited from here. The start-up
+    # check below is what tells the renter when that happens.
+    mkdir -p "$(dirname "$CLUSTER_SSH_CLIENT_CONF")"
+    cat > "$CLUSTER_SSH_CLIENT_CONF" <<EOF
+# DAH-2664 / DAH-3060: the Lium cluster overlay (see lium-cluster-entrypoint).
 Host $overlay_host_pattern
     IdentityFile $CLUSTER_SSH_KEY_FILE
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR
-
-$existing_config
 EOF
+    chmod 644 "$CLUSTER_SSH_CLIENT_CONF"
+}
+
+check_cluster_ssh_peers() {
+    # DAH-3060: the ticket's second ask. A pod that cannot reach its peers over ssh fails only when
+    # the renter's first mpirun/pdsh hangs, hours later and with nothing in the logs. This dials
+    # every peer wg0 knows once at start, in the background, and leaves the verdict where the renter
+    # and a support person can read it: CLUSTER_SSH_CHECK_LOG, and the container log. It never
+    # decides the pod's fate — a peer that is still booting is the normal case for the first tries.
+    if [[ ! -s "$CLUSTER_SSH_KEY_FILE" ]]; then
+        return 0
     fi
+    # Every /32 in the peers' AllowedIPs is a pod of this group; the address plan is the backend's.
+    local peers=()
+    mapfile -t peers < <(wg show wg0 allowed-ips 2>/dev/null \
+        | awk '{for (i = 2; i <= NF; i++) if ($i ~ /\/32$/) {sub(/\/32$/, "", $i); print $i}}' || true)
+    if (( ${#peers[@]} == 0 )); then
+        echo "lium-cluster: wg0 lists no peers, so there is nothing to ssh-check" >&2
+        return 0
+    fi
+
+    # setsid, stdin and stdout closed: the check outlives this script's exec into the base
+    # entrypoint. stderr is kept — it is the container log, the same place the other lines of this
+    # script go. Plain `ssh`, no -i and no -o for the key: the check must take the same path a
+    # launcher takes, drop-in config included, or a PASS here would prove nothing about mpirun.
+    setsid bash -c '
+        log="$1"; wait_seconds="$2"; shift 2
+        mkdir -p "$(dirname "$log")"
+        deadline=$(( $(date +%s) + wait_seconds ))
+        pending=("$@")
+        sleep 1
+        while :; do
+            still=()
+            for peer in "${pending[@]}"; do
+                if ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$peer" true 2>/dev/null; then
+                    echo "$(date -u +%FT%TZ) ok $peer" >> "$log"
+                else
+                    still+=("$peer")
+                fi
+            done
+            pending=("${still[@]}")
+            if (( ${#pending[@]} == 0 )); then
+                echo "$(date -u +%FT%TZ) verdict PASS: every peer answers ssh" >> "$log"
+                echo "lium-cluster: ssh to every peer works (see $log)" >&2
+                exit 0
+            fi
+            if (( $(date +%s) >= deadline )); then
+                for peer in "${pending[@]}"; do
+                    echo "$(date -u +%FT%TZ) FAIL $peer (no ssh login after ${wait_seconds}s)" >> "$log"
+                done
+                echo "$(date -u +%FT%TZ) verdict FAIL: ${#pending[@]} peer(s) never answered ssh; mpirun and pdsh will hang on them" >> "$log"
+                echo "lium-cluster: ssh to ${#pending[@]} peer(s) FAILED (see $log)" >&2
+                exit 1
+            fi
+            sleep 5
+        done
+    ' lium-cluster-ssh-check "$CLUSTER_SSH_CHECK_LOG" "$CLUSTER_SSH_CHECK_WAIT_SECONDS" "${peers[@]}" \
+        > /dev/null < /dev/null &
+    disown
 }
 
 configure_nested_docker() {
@@ -213,6 +291,7 @@ PY
 
 raise_cluster_overlay
 install_cluster_ssh_identity
+check_cluster_ssh_peers
 configure_nested_docker
 
 # Hand off to the base image's own entrypoint, which starts the inner Docker daemon and the rest of
