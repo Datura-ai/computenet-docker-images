@@ -1,6 +1,8 @@
 
-# Use the docker:dind image as the base
-FROM cruizba/ubuntu-dind:latest
+# Base: Ubuntu 24.04 + Docker 28.0.4, what daturaai/dind:0.0.1 was built from. Pinned (DAH-2856): `latest`
+# moved to Ubuntu 26.04 / Docker 29.7.2 in Sep 2026, and a rebuild for one fix should not also change the OS
+# and the dockerd version the probe runs on. Bump on purpose, in its own change.
+FROM cruizba/ubuntu-dind:noble-28.0.4
 
 # Install OpenSSH server and NVIDIA dependencies
 RUN apt-get update && apt-get install -y \
@@ -25,6 +27,18 @@ RUN nvidia-ctk runtime configure --runtime=docker
 COPY daemon.json /etc/docker/daemon.json
 COPY config.toml /etc/nvidia-container-runtime/config.toml
 
+# DAH-2856: the inner dockerd talks to the kernel through iptables. The base image selects the
+# legacy binary, which needs the ip_tables/iptable_nat kernel modules loaded ON THE HOST; a host
+# whose own iptables runs in nf_tables mode with nothing else loading those modules (Debian 12+,
+# Ubuntu without ufw) leaves the inner dockerd dying at `iptables -t nat -N DOCKER` with
+# "can't initialize iptables table `nat': Table does not exist", sshd never starts and the
+# validator scores the node as "no sysbox" (ticket-0309: three reinstalls). A sysbox container
+# cannot modprobe. iptables-nft only needs nf_tables, which every host running a current dockerd
+# already has. The default is nft; select-iptables-backend.sh (run first by load-probe-entrypoint.sh)
+# falls back to legacy at start when nft cannot open a table but legacy can (legacy-only hosts).
+RUN update-alternatives --set iptables /usr/sbin/iptables-nft \
+    && update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
+
 # Start Scripts
 COPY --from=scripts start.sh /
 RUN chmod +x /start.sh
@@ -47,8 +61,8 @@ RUN chmod +x /nvidia-setup.sh
 # validator overrides CMD, so any setup we put in CMD would be silently dropped.
 # A failed load is best-effort: the validator probe just falls back to a registry pull.
 COPY hello-world.tar /opt/probe/hello-world.tar
-COPY load-probe.sh load-probe-entrypoint.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/load-probe.sh /usr/local/bin/load-probe-entrypoint.sh
+COPY load-probe.sh load-probe-entrypoint.sh select-iptables-backend.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/load-probe.sh /usr/local/bin/load-probe-entrypoint.sh /usr/local/bin/select-iptables-backend.sh
 ENTRYPOINT ["/usr/local/bin/load-probe-entrypoint.sh"]
 
 # Welcome Message
