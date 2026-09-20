@@ -18,6 +18,16 @@ print_feedback() {
     echo -e "${GREEN}[ComfyUI Startup]:${NC} $1"
 }
 
+# A command that fails under `set -e` would end this script and, through /start.sh's own `set -e`, the container.
+# A pod the renter can still reach over SSH, with this line in `docker logs`, is worth more than a dead one, so the
+# failure is reported and control goes back to /start.sh (SSH setup, `sleep infinity`).
+on_error() {
+    local rc=$? line=$1
+    print_feedback "pre_start.sh failed at line $line (exit $rc): ComfyUI was not started; the pod stays up for SSH"
+    exit 0
+}
+trap 'on_error $LINENO' ERR
+
 # Function to run rsync with progress bar and optimizations
 rsync_with_progress() {
     rsync -aHvx --info=progress2 --ignore-existing --update --stats "$@"

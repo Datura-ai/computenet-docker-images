@@ -17,5 +17,5 @@ The image CMD is `/start.sh` (`scripts/start.sh`), which runs `/pre_start.sh` in
 
 ## Checks
 
-- `bash templates/better-comfyui/tests/test_pre_start.sh` — the first-time-sync spinner is stopped without ending `pre_start.sh` (the archived image died here), no bare `wait` under `set -e`, `CUSTOM_ARGS` handling.
+- `bash templates/better-comfyui/tests/test_pre_start.sh` — the first-time-sync spinner is stopped without ending `pre_start.sh` (the archived image died here), no bare `wait` under `set -e`, a failing command hands back to `/start.sh` with the pod still up, `CUSTOM_ARGS` handling.
 - `templates/better-comfyui/smoke/template_serve_probe.sh <image> [port=3000]` — on a GPU host with the NVIDIA container toolkit: starts the image the way the platform does (image CMD, no startup command, `--gpus all`), waits up to `PROBE_TIMEOUT_MIN` (20) minutes for HTTP 200 on the port and a `cuda` device in `GET /system_stats`, prints `PASS: ComfyUI <version> · python … · torch … · <GPU>` or `FAIL: <why>` with the container log tail. There is no GPU runner in CI, so this probe is the gate before a tag is published or a template row points at it.

@@ -34,20 +34,21 @@ RUN mkdir -p /workspace/venvs && python -m venv /workspace/venvs/better-comfyui
 ENV VIRTUAL_ENV="/workspace/venvs/better-comfyui"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Activate the virtual environment and install packages
-RUN $VIRTUAL_ENV/bin/pip install --upgrade pip setuptools wheel && \
+# Activate the virtual environment and install packages. Every pip call runs with --no-cache-dir: the wheel cache
+# (several GB for torch/xformers/insightface) would otherwise stay in this layer and in every image built on it.
+RUN $VIRTUAL_ENV/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
     if [ -n "${TORCH}" ]; then \
         $VIRTUAL_ENV/bin/pip install --no-cache-dir ${TORCH}; \
     fi && \
     git clone https://github.com/comfyanonymous/ComfyUI.git /ComfyUI && \
-    $VIRTUAL_ENV/bin/pip install -r /ComfyUI/requirements.txt && \
+    $VIRTUAL_ENV/bin/pip install --no-cache-dir -r /ComfyUI/requirements.txt && \
     git clone https://github.com/ltdrdata/ComfyUI-Manager.git /ComfyUI/custom_nodes/ComfyUI-Manager && \
-    $VIRTUAL_ENV/bin/pip install -r /ComfyUI/custom_nodes/ComfyUI-Manager/requirements.txt && \
+    $VIRTUAL_ENV/bin/pip install --no-cache-dir -r /ComfyUI/custom_nodes/ComfyUI-Manager/requirements.txt && \
     if [ -n "${XFORMERS}" ]; then \
         $VIRTUAL_ENV/bin/pip install --no-cache-dir ${XFORMERS}; \
     fi && \
-    $VIRTUAL_ENV/bin/pip install accelerate wheel comfy-cli insightface && \
-    $VIRTUAL_ENV/bin/pip install ipykernel ipywidgets && \
+    $VIRTUAL_ENV/bin/pip install --no-cache-dir accelerate wheel comfy-cli insightface && \
+    $VIRTUAL_ENV/bin/pip install --no-cache-dir ipykernel ipywidgets && \
     $VIRTUAL_ENV/bin/python -m ipykernel install --name "python3" --display-name "Python 3 (Workspace Venv)"
 
 # The build fails here if any of the installs above resolved a different torch over the cu128 one.

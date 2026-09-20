@@ -6,8 +6,9 @@
 # Covered: the first-time-sync spinner is stopped without ending the script — the exact `kill`/`wait` lines from
 # pre_start.sh run under `set -e` with a real background loop and the script must reach the line after them
 # (the archived image's `kill $PID; wait $PID` returned 143 and errexit ended /pre_start.sh, so /start.sh and the
-# container exited before ComfyUI started); no `wait` in the script is left unguarded; the script parses (bash -n)
-# and the ComfyUI command line is built from CUSTOM_ARGS the way the header documents.
+# container exited before ComfyUI started); no `wait` in the script is left unguarded; the script parses (bash -n);
+# a failing command reports itself and exits 0 so /start.sh keeps the pod up, and the ComfyUI command line is built
+# from CUSTOM_ARGS the way the header documents.
 #
 # Against the old script it fails: `bash tests/test_pre_start.sh <(git show 210db17:templates/better-comfyui/pre_start.sh)`.
 set -uo pipefail
@@ -57,6 +58,23 @@ if [[ -z "$unguarded" ]]; then
     check pass "no bare 'wait' under set -e"
 else
     check fail "bare 'wait' under set -e: $unguarded"
+fi
+
+# --- a failing command reports itself and hands back to /start.sh with rc 0 ---------------------------------------
+handler=$(sed -n '/^print_feedback() {/,/^}/p; /^on_error() {/,/^}/p; /^trap .*ERR$/p' "$PRE_START")
+if ! grep -q '^trap ' <<<"$handler"; then
+    check fail "found the ERR trap and on_error"
+else
+    out=$(bash -c "set -e
+$handler
+false
+echo unreachable" 2>&1)
+    rc=$?
+    if [[ $rc -eq 0 && "$out" == *"pre_start.sh failed at line"* && "$out" != *unreachable* ]]; then
+        check pass "a failing command under set -e prints the failure line and exits 0 for /start.sh"
+    else
+        check fail "a failing command under set -e prints the failure line and exits 0: rc $rc, output '$out'"
+    fi
 fi
 
 # --- CUSTOM_ARGS is split into extra flags -------------------------------------------------------------------------
