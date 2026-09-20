@@ -8,8 +8,10 @@ if [ -z "$TERM" ]; then
     export TERM=xterm-256color
 fi
 
-# Exit immediately if a command exits with a non-zero status
-set -e
+# Exit immediately if a command exits with a non-zero status; -E so the ERR trap below also fires for a command
+# that fails inside a function (rsync_with_progress, print_feedback) — without it that failure ends the script with
+# the command's status and the container with it
+set -eE
 
 # Function to print colorized feedback
 print_feedback() {
@@ -104,6 +106,7 @@ EOF
     # `wait $PID` ends this script right here and the container with it (DAH-3704), so the status is swallowed.
     kill "$PROGRESS_PID" 2>/dev/null || true
     wait "$PROGRESS_PID" 2>/dev/null || true
+    unset PROGRESS_PID
 
     # complete copy → its final path (same filesystem, one rename)
     mv "$SYNC_DIR" "$VIRTUAL_ENV"

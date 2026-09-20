@@ -7,8 +7,9 @@
 # pre_start.sh run under `set -e` with a real background loop and the script must reach the line after them
 # (the archived image's `kill $PID; wait $PID` returned 143 and errexit ended /pre_start.sh, so /start.sh and the
 # container exited before ComfyUI started); no `wait` in the script is left unguarded; the script parses (bash -n);
-# a failing command reports itself and exits 0 so /start.sh keeps the pod up, and the ComfyUI command line is built
-# from CUSTOM_ARGS the way the header documents.
+# the whole first-time-sync block runs through on temp dirs (venv at its final path, staging dir gone); a failing
+# command — inside a function too — reports itself, stops the spinner and exits 0 so /start.sh keeps the pod up; and
+# the ComfyUI command line is built from CUSTOM_ARGS the way the header documents.
 #
 # Against the old script it fails: `bash tests/test_pre_start.sh <(git show 210db17:templates/better-comfyui/pre_start.sh)`.
 set -uo pipefail
@@ -117,10 +118,27 @@ echo unreachable" 2>&1)
         check fail "a failing command under set -e prints the failure line and exits 0: rc $rc, output '$out'"
     fi
 
-    # a failure while the spinner runs (rsync ENOSPC, mv) must not leave the spinner subshell behind
-    out=$(bash -c "set -e
+    # a failure inside a function must reach the trap too: the script's own `set` line must carry -E (errtrace),
+    # or `rsync_with_progress` failing ends the script with rsync's status and the container exits
+    set_line=$(grep -E '^set -[a-zA-Z]+$' "$PRE_START" | head -1)
+    out=$(bash -c "${set_line:-set -e}
 $handler
-( while true; do sleep 0.2; done ) &
+f() { false; }
+f
+echo unreachable" 2>&1)
+    rc=$?
+    if [[ $rc -eq 0 && "$out" == *"pre_start.sh failed at line"* && "$out" != *unreachable* ]]; then
+        check pass "a command failing inside a function reaches on_error (set -E)"
+    else
+        check fail "a command failing inside a function reaches on_error (set -E): set line '$set_line', rc $rc, output '$out'"
+    fi
+
+    # a failure while the spinner runs (rsync ENOSPC, mv) must not leave the spinner subshell behind. The harness
+    # spinner's output is detached so the command substitution returns when the inner bash exits and `kill -0`
+    # decides — a spinner still holding the pipe would make a missing kill look like a hang, not a FAIL.
+    out=$(timeout 10 bash -c "set -e
+$handler
+( while true; do sleep 0.2; done ) >/dev/null 2>&1 &
 PROGRESS_PID=\$!
 echo spinner=\$PROGRESS_PID
 false
@@ -137,7 +155,7 @@ echo unreachable" 2>&1)
 fi
 
 # --- CUSTOM_ARGS is split into extra flags -------------------------------------------------------------------------
-# Run the argument-building block with a stub python that prints its argv.
+# Run the argument-building block and print COMFY_ARGS.
 argv_block=$(sed -n '/^COMFY_ARGS=(/,/^fi$/p' "$PRE_START")
 if [[ -z "$argv_block" ]]; then
     check fail "found the COMFY_ARGS block"
