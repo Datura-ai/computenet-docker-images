@@ -52,6 +52,39 @@ echo survived" 2>&1)
     fi
 fi
 
+# --- the whole first-time-sync block, end to end, on temp directories ------------------------------------------
+# From `if [ ! -d "$VIRTUAL_ENV" ]; then` to its `else`: banner, spinner, rsync into the staging dir, spinner stop,
+# rename, banner. The venv must appear at its final path only, complete, and the block must run through under set -e.
+if ! command -v rsync >/dev/null 2>&1; then
+    echo "  skip: rsync not installed — first-time-sync block not run"
+else
+    block=$(awk '/^if \[ ! -d "\$VIRTUAL_ENV" \]; then$/{p=1} p{print} p&&/^else$/{exit}' "$PRE_START" | sed '$d')
+    if [[ -z "$block" ]]; then
+        check fail "found the first-time-sync block"
+    else
+        tmp=$(mktemp -d)
+        mkdir -p "$tmp/src/bin" "$tmp/src/lib" && echo python > "$tmp/src/bin/python3" && echo torch > "$tmp/src/lib/torch.py"
+        out=$(TERM=dumb bash -c "set -e
+print_feedback() { echo \"\$1\"; }
+VIRTUAL_ENV='$tmp/venv'; SOURCE_VENV='$tmp/src'; SYNC_DIR='$tmp/venv.sync'
+$block
+fi
+echo block-done" 2>&1)
+        rc=$?
+        if [[ $rc -eq 0 && "$out" == *block-done* && "$out" == *"SYNC COMPLETED"* ]]; then
+            check pass "first-time-sync block runs through under set -e (rc 0, completion banner)"
+        else
+            check fail "first-time-sync block runs through under set -e: rc $rc, tail: $(tail -c 200 <<<"$out")"
+        fi
+        if [[ -f "$tmp/venv/bin/python3" && -f "$tmp/venv/lib/torch.py" && ! -e "$tmp/venv.sync" ]]; then
+            check pass "venv copied to its final path via the staging dir (staging dir gone)"
+        else
+            check fail "venv copied to its final path via the staging dir: $(find "$tmp" 2>&1 | tr '\n' ' ')"
+        fi
+        rm -rf "$tmp"
+    fi
+fi
+
 # --- every wait is guarded ---------------------------------------------------------------------------------------
 unguarded=$(grep -nE '^\s*wait\b' "$PRE_START" | grep -vE '\|\|\s*true\s*$' || true)
 if [[ -z "$unguarded" ]]; then

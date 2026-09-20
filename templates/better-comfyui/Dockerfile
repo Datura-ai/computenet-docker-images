@@ -4,7 +4,7 @@
 # The host driver must be >= 570, or one of the 470/535/550/560/565 branches the base image lists for CUDA forward
 # compatibility (its NVIDIA_REQUIRE_CUDA is `cuda>=12.8 …`; the cu126 base accepted >= 560 or 470/535/550).
 ARG BASE_IMAGE=daturaai/pytorch:2.7.0-py3.12-cuda12.8.0-devel-ubuntu22.04
-FROM ${BASE_IMAGE} as base
+FROM ${BASE_IMAGE} AS base
 
 ARG PYTHON_VERSION1=3.12
 
@@ -16,7 +16,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Stage 2: ComfyUI Installation
-FROM base as comfyui-install
+FROM base AS comfyui-install
 
 # ARGs are per stage: declared here, where they are used (a `--build-arg TORCH=…` reaches this RUN only through this
 # line — the earlier declaration in the base stage never did, and the venv's torch came from ComfyUI's requirements.txt).
@@ -55,7 +55,7 @@ RUN $VIRTUAL_ENV/bin/pip install --no-cache-dir --upgrade pip setuptools wheel &
 RUN $VIRTUAL_ENV/bin/python -c 'import sys, torch; v = torch.version.cuda or "cpu"; sys.exit(0 if v.startswith("12.8") else "venv torch %s is a CUDA %s build, not cu128" % (torch.__version__, v))'
 
 # Stage 3: Model Setup
-FROM comfyui-install as model-setup
+FROM comfyui-install AS model-setup
 
 # Create model and cache directories
 RUN mkdir -p /root/.cache/huggingface /comfy-models
@@ -85,7 +85,7 @@ RUN if [ "${INCLUDE_MODELS}" = "true" ]; then \
     fi
 
 # Stage 4: Final Image
-FROM comfyui-install as final
+FROM comfyui-install AS final
 
 # Move virtual environment from /workspace/venv to /venv
 RUN mv /workspace/venvs/better-comfyui /venv
