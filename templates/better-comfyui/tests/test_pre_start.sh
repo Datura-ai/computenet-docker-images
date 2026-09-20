@@ -15,6 +15,14 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRE_START="${1:-$HERE/../pre_start.sh}"
+# the script is read several times below; a process substitution (<(git show …)) is a FIFO that empties on the
+# first read, so anything that is not a regular file is copied to a temp file first
+if [[ ! -f "$PRE_START" ]]; then
+    _copy=$(mktemp)
+    cat "$PRE_START" > "$_copy"
+    PRE_START=$_copy
+    trap 'rm -f "$_copy"' EXIT
+fi
 failures=0
 
 check() {
@@ -107,6 +115,24 @@ echo unreachable" 2>&1)
         check pass "a failing command under set -e prints the failure line and exits 0 for /start.sh"
     else
         check fail "a failing command under set -e prints the failure line and exits 0: rc $rc, output '$out'"
+    fi
+
+    # a failure while the spinner runs (rsync ENOSPC, mv) must not leave the spinner subshell behind
+    out=$(bash -c "set -e
+$handler
+( while true; do sleep 0.2; done ) &
+PROGRESS_PID=\$!
+echo spinner=\$PROGRESS_PID
+false
+echo unreachable" 2>&1)
+    rc=$?
+    spinner_pid=$(sed -n 's/^spinner=//p' <<<"$out")
+    sleep 0.3
+    if [[ $rc -eq 0 && -n "$spinner_pid" ]] && ! kill -0 "$spinner_pid" 2>/dev/null; then
+        check pass "on_error stops a running spinner before it exits"
+    else
+        [[ -n "$spinner_pid" ]] && kill "$spinner_pid" 2>/dev/null
+        check fail "on_error stops a running spinner before it exits: rc $rc, spinner '$spinner_pid', output '$out'"
     fi
 fi
 

@@ -23,6 +23,11 @@ print_feedback() {
 # failure is reported and control goes back to /start.sh (SSH setup, `sleep infinity`).
 on_error() {
     local rc=$? line=$1
+    # a failure inside the first-time sync leaves the spinner subshell running; stop it before handing back
+    if [ -n "${PROGRESS_PID:-}" ]; then
+        kill "$PROGRESS_PID" 2>/dev/null || true
+        wait "$PROGRESS_PID" 2>/dev/null || true
+    fi
     print_feedback "pre_start.sh failed at line $line (exit $rc): ComfyUI was not started; the pod stays up for SSH"
     exit 0
 }

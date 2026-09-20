@@ -8,7 +8,7 @@ Base: `daturaai/pytorch:2.7.0-py3.12-cuda12.8.0-devel-ubuntu22.04` with torch 2.
 
 ## Start path
 
-The image CMD is `/start.sh` (`scripts/start.sh`), which runs `/pre_start.sh` in the foreground: on the first start the venv is copied from `/venv` to `/workspace/venvs/better-comfyui` (~6.5 GB, a few minutes) and `/ComfyUI` to `/workspace/ComfyUI`, then ComfyUI starts on port 3000 (`--listen --port 3000 --enable-cors-header`, plus whatever `CUSTOM_ARGS` holds). The server log is `/workspace/comfyui.log`. If the server exits, the pod stays up for SSH. `NO_SYNC=true` skips the sync and the server.
+The image CMD is `/start.sh` (`scripts/start.sh`), which runs `/pre_start.sh` in the foreground: on the first start the venv is copied from `/venv` to `/workspace/venvs/better-comfyui` (~6.5 GB, a few minutes) and `/ComfyUI` to `/workspace/ComfyUI`, then ComfyUI starts on port 3000 (`--listen --port 3000 --enable-cors-header`, plus whatever `CUSTOM_ARGS` holds). The server log is `/workspace/comfyui.log`. If the server exits, the pod stays up for SSH. `NO_SYNC=true` skips the sync and the server — and everything `/start.sh` runs after `pre_start.sh` (its SSH setup, Jupyter, `post_start.sh`): the container just sleeps.
 
 ## Ports
 
