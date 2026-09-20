@@ -1,6 +1,6 @@
 #!/bin/bash
 # pre_start.sh — run by /start.sh (scripts/start.sh) in the foreground: first-time sync of the venv and the ComfyUI tree
-# into /workspace, then the ComfyUI server on :3000. PID 1 blocks here while ComfyUI runs; when the server exits, control
+# into /workspace, then the ComfyUI server on :3000. /start.sh (PID 1) waits on this script, which blocks on the server; when it exits, control
 # returns to /start.sh, which keeps the pod up for SSH (`sleep infinity`) — the reason is in /workspace/comfyui.log.
 
 # Set a default TERM if it's not set
