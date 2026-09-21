@@ -39,7 +39,9 @@ Nothing.
 - Pod-to-pod SSH works over the overlay (DAH-2664). The backend mints one keypair per cluster; the
   entrypoint installs the private half at `/etc/lium/cluster_ed25519`, the public half at
   `/etc/lium/cluster_authorized_keys` (an `AuthorizedKeysFile` drop-in in `/etc/ssh/sshd_config.d/`
-  makes sshd read it next to the renter's own `authorized_keys`), and a `Host` block for the overlay
+  makes sshd read it next to the renter's own `authorized_keys`; the key carries a `from=` limited
+  to the overlay subnet, since sshd also listens on the public port and the key is the whole
+  group's — without wg0's address nothing of the login is installed), and a `Host` block for the overlay
   subnet in `/etc/ssh/ssh_config.d/lium-cluster.conf` that names the key and skips the host-key
   prompt. This is what `mpirun`, DeepSpeed's pdsh launcher and the nccl-tests recipes need; without
   it the only working launcher is torchrun with a hand-typed `--node_rank` per node.

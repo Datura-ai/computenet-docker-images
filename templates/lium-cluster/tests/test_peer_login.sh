@@ -18,12 +18,17 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RUN_ID="$$"
 NET="lium-cluster-peer-test-${RUN_ID}"
+# a second network both nodes are also on, standing in for the public side of the pod: the shared
+# key must NOT open a peer from there, only from the overlay
+PUBLIC_NET="lium-cluster-peer-test-public-${RUN_ID}"
 IMAGE="${TEST_SSHD_IMAGE:-lium-cluster-test-sshd:24.04}"
 # a /24 of its own per run, so two runs on one docker host do not collide
 OCTET=$(( RUN_ID % 200 + 20 ))
 SUBNET="172.30.${OCTET}.0/24"
 NODE_A_IP="172.30.${OCTET}.2"
 NODE_B_IP="172.30.${OCTET}.3"
+PUBLIC_SUBNET="172.31.${OCTET}.0/24"
+NODE_B_PUBLIC_IP="172.31.${OCTET}.3"
 WORK="$(mktemp -d)"
 
 failures=0
@@ -32,7 +37,7 @@ pass() { echo "  ok: $*"; }
 
 cleanup() {
     docker rm -f "node-a-${RUN_ID}" "node-b-${RUN_ID}" >/dev/null 2>&1
-    docker network rm "$NET" >/dev/null 2>&1
+    docker network rm "$NET" "$PUBLIC_NET" >/dev/null 2>&1
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -45,6 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssh-server 
 DOCKERFILE
 
 docker network create --subnet "$SUBNET" "$NET" >/dev/null
+docker network create --subnet "$PUBLIC_SUBNET" "$PUBLIC_NET" >/dev/null
 
 # The backend mints one keypair per group; the renter brings their own.
 ssh-keygen -q -t ed25519 -N '' -C lium-cluster -f "$WORK/cluster_key"
@@ -103,9 +109,10 @@ mount_volume_over_root() {
 
 # A run: two nodes with the given entrypoint, the validator's steps, then the logins that matter.
 # Sets LOGIN_RC (a → b as a launcher would), NOPROMPT_RC (the same with the host-key prompt
-# switched off on the command line, which isolates the key from the Host block), RENTER_RC (the
-# renter's own key still opens b; -F /dev/null so no config adds our key to that attempt),
-# CHECK_LOG (node a's start-up verdict).
+# switched off on the command line, which isolates the key from the Host block), PUBLIC_RC (the
+# cluster key offered to b's PUBLIC address, from a's public address — sshd must refuse it),
+# RENTER_RC (the renter's own key still opens b; -F /dev/null so no config adds our key to that
+# attempt), CHECK_LOG (node a's start-up verdict).
 run_cluster() {
     local entrypoint="$1"
     docker rm -f "node-a-${RUN_ID}" "node-b-${RUN_ID}" >/dev/null 2>&1
@@ -115,9 +122,15 @@ run_cluster() {
     wait_for_sshd "node-b-${RUN_ID}" || { echo "node b never started sshd"; docker logs "node-b-${RUN_ID}"; return 1; }
     mount_volume_over_root "node-a-${RUN_ID}" || return 1
     mount_volume_over_root "node-b-${RUN_ID}" || return 1
+    # the public side, joined after the entrypoint ran so `ip … wg0` (stubbed) is not what changes
+    docker network connect "$PUBLIC_NET" "node-a-${RUN_ID}" || return 1
+    docker network connect --ip "$NODE_B_PUBLIC_IP" "$PUBLIC_NET" "node-b-${RUN_ID}" || return 1
 
     LOGIN_OUT="$(docker exec "node-a-${RUN_ID}" ssh -o BatchMode=yes -o ConnectTimeout=5 "root@${NODE_B_IP}" hostname 2>&1)"
     LOGIN_RC=$?
+    PUBLIC_OUT="$(docker exec "node-a-${RUN_ID}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i /etc/lium/cluster_ed25519 "root@${NODE_B_PUBLIC_IP}" hostname 2>&1)"
+    PUBLIC_RC=$?
     NOPROMPT_OUT="$(docker exec "node-a-${RUN_ID}" ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "root@${NODE_B_IP}" hostname 2>&1)"
     NOPROMPT_RC=$?
@@ -139,6 +152,10 @@ if run_cluster "${HERE}/../entrypoint.sh"; then
     [[ "$LOGIN_RC" == "0" && "$LOGIN_OUT" == "node-b-${RUN_ID}" ]] \
         && pass "ssh root@peer hostname → the peer's hostname, no key, no prompt" \
         || fail "ssh to the peer: rc ${LOGIN_RC}, said: ${LOGIN_OUT}"
+    # the key is the whole group's and sshd listens on the public port too: from off the overlay it opens nothing
+    [[ "$PUBLIC_RC" != "0" && "$PUBLIC_OUT" == *"Permission denied"* ]] \
+        && pass "the cluster key is refused at the peer's public address (from= keeps it to the overlay)" \
+        || fail "expected 'Permission denied' from the public side, got rc ${PUBLIC_RC}: ${PUBLIC_OUT}"
     [[ "$RENTER_RC" == "0" ]] \
         && pass "the renter's own key still opens the peer (sshd reads both authorized_keys files)" \
         || fail "the renter's key was refused: ${RENTER_OUT}"

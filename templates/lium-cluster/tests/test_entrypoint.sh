@@ -118,7 +118,8 @@ RESULT="$(run_entrypoint \
 [[ "$(fact private_key_mode)" == "600" ]] && pass "the private key is unreadable to others" || fail "private key mode $(fact private_key_mode)"
 # sshd's StrictModes: the keys file and its directory are root-owned and writable by nobody else
 [[ "$(fact cluster_dir_mode)" == "755" ]] && pass "/etc/lium is root's, not writable by others" || fail "/etc/lium mode $(fact cluster_dir_mode)"
-[[ "$(fact cluster_authorized_keys)" == "${SSH_AUTHORIZED_KEY}," ]] && pass "the peers' login is authorized" || fail "cluster_authorized_keys reads: $(fact cluster_authorized_keys)"
+# the key is the whole group's and sshd listens on the public port too, so it opens root only from the overlay
+[[ "$(fact cluster_authorized_keys)" == "from=\"10.42.0.*\" ${SSH_AUTHORIZED_KEY}," ]] && pass "the peers' login is authorized from the overlay only" || fail "cluster_authorized_keys reads: $(fact cluster_authorized_keys)"
 [[ "$(fact cluster_authorized_keys_mode)" == "644" ]] && pass "sshd may read the peers' login" || fail "cluster_authorized_keys mode $(fact cluster_authorized_keys_mode)"
 [[ "$(fact sshd_dropin)" == "AuthorizedKeysFile .ssh/authorized_keys /etc/lium/cluster_authorized_keys," ]] \
     && pass "sshd reads the renter's authorized_keys AND ours" \
@@ -152,7 +153,7 @@ if [[ "$(fact mounted_over_root)" != "1" ]]; then
     echo "  skipped: this docker cannot mount a tmpfs inside the container (needs CAP_SYS_ADMIN)"
 else
     [[ "$(fact private_key)" == "FAKE-CLUSTER-PRIVATE-KEY-FOR-TESTS" ]] && pass "the private key is still there after the mount" || fail "private key reads: $(fact private_key)"
-    [[ "$(fact cluster_authorized_keys)" == "${SSH_AUTHORIZED_KEY}," ]] && pass "the peers' login is still authorized after the mount" || fail "cluster_authorized_keys reads: $(fact cluster_authorized_keys)"
+    [[ "$(fact cluster_authorized_keys)" == "from=\"10.42.0.*\" ${SSH_AUTHORIZED_KEY}," ]] && pass "the peers' login is still authorized after the mount" || fail "cluster_authorized_keys reads: $(fact cluster_authorized_keys)"
     [[ -n "$(fact ssh_config)" && -n "$(fact sshd_dropin)" ]] && pass "both ssh drop-ins are still there after the mount" || fail "a drop-in vanished with the mount"
     [[ "$(fact renter_authorized_keys)" == "RENTERS-OWN-KEY," ]] && pass "the renter's authorized_keys holds only what the validator wrote" || fail "renter authorized_keys reads: $(fact renter_authorized_keys)"
 fi
@@ -192,8 +193,10 @@ RESULT="$(run_entrypoint)"
 [[ -z "$(fact sshd_dropin)$(fact ssh_config)" ]] && pass "no ssh drop-ins" || fail "an ssh drop-in was written on a standalone pod"
 [[ -z "$(fact ssh_calls)" ]] && pass "nothing was dialled" || fail "ssh was called with: $(fact ssh_calls)"
 
-echo "== a cluster pod whose wg0 reports no address: the pod still comes up =="
-# `ip` failing must not take the entrypoint down with it — set -o pipefail makes that easy to get wrong
+echo "== a cluster pod whose wg0 reports no address: the pod still comes up, without the login =="
+# `ip` failing must not take the entrypoint down with it — set -o pipefail makes that easy to get wrong.
+# And with the subnet unknown the peers' key cannot be limited to it, so it is not installed at all:
+# a key the whole group holds must never open root from any address.
 RESULT="$(TEST_IP_FAILS=1 run_entrypoint \
     -e TEST_IP_FAILS=1 \
     -e LIUM_WIREGUARD_CONF_B64="${WIREGUARD_CONF_B64}" \
@@ -202,9 +205,9 @@ RESULT="$(TEST_IP_FAILS=1 run_entrypoint \
 
 [[ "$(fact exit_status)" == "0" ]] && pass "entrypoint survived a failing ip" || fail "exit $(fact exit_status)"
 [[ "$(fact handed_off)" == "1" ]] && pass "handed off to the base entrypoint" || fail "never reached the base entrypoint"
-[[ "$(fact private_key)" == "FAKE-CLUSTER-PRIVATE-KEY-FOR-TESTS" ]] && pass "the cluster login is still installed" || fail "no private key"
-[[ -z "$(fact ssh_config)" ]] && pass "no host block, since the subnet is unknown" || fail "ssh config reads: $(fact ssh_config)"
-[[ "$(fact ssh_check_log)" == *"verdict"* ]] && pass "the peers are still checked" || fail "check log reads: $(fact ssh_check_log)"
+[[ -z "$(fact cluster_authorized_keys)" ]] && pass "no peers' login: it could not be limited to the overlay" || fail "cluster_authorized_keys reads: $(fact cluster_authorized_keys)"
+[[ -z "$(fact private_key)$(fact sshd_dropin)$(fact ssh_config)" ]] && pass "no key and no drop-ins either" || fail "something of the login was installed: $(fact private_key) $(fact sshd_dropin) $(fact ssh_config)"
+[[ -z "$(fact ssh_calls)" ]] && pass "no peer is dialled without a login to try" || fail "ssh was called with: $(fact ssh_calls)"
 
 echo "== a cluster pod on RoCE: the card and GID the gate found are published too =="
 RESULT="$(run_entrypoint \

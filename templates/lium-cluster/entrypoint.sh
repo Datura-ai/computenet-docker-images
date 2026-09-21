@@ -148,6 +148,20 @@ install_cluster_ssh_identity() {
         return 0
     fi
 
+    # The overlay subnet, read off wg0 before anything is written: the peers' key below is limited
+    # to it, so the login is installed only once the subnet is known. It is read rather than
+    # hardcoded because the backend owns the address plan, and a copy baked into this image would
+    # silently stop matching the day that plan changes.
+    local overlay_address overlay_host_pattern
+    # `|| true` because `set -o pipefail` is on: without it a missing wg0 kills the whole entrypoint
+    # here, which would fail the pod over an SSH convenience instead of degrading.
+    overlay_address="$(ip -o -4 addr show wg0 2>/dev/null | awk '{print $4}' | head -1 || true)"
+    if [[ -z "$overlay_address" ]]; then
+        echo "lium-cluster: wg0 has no address, so the cluster login is not installed (its key could not be limited to the overlay)" >&2
+        return 0
+    fi
+    overlay_host_pattern="${overlay_address%.*}.*"
+
     # Root-owned, world-readable directory: sshd's StrictModes accepts an AuthorizedKeysFile only
     # when the file and every directory above it are owned by root or the user and writable by
     # nobody else. The private key inside is restricted before it holds anything — ssh refuses a
@@ -157,10 +171,12 @@ install_cluster_ssh_identity() {
     install -m 600 /dev/null "$CLUSTER_SSH_KEY_FILE"
     echo "$key_b64" | base64 -d > "$CLUSTER_SSH_KEY_FILE"
 
-    # The peers' login, in a file of its own. The renter's authorized_keys under /root/.ssh is left
-    # to the validator: it writes that file after the mount, and it lands in the mounted volume.
+    # The peers' login, in a file of its own. `from=` limits it to the overlay: the group shares
+    # this one key, and sshd listens on the public port too, so without it anyone holding the key
+    # logs in as root from any address. The renter's authorized_keys under /root/.ssh is left to
+    # the validator: it writes that file after the mount, and it lands in the mounted volume.
     install -m 644 /dev/null "$CLUSTER_SSH_AUTHORIZED_KEYS_FILE"
-    echo "$authorized_key" > "$CLUSTER_SSH_AUTHORIZED_KEYS_FILE"
+    echo "from=\"$overlay_host_pattern\" $authorized_key" > "$CLUSTER_SSH_AUTHORIZED_KEYS_FILE"
 
     # sshd reads the drop-in directory before the rest of sshd_config (Ubuntu's file opens with
     # `Include /etc/ssh/sshd_config.d/*.conf`), and the FIRST value of an option wins, so this
@@ -174,20 +190,8 @@ EOF
     chmod 644 "$CLUSTER_SSHD_CONF"
 
     # A launcher fails outright on an unknown host key, and nothing on this private mesh can be
-    # impersonated — the peers are exactly the pods WireGuard let in. The subnet is read off wg0
-    # rather than hardcoded: the backend owns the address plan, and a copy baked into this image
-    # would silently stop matching the day that plan changes.
-    local overlay_address overlay_host_pattern
-    # `|| true` because `set -o pipefail` is on: without it a missing wg0 kills the whole entrypoint
-    # here, which would fail the pod over an SSH convenience instead of degrading.
-    overlay_address="$(ip -o -4 addr show wg0 2>/dev/null | awk '{print $4}' | head -1 || true)"
-    if [[ -z "$overlay_address" ]]; then
-        echo "lium-cluster: wg0 has no address, so peers cannot be dialled by name" >&2
-        return 0
-    fi
-    overlay_host_pattern="${overlay_address%.*}.*"
-
-    # The client side goes to the system-wide drop-in directory (`/etc/ssh/ssh_config` opens with
+    # impersonated — the peers are exactly the pods WireGuard let in. The client side goes to the
+    # system-wide drop-in directory (`/etc/ssh/ssh_config` opens with
     # `Include /etc/ssh/ssh_config.d/*.conf`). ssh reads ~/.ssh/config before the system file, so a
     # restored backup whose config opens with `Host *` + `StrictHostKeyChecking yes` keeps its own
     # value; that file lives in the mounted volume and cannot be edited from here. The start-up
