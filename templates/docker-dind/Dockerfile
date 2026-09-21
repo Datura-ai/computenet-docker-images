@@ -27,15 +27,8 @@ RUN nvidia-ctk runtime configure --runtime=docker
 COPY daemon.json /etc/docker/daemon.json
 COPY config.toml /etc/nvidia-container-runtime/config.toml
 
-# DAH-2856: the inner dockerd talks to the kernel through iptables. The base image selects the
-# legacy binary, which needs the ip_tables/iptable_nat kernel modules loaded ON THE HOST; a host
-# whose own iptables runs in nf_tables mode with nothing else loading those modules (Debian 12+,
-# Ubuntu without ufw) leaves the inner dockerd dying at `iptables -t nat -N DOCKER` with
-# "can't initialize iptables table `nat': Table does not exist", sshd never starts and the
-# validator scores the node as "no sysbox" (ticket-0309: three reinstalls). A sysbox container
-# cannot modprobe. iptables-nft only needs nf_tables, which every host running a current dockerd
-# already has. The default is nft; select-iptables-backend.sh (run first by load-probe-entrypoint.sh)
-# falls back to legacy at start when nft cannot open a table but legacy can (legacy-only hosts).
+# DAH-2856: default to iptables-nft, which needs only nf_tables on the host; legacy needs kernel modules
+# a sysbox container cannot load. select-iptables-backend.sh (header has the why) falls back to legacy at start.
 RUN update-alternatives --set iptables /usr/sbin/iptables-nft \
     && update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
 

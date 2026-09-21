@@ -10,16 +10,16 @@ probe never pulls from Docker Hub.
 
 ```bash
 docker run -d --gpus all --runtime=sysbox-runc --rm --name=dind-test \
-  -p 2023:22 daturaai/dind:0.0.2 \
+  -p 2023:22 daturaai/dind:0.0.3 \
   sh -c 'mkdir -p ~/.ssh && echo "<your ssh public key>" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'
 ssh -p 2023 root@<host> docker run --rm hello-world
 ```
 
-## iptables backend (0.0.2, DAH-2856)
+## iptables backend (0.0.3, DAH-2856)
 
 The inner dockerd needs iptables. The image selects `iptables-nft` (Dockerfile `update-alternatives`);
 `select-iptables-backend.sh` runs first in the entrypoint and switches back to `iptables-legacy` only when
-nft cannot open the `nat` table but legacy can. `smoke.sh` (run by `scripts/build-smoke.sh` in CI) asserts the nft alternative. Before 0.0.2 the image used legacy iptables, which needs
+nft cannot open the `nat` table but legacy can. `smoke.sh` (run by `scripts/build-smoke.sh` in CI) asserts the nft alternative. Before 0.0.3 the image used legacy iptables, which needs
 the `ip_tables`/`iptable_nat` kernel modules loaded on the host; on a host whose own iptables runs in
 nf_tables mode with nothing loading those modules (the Debian 12+ default) the inner dockerd died with
 `can't initialize iptables table 'nat'`, sshd never started and the validator scored the node as having
@@ -32,5 +32,5 @@ The base is pinned to `cruizba/ubuntu-dind:noble-28.0.4` (Ubuntu 24.04, Docker 2
 
 ```bash
 cd templates/docker-dind
-BUILDX_BAKE_ENTITLEMENTS_FS=0 docker buildx bake --load      # daturaai/dind:0.0.2 (VERSION in docker-bake.hcl)
+BUILDX_BAKE_ENTITLEMENTS_FS=0 docker buildx bake --load      # daturaai/dind:0.0.3 (VERSION in docker-bake.hcl)
 ```
