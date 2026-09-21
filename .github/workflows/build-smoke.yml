@@ -5,8 +5,8 @@ name: build-smoke
 # host (`E2E_GPU=1 scripts/build-smoke.sh <template>`, run by the loop on a Lium pod) the same script also requires
 # nvidia-smi inside every container and torch.cuda where torch imports. Nothing is pushed: images are tagged lium-smoke/<template> and
 # removed. A push to master only resolves the bake files (its diff against origin/master is empty). Stable job name so it can be required.
-# Each build pulls its base images first (3 tries, each using leftover T_PULL_TOTAL=25m — a stalled registry ends with a
-# message instead of eating the 40-minute build budget, DAH-3409)
+# Each build pulls its base images first (3 tries, each capped at T_PULL=8m and leftover T_PULL_TOTAL / tries left —
+# a stalled first connection cannot spend the whole 25 minutes, DAH-3409)
 # and writes its full log to artifacts/build-<template>.log, kept by the upload below even when the step times out.
 on:
   pull_request:

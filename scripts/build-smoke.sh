@@ -8,8 +8,8 @@
 #
 # For each template: `docker buildx bake --print` (the HCL resolves; every default target's Dockerfile exists), then ONE target is built with --load —
 # the template's `smoke` group when it defines one, else the first target of `default` — and the image is booted
-# with its own CMD (its base images are pulled first, 3 tries, each try using leftover T_PULL_TOTAL,
-# so a stalled registry ends with a message instead of eating the build budget): pod templates (they ship /start.sh) must answer python3; the `pytorch` template must `import torch`; on a GPU host
+# with its own CMD (its base images are pulled first, 3 tries, each try capped at T_PULL and leftover/tries-left,
+# so a stalled registry dies and later tries still have budget): pod templates (they ship /start.sh) must answer python3; the `pytorch` template must `import torch`; on a GPU host
 # nvidia-smi must list the GPU in every image and torch.cuda must be available where torch imports; templates/<name>/smoke.sh runs inside the container when present. Every step under `timeout`;
 # artifacts/ gets timings.txt and summary.md (the CI job posts it). Exit 0 only when every step passed.
 set -uo pipefail
@@ -107,10 +107,12 @@ pull_base_images() {  # <template> <target>: docker pull each base image, up to 
   # are kept between tries, the layer in flight is fetched again. An apt stall still times out, with its log kept.
   # T_PULL_TOTAL (default 25m, below T_BUILD) caps the pulls of one template together, so a template with several
   # FROM images (fast-stable-diffusion has two) still ends with a message rather than the step's TIMEOUT.
-  # Each try uses the remaining budget, not T_PULL, so a progressing 2.97 GB layer is not killed at 8 minutes.
+  # Each try is min(T_PULL, leftover / tries-left): T_PULL (default 8m) is the attempt cap operators can override,
+  # and leftover is split so a stalled first connection cannot spend the whole 25 minutes (retries then never run).
   # `base_images` is captured first so a parser failure is not discarded by process substitution.
-  local img rc tries start=$SECONDS left total imgs
+  local img rc tries start=$SECONDS left total cap remain limit imgs
   total=$(secs "$T_PULL_TOTAL")
+  cap=$(secs "$T_PULL")
   imgs=$(base_images "$1" "$2") || { echo "base_images failed for $1 $2"; return 1; }
   while read -r img; do
     [ -n "$img" ] || continue
@@ -118,8 +120,12 @@ pull_base_images() {  # <template> <target>: docker pull each base image, up to 
     for tries in 1 2 3; do
       left=$(( total - (SECONDS - start) ))
       [ "$left" -gt 0 ] || { echo "base image $img: pull budget $T_PULL_TOTAL spent"; return 1; }
-      echo "pull $img (try $tries, limit ${left}s)"
-      if timeout -k 15 "$left" docker pull --quiet --platform linux/amd64 "$img"; then rc=0; break; fi
+      remain=$(( 4 - tries ))
+      limit=$(( left / remain ))
+      [ "$limit" -gt "$cap" ] && limit=$cap
+      [ "$limit" -lt 1 ] && limit=1
+      echo "pull $img (try $tries, limit ${limit}s)"
+      if timeout -k 15 "$limit" docker pull --quiet --platform linux/amd64 "$img"; then rc=0; break; fi
     done
     [ $rc -eq 0 ] || { echo "base image $img did not pull in 3 tries"; return 1; }
   done <<< "$imgs"
