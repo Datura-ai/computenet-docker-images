@@ -100,26 +100,29 @@ PY
 
 secs() { case $1 in *h) echo $(( ${1%h} * 3600 )) ;; *m) echo $(( ${1%m} * 60 )) ;; *s) echo "${1%s}" ;; *) echo "$1" ;; esac; }
 
-pull_base_images() {  # <template> <target>: docker pull each base image, up to 3 tries of T_PULL each, all within T_PULL_TOTAL
+pull_base_images() {  # <template> <target>: docker pull each base image, up to 3 tries, all within T_PULL_TOTAL
   # 11 Sep 2026, run 34584117479 attempt 1: build-dolphin produced no output for the whole 40-minute budget (the log
   # was lost to `| tail -40`) — a stalled pull or a stalled apt mirror; attempt 2 built the same image in 181 s. The
   # pull half is retried here under its own timeout instead of consuming the build budget; layers already extracted
   # are kept between tries, the layer in flight is fetched again. An apt stall still times out, with its log kept.
   # T_PULL_TOTAL (default 25m, below T_BUILD) caps the pulls of one template together, so a template with several
   # FROM images (fast-stable-diffusion has two) still ends with a message rather than the step's TIMEOUT.
-  local img rc tries start=$SECONDS left per_try total; total=$(secs "$T_PULL_TOTAL"); per_try=$(secs "$T_PULL")
+  # Each try uses the remaining budget, not T_PULL, so a progressing 2.97 GB layer is not killed at 8 minutes.
+  # `base_images` is captured first so a parser failure is not discarded by process substitution.
+  local img rc tries start=$SECONDS left total imgs
+  total=$(secs "$T_PULL_TOTAL")
+  imgs=$(base_images "$1" "$2") || { echo "base_images failed for $1 $2"; return 1; }
   while read -r img; do
     [ -n "$img" ] || continue
     rc=1
     for tries in 1 2 3; do
       left=$(( total - (SECONDS - start) ))
       [ "$left" -gt 0 ] || { echo "base image $img: pull budget $T_PULL_TOTAL spent"; return 1; }
-      [ "$left" -lt "$per_try" ] || left=$per_try
       echo "pull $img (try $tries, limit ${left}s)"
       if timeout -k 15 "$left" docker pull --quiet --platform linux/amd64 "$img"; then rc=0; break; fi
     done
     [ $rc -eq 0 ] || { echo "base image $img did not pull in 3 tries"; return 1; }
-  done < <(base_images "$1" "$2")
+  done <<< "$imgs"
 }
 
 build_one() {  # <template>
