@@ -8,7 +8,7 @@
 #
 # For each template: `docker buildx bake --print` (the HCL resolves; every default target's Dockerfile exists), then ONE target is built with --load —
 # the template's `smoke` group when it defines one, else the first target of `default` — and the image is booted
-# with its own CMD (its base images are pulled first, each try under T_PULL, 3 tries, all of them within T_PULL_TOTAL,
+# with its own CMD (its base images are pulled first, 3 tries, each try using leftover T_PULL_TOTAL,
 # so a stalled registry ends with a message instead of eating the build budget): pod templates (they ship /start.sh) must answer python3; the `pytorch` template must `import torch`; on a GPU host
 # nvidia-smi must list the GPU in every image and torch.cuda must be available where torch imports; templates/<name>/smoke.sh runs inside the container when present. Every step under `timeout`;
 # artifacts/ gets timings.txt and summary.md (the CI job posts it). Exit 0 only when every step passed.
