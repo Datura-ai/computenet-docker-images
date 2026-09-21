@@ -3,7 +3,7 @@
 Docker-in-Docker image the lium validators start on every executor for the sysbox probe
 (`DockerCommand.run_dind` in lium-io `neurons/validators/src/core/docker_utils.py`): the container
 brings up an inner dockerd, then the validator's own `service ssh start` command, and the validator
-runs `docker run --rm hello-world` inside it over SSH. `hello-world` is bundled (DAH-1959), so the
+runs `docker run --rm hello-world` inside it over SSH. `hello-world` is bundled, so the
 probe never pulls from Docker Hub.
 
 ## Running it by hand
@@ -15,7 +15,7 @@ docker run -d --gpus all --runtime=sysbox-runc --rm --name=dind-test \
 ssh -p 2023 root@<host> docker run --rm hello-world
 ```
 
-## iptables backend (0.0.3, DAH-2856)
+## iptables backend (0.0.3)
 
 The inner dockerd needs iptables. The image selects `iptables-nft` (Dockerfile `update-alternatives`);
 `select-iptables-backend.sh` runs first in the entrypoint and switches back to `iptables-legacy` only when
