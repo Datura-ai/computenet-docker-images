@@ -3,7 +3,7 @@
 # the base image's start script, so it runs inside a throwaway container with wg-quick, wg, ip, ssh
 # and /pytorch-entrypoint.sh stubbed — what is under test is where the overlay settings and the
 # cluster login end up, with which permissions, and that nothing of ours depends on /root: the
-# validator mounts the rental volume over /root AFTER the entrypoint (DAH-3060), which the mount
+# validator mounts the rental volume over /root AFTER the entrypoint, which the mount
 # scenario below reproduces with a tmpfs (it needs CAP_SYS_ADMIN in the test container, so it is
 # skipped when docker refuses the mount). The peer login itself, with a real sshd, is
 # tests/test_peer_login.sh.
@@ -113,7 +113,7 @@ RESULT="$(run_entrypoint \
 [[ "$(fact etc_environment_has_ifname)" == "1" ]] && pass "an SSH session still reads them too" || fail "/etc/environment lost the settings"
 [[ "$(fact login_shell_ifname)" == "wg0" ]] && pass "a login shell reads them too" || fail "a login shell got: $(fact login_shell_ifname)"
 # DAH-2664 item 3: without a private key and the matching authorized key, mpirun cannot start a
-# rank on a peer. DAH-3060: none of it under /root, which the validator mounts over afterwards.
+# rank on a peer. None of it under /root, which the validator mounts over afterwards.
 [[ "$(fact private_key)" == "FAKE-CLUSTER-PRIVATE-KEY-FOR-TESTS" ]] && pass "the cluster private key is installed" || fail "private key reads: $(fact private_key)"
 [[ "$(fact private_key_mode)" == "600" ]] && pass "the private key is unreadable to others" || fail "private key mode $(fact private_key_mode)"
 # sshd's StrictModes: the keys file and its directory are root-owned and writable by nobody else
@@ -137,7 +137,7 @@ RESULT="$(run_entrypoint \
     || fail "check log reads: $(fact ssh_check_log)"
 [[ "$(fact ssh_check_stderr)" == "1" ]] && pass "the verdict also reaches the container log" || fail "$(fact ssh_check_stderr) verdict line(s) in the container log"
 
-echo "== DAH-3060: the validator mounts the volume over /root after the entrypoint; the login survives =="
+echo "== the validator mounts the volume over /root after the entrypoint; the login survives =="
 # The regression: everything of ours used to live in /root/.ssh, and the mount hid it — the peer
 # then refused the key and mpirun/pdsh hung on every rank but the first.
 # CAP_SYS_ADMIN is what `mount` needs; nothing wider. A host whose docker-default AppArmor profile

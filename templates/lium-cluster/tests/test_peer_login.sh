@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DAH-3060: does the cluster login work once the validator has mounted the volume over /root?
+# Does the cluster login work once the validator has mounted the volume over /root?
 #
 # Two containers on one docker network stand in for two pods of a group rental. Each runs the real
 # entrypoint (wg-quick, wg, ip and the fabric gate stubbed; sshd and ssh REAL, from openssh-server),
@@ -170,7 +170,7 @@ else
 fi
 
 if [[ -n "${TEST_OLD_ENTRYPOINT:-}" ]]; then
-    echo "== the same with the entrypoint from main: the mount hides the login (the DAH-3060 regression) =="
+    echo "== the same with the entrypoint from main: the mount hides the login (the regression this guards) =="
     if run_cluster "$TEST_OLD_ENTRYPOINT"; then
         # the mount hid /root/.ssh/config, so a launcher stops at the host-key prompt …
         [[ "$LOGIN_RC" != "0" && "$LOGIN_OUT" == *"Host key verification failed"* ]] \

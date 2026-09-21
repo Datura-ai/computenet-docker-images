@@ -10,13 +10,7 @@ set -euo pipefail
 # and the nested-container runtime. Written only while the pod is a cluster member.
 CLUSTER_ENV_FILE=/etc/lium-cluster.env
 
-# The group's shared SSH login. Everything lives under /etc, nothing under /root (DAH-3060): on an
-# encrypted rental (the validator's default) the ciphertext volume is at /lium-cipher and the
-# validator FUSE-mounts the gocryptfs plaintext OVER /root (`-nonempty`) with a `docker exec` after
-# this entrypoint has run, so a key, an authorized key or a Host block written to /root/.ssh here is
-# hidden the moment the mount lands. /root/.ssh then holds only the renter's authorized_keys, which
-# the validator writes after the mount. /etc stays on the container's own layer. The renter's own
-# ~/.ssh is never touched, so a restored backup survives too.
+# Kept under /etc: the validator mounts the rental volume over /root after this script.
 CLUSTER_SSH_DIR=/etc/lium
 CLUSTER_SSH_KEY_FILE=$CLUSTER_SSH_DIR/cluster_ed25519
 CLUSTER_SSH_AUTHORIZED_KEYS_FILE=$CLUSTER_SSH_DIR/cluster_authorized_keys
@@ -184,7 +178,7 @@ install_cluster_ssh_identity() {
     # PasswordAuthentication lines at the end of sshd_config, which this does not touch.
     mkdir -p "$(dirname "$CLUSTER_SSHD_CONF")"
     cat > "$CLUSTER_SSHD_CONF" <<EOF
-# DAH-2664 / DAH-3060: the Lium cluster login, kept outside /root (see lium-cluster-entrypoint).
+# DAH-2664: the Lium cluster login, kept outside /root (see lium-cluster-entrypoint).
 AuthorizedKeysFile .ssh/authorized_keys $CLUSTER_SSH_AUTHORIZED_KEYS_FILE
 EOF
     chmod 644 "$CLUSTER_SSHD_CONF"
@@ -198,7 +192,7 @@ EOF
     # check below is what tells the renter when that happens.
     mkdir -p "$(dirname "$CLUSTER_SSH_CLIENT_CONF")"
     cat > "$CLUSTER_SSH_CLIENT_CONF" <<EOF
-# DAH-2664 / DAH-3060: the Lium cluster overlay (see lium-cluster-entrypoint).
+# DAH-2664: the Lium cluster overlay (see lium-cluster-entrypoint).
 Host $overlay_host_pattern
     IdentityFile $CLUSTER_SSH_KEY_FILE
     StrictHostKeyChecking no
@@ -209,8 +203,8 @@ EOF
 }
 
 check_cluster_ssh_peers() {
-    # DAH-3060: the ticket's second ask. A pod that cannot reach its peers over ssh fails only when
-    # the renter's first mpirun/pdsh hangs, hours later and with nothing in the logs. This dials
+    # A pod that cannot reach its peers over ssh fails only when the renter's first mpirun/pdsh
+    # hangs, hours later and with nothing in the logs. This dials
     # every peer wg0 knows once at start, in the background, and leaves the verdict where the renter
     # and a support person can read it: CLUSTER_SSH_CHECK_LOG, and the container log. It never
     # decides the pod's fate — a peer that is still booting is the normal case for the first tries.

@@ -45,7 +45,7 @@ Nothing.
   subnet in `/etc/ssh/ssh_config.d/lium-cluster.conf` that names the key and skips the host-key
   prompt. This is what `mpirun`, DeepSpeed's pdsh launcher and the nccl-tests recipes need; without
   it the only working launcher is torchrun with a hand-typed `--node_rank` per node.
-  Nothing of it lives under `/root` (DAH-3060): on an encrypted rental the validator mounts the
+  Nothing of it lives under `/root`: on an encrypted rental the validator mounts the
   gocryptfs plaintext over `/root` after the entrypoint has run, and anything written to
   `/root/.ssh` before that is hidden by the mount. The renter's own `~/.ssh` is never touched. One
   consequence: a restored backup whose `~/.ssh/config` opens with `Host *` and
@@ -98,7 +98,7 @@ API on 2026-08-11:
 
 ```bash
 cd templates/lium-cluster
-VERSION=0.0.7 docker buildx bake --push
+VERSION=0.0.8 docker buildx bake --push
 ```
 
 `docker-bake.hcl` pins amd64 and the base tag. Bump `VERSION` and the tag in the backend's
@@ -120,7 +120,7 @@ with which permissions, that a standalone pod gets neither, that the login survi
 `/root` (the mount case needs `CAP_SYS_ADMIN` in the test container; it is skipped where Docker
 refuses the mount), and what the start-up peer check writes. Needs Docker.
 
-`tests/test_peer_login.sh` is the end-to-end proof of DAH-3060: two containers with a real sshd,
+`tests/test_peer_login.sh` is the end-to-end proof: two containers with a real sshd,
 the volume mounted over `/root` after the entrypoint as the validator does it, then
 `ssh root@<peer> hostname` from one to the other, and the renter's own key still opening the peer.
 With `TEST_OLD_ENTRYPOINT=<file>` it runs that entrypoint too and expects the login to fail.
