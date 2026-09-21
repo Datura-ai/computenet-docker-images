@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pre_start.sh tests (DAH-3704). No framework, run it:
+# pre_start.sh tests. No framework, run it:
 #
 #     bash templates/better-comfyui/tests/test_pre_start.sh [path/to/pre_start.sh]
 #

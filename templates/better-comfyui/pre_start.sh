@@ -67,9 +67,7 @@ print_feedback "Syncing virtual environment..."
 # the first start copies it back here, so everything below uses this copy through its own interpreter.
 VIRTUAL_ENV="/workspace/venvs/better-comfyui"
 SOURCE_VENV="/venv"
-# The image's PATH puts $VIRTUAL_ENV/bin first, so a half-copied venv must never sit at that path: the first-time
-# copy goes to a staging directory and is renamed when complete (CI's boot check ran `python3 -c 'import torch'`
-# mid-sync and imported a torn package). An interrupted first start resumes into the same staging directory.
+# The first-time copy lands in a staging directory and is renamed when complete, so a half-copied venv never sits on PATH.
 SYNC_DIR="$VIRTUAL_ENV.sync"
 
 if [ ! -d "$VIRTUAL_ENV" ]; then
@@ -103,7 +101,7 @@ EOF
     rsync -aHx --info=progress2 --stats --exclude='*.pyc' --exclude='__pycache__' "$SOURCE_VENV/" "$SYNC_DIR/"
 
     # Stop the progress indicator. `wait` on a killed child returns 128+SIGTERM (143); under `set -e` a bare
-    # `wait $PID` ends this script right here and the container with it (DAH-3704), so the status is swallowed.
+    # `wait $PID` ends this script right here and the container with it, so the status is swallowed.
     kill "$PROGRESS_PID" 2>/dev/null || true
     wait "$PROGRESS_PID" 2>/dev/null || true
     unset PROGRESS_PID

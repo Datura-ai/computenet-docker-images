@@ -1,6 +1,6 @@
 # Stage 1: Base Image
 # CUDA 12.8 base + cu128 wheels: torch 2.7.0/cu128 carries sm_100 and sm_120 kernels, so the image runs on Blackwell
-# (B200, B300, RTX 5090) as well as on Turing/Ampere/Ada (sm_75–sm_89), where the cu124 build ran before (DAH-3704).
+# (B200, B300, RTX 5090) as well as on Turing/Ampere/Ada (sm_75–sm_89), where the cu124 build ran before.
 # The host driver must be >= 570, or one of the 470/535/550/560/565 branches the base image lists for CUDA forward
 # compatibility (its NVIDIA_REQUIRE_CUDA is `cuda>=12.8 …`; the cu126 base accepted >= 560 or 470/535/550).
 ARG BASE_IMAGE=daturaai/pytorch:2.7.0-py3.12-cuda12.8.0-devel-ubuntu22.04
@@ -116,7 +116,7 @@ COPY install-flux.sh /install-flux.sh
 RUN chmod +x /install-flux.sh
 
 # The validator starts a template with the image CMD when the template row has no startup command, so this is the
-# pod's start path: /start.sh → /pre_start.sh → ComfyUI on :3000 in the foreground. `tail -f /dev/null` (210db17)
-# left every pod SSH-only with ComfyUI never started (DAH-3704).
+# pod's start path: /start.sh → /pre_start.sh → ComfyUI on :3000 in the foreground. The earlier `tail -f /dev/null`
+# left every pod SSH-only with ComfyUI never started.
 CMD ["/start.sh"]
 

@@ -11,7 +11,7 @@ group "smoke" {
 target "base" {
     dockerfile = "Dockerfile"
     args = {
-        # CUDA 12.8 base and cu128 wheels: Blackwell (sm_100/sm_120) plus everything the cu124 build ran on (DAH-3704)
+        # CUDA 12.8 base and cu128 wheels: Blackwell (sm_100/sm_120) plus everything the cu124 build ran on
         BASE_IMAGE = "daturaai/pytorch:2.7.0-py3.12-cuda12.8.0-devel-ubuntu22.04",
         TORCH = "torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128",
         XFORMERS = "xformers==0.0.30 --index-url https://download.pytorch.org/whl/cu128",
