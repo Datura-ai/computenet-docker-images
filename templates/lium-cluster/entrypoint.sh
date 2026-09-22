@@ -73,7 +73,7 @@ publish_cluster_env() {
     # session starts from a clean environment — and NCCL then picks the docker bridge, announces
     # 172.x to its peers and the job hangs or crawls. So the same variables are written where a
     # session will read them: PAM reads /etc/environment, a login shell reads /etc/profile.d, and
-    # (DAH-2664) the nested-container runtime reads CLUSTER_ENV_FILE, because a container the inner
+    # the nested-container runtime reads CLUSTER_ENV_FILE, because a container the inner
     # docker starts inherits nothing from this process either.
     # The one contract with the workload: the overlay is always called wg0. NCCL and gloo do not
     # pick a second interface on their own, so we name it for them here and the renter never has to.
@@ -132,7 +132,7 @@ publish_cluster_env() {
 }
 
 install_cluster_ssh_identity() {
-    # DAH-2664: without this a pod cannot log in to its peers — the renter's key is installed for
+    # Without this a pod cannot log in to its peers — the renter's key is installed for
     # inbound access only. Every ready-made multi-node launcher needs it: mpirun spawns its remote
     # ranks over ssh, DeepSpeed's default launcher is pdsh, and every nccl-tests recipe is mpirun.
     # The backend mints one keypair for the whole group, so the same login works in every direction.
@@ -178,21 +178,15 @@ install_cluster_ssh_identity() {
     # PasswordAuthentication lines at the end of sshd_config, which this does not touch.
     mkdir -p "$(dirname "$CLUSTER_SSHD_CONF")"
     cat > "$CLUSTER_SSHD_CONF" <<EOF
-# DAH-2664: the Lium cluster login, kept outside /root (see lium-cluster-entrypoint).
+# The Lium cluster login, kept outside /root.
 AuthorizedKeysFile .ssh/authorized_keys $CLUSTER_SSH_AUTHORIZED_KEYS_FILE
 EOF
     chmod 644 "$CLUSTER_SSHD_CONF"
 
-    # A launcher fails outright on an unknown host key, and nothing on this private mesh can be
-    # impersonated — the peers are exactly the pods WireGuard let in. The client side goes to the
-    # system-wide drop-in directory (`/etc/ssh/ssh_config` opens with
-    # `Include /etc/ssh/ssh_config.d/*.conf`). ssh reads ~/.ssh/config before the system file, so a
-    # restored backup whose config opens with `Host *` + `StrictHostKeyChecking yes` keeps its own
-    # value; that file lives in the mounted volume and cannot be edited from here. The start-up
-    # check below is what tells the renter when that happens.
+    # The mesh is private. The renter's own ~/.ssh/config wins over this drop-in.
     mkdir -p "$(dirname "$CLUSTER_SSH_CLIENT_CONF")"
     cat > "$CLUSTER_SSH_CLIENT_CONF" <<EOF
-# DAH-2664: the Lium cluster overlay (see lium-cluster-entrypoint).
+# The Lium cluster overlay.
 Host $overlay_host_pattern
     IdentityFile $CLUSTER_SSH_KEY_FILE
     StrictHostKeyChecking no
@@ -226,7 +220,7 @@ check_cluster_ssh_peers() {
     # launcher takes, drop-in config included, or a PASS here would prove nothing about mpirun.
     setsid bash -c '
         log="$1"; wait_seconds="$2"; shift 2
-        mkdir -p "$(dirname "$log")"
+        mkdir -p "$(dirname "$log")"; : > "$log"
         deadline=$(( $(date +%s) + wait_seconds ))
         pending=("$@")
         sleep 1
