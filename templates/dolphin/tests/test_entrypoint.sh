@@ -60,6 +60,9 @@ make_sandbox() {
     mkdir -p "${HOME}" "${DOLPHIN_WATCHDOG_STATE_DIR}"
     mock_curl
     engine_answers_health yes
+    # An earlier test's pgrep stub stays on PATH (the sandbox bins stack); without its file it prints
+    # nothing, which is what the real pgrep prints on a host with no engine.
+    unset DOLPHIN_TEST_PGREP_FILE
 }
 
 mock_curl() {
@@ -836,6 +839,7 @@ if [[ "\${HF_HUB_OFFLINE}" == "0" ]]; then
     ${1:-touch "${SANDBOX}/topped_up"}
     exit \${ONLINE_EXIT:-0}
 fi
+echo "offline-revision=\${DOLPHIN_HF_REVISION:-none}" >>"${SANDBOX}/hf_calls"
 [[ -f "${SANDBOX}/topped_up" ]]
 EOF
     chmod +x "${runtime_bin}/python"
@@ -1094,6 +1098,530 @@ test_hf_offline_self_heals_when_no_engine_serves() {
 }
 
 
+# --- DAH-3393: the entrypoint fetches the weights itself; the check reads the worker's revision ----
+# 2026-09-10 prod: the worker gives its engine 10 min to become ready. The model it serves since
+# v2.4.2 (unsloth/Qwen3.8-27B-NVFP4) is ONE 21 GiB safetensors file, so a node must hold 37.6 MB/s
+# for ten minutes with no pause; below that the worker kills the engine, huggingface_hub 1.18+ does
+# not resume, and the next try starts at byte 0. Ten nodes (62 GPUs) looped like that. Two things
+# in this file were blind to it: the completeness check read `refs/main`, which the worker never
+# writes (it downloads a commit sha, and hf_hub writes no ref for one), and counted shards by the
+# mask `model-*.safetensors`, which this one-file model does not match.
+
+# The model the worker serves since v2.4.2, its cache laid out the way hf_hub lays it out for a
+# download pinned to a commit sha: snapshots/<sha>/ and NO refs/main.
+SINGLE_FILE_MODEL="unsloth/Qwen3.8-27B-NVFP4"
+SERVE_REVISION="f0b7c9e722f5565102fff8481c99e4d86ae099c7"
+
+single_file_repo_dir() {
+    echo "${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${SINGLE_FILE_MODEL}")"
+}
+
+seed_single_file_snapshot() {
+    # Args: the weight files to create. The index names model.safetensors and model_mtp.safetensors —
+    # the two files the Hub's index for this model maps tensors to (read 2026-09-11) — so leaving one
+    # out is how a killed download is expressed.
+    local revision="${SINGLE_FILE_REVISION:-${SERVE_REVISION}}"
+    local snapshot="$(single_file_repo_dir)/snapshots/${revision}"
+    rm -rf "${snapshot}"
+    mkdir -p "${snapshot}"
+    printf '%s' '{"weight_map":{"model.embed_tokens.weight":"model.safetensors","mtp.fc.weight":"model_mtp.safetensors"}}' \
+        >"${snapshot}/model.safetensors.index.json"
+    touch "${snapshot}/config.json" "${snapshot}/tokenizer.json"
+    local weight
+    for weight in "$@"; do
+        touch "${snapshot}/${weight}"
+    done
+}
+
+mock_engine_command_line() {
+    # Args: <pid> [revision [model]]. What `pgrep -af` prints for the engine the worker launched from
+    # its runtime: `serve <model> --revision <sha> --uds <socket>`. The stub prints the file named by
+    # DOLPHIN_TEST_PGREP_FILE; without the variable it hands over to the pgrep it shadowed, so the
+    # sandboxes of later tests (their bins stack on PATH) see the real process table.
+    local pid="$1" revision="${2:-${SERVE_REVISION}}" model="${3:-${SINGLE_FILE_MODEL}}" real_pgrep
+    export DOLPHIN_TEST_PGREP_FILE="${SANDBOX}/pgrep.txt"
+    echo "${pid} ${DOLPHIN_HOME}/runtimes/text-v/bin/python3.12 ${DOLPHIN_HOME}/runtimes/text-v/bin/aphrodite serve ${model} --revision ${revision} --uds ${SANDBOX}/dp-abc/v.sock --tensor-parallel-size 1" \
+        >"${DOLPHIN_TEST_PGREP_FILE}"
+    # Written once per sandbox: a second write would resolve `pgrep` to this very stub.
+    [[ -x "${SANDBOX}/bin/pgrep" ]] && return 0
+    real_pgrep="$(command -v pgrep)"
+    cat >"${SANDBOX}/bin/pgrep" <<EOF
+#!/usr/bin/env bash
+[[ -n "\${DOLPHIN_TEST_PGREP_FILE:-}" ]] || exec "${real_pgrep}" "\$@"
+[[ -s "\${DOLPHIN_TEST_PGREP_FILE}" ]] || exit 1
+cat "\${DOLPHIN_TEST_PGREP_FILE}"
+EOF
+    chmod +x "${SANDBOX}/bin/pgrep"
+}
+
+no_engine_process() {
+    # The moment between the worker killing its engine and starting the next one.
+    : >"${DOLPHIN_TEST_PGREP_FILE}"
+}
+
+install_slow_fetcher_python() {
+    # Args: seconds one fetch takes. Stands in for the runtime's interpreter running
+    # snapshot_download: records the call, takes its time like a throttled link, then lands every
+    # file the index names under the snapshot it was pinned to. FETCH_EXIT=<n> makes it fail instead,
+    # the way a Hub that keeps answering 429 does.
+    local runtime_bin="${DOLPHIN_HOME}/runtimes/text-v/bin"
+    mkdir -p "${runtime_bin}"
+    cat >"${runtime_bin}/python" <<EOF
+#!/usr/bin/env bash
+echo "model=\${DOLPHIN_HF_MODEL} revision=\${DOLPHIN_HF_REVISION} offline=\${HF_HUB_OFFLINE} hf_home=\${HF_HOME}" >>"${SANDBOX}/fetch_calls"
+sleep ${1}
+[[ "\${FETCH_EXIT:-0}" == "0" ]] || exit "\${FETCH_EXIT}"
+[[ -z "\${FETCH_LANDS_NOTHING:-}" ]] || exit 0
+snapshot="\${HF_HOME}/hub/$(hf_cache_dir_name "${SINGLE_FILE_MODEL}")/snapshots/\${DOLPHIN_HF_REVISION}"
+touch "\${snapshot}/model.safetensors" "\${snapshot}/model_mtp.safetensors"
+echo "done" >>"${SANDBOX}/fetch_done"
+EOF
+    chmod +x "${runtime_bin}/python"
+}
+
+fetch_call_count() {
+    if [[ -f "${SANDBOX}/fetch_calls" ]]; then wc -l <"${SANDBOX}/fetch_calls" | tr -d ' '; else echo 0; fi
+}
+
+wait_for_fetch_calls() {
+    # The fetch is a background process, so its record lands a moment after ensure_weights_fetch returns.
+    local n="$1" waited=0
+    while (( $(fetch_call_count) < n && waited < 10 )); do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+}
+
+wait_until_gone() {
+    local pid="$1" waited=0
+    while kill -0 "${pid}" 2>/dev/null && (( waited < 20 )); do
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+test_completeness_check_reads_the_serve_revision_and_the_index() {
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mock_engine_command_line 1111
+
+    # The looping nodes' cache, once the download has landed: one file, no refs/main. The shipped
+    # check said "not complete" here forever, so offline mode never armed and the download floor
+    # read a complete cache as a download still to come.
+    seed_single_file_snapshot model.safetensors model_mtp.safetensors
+    assert_eq "a single-file snapshot under the serve revision is complete without refs/main" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # The killed-download shape: the index names a file that is not on disk.
+    rm "$(single_file_repo_dir)/snapshots/${SERVE_REVISION}/model_mtp.safetensors"
+    assert_eq "a snapshot missing a file the index names is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # A repo with no index at all ships its weights as model.safetensors alone.
+    seed_single_file_snapshot model.safetensors
+    rm "$(single_file_repo_dir)/snapshots/${SERVE_REVISION}/model.safetensors.index.json"
+    assert_eq "with no index, model.safetensors alone is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+    rm "$(single_file_repo_dir)/snapshots/${SERVE_REVISION}/model.safetensors"
+    assert_eq "with no index and no model.safetensors it is not" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # refs/main names a complete OLDER snapshot while the engine was started with a newer sha whose
+    # download has not landed. A check that fell back to the ref would arm offline mode against a
+    # snapshot the engine never opens — the DAH-3341 shape again.
+    seed_single_file_snapshot model.safetensors model_mtp.safetensors
+    SINGLE_FILE_REVISION=57926bac57926bac57926bac57926bac57926bac seed_single_file_snapshot model.safetensors model_mtp.safetensors
+    mkdir -p "$(single_file_repo_dir)/refs"
+    printf '%s' 57926bac57926bac57926bac57926bac57926bac >"$(single_file_repo_dir)/refs/main"
+    rm "$(single_file_repo_dir)/snapshots/${SERVE_REVISION}/model.safetensors"
+    assert_eq "the serve revision decides, not refs/main" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+
+    # The worker has killed its engine and not yet started the next (no serve process). DOLPHIN_MODEL
+    # still names the model the worker served BEFORE its update, and that model's cache is complete
+    # under refs/main. The lately running engine's model is what the next engine opens, so its
+    # half-downloaded snapshot is what decides — a yes here would arm offline mode against a cache no
+    # engine reads (the DAH-3341 shape) and flap the switch on every kill/restart gap.
+    # The cycle remembers the running engines in the entrypoint's own shell; the `$(...)` probes above
+    # remembered them in a subshell, so do it here the way sync_hf_offline_with_cache does.
+    remember_launched_engines
+    no_engine_process
+    seed_hf_cache "model-00001-of-00003.safetensors" "model-00002-of-00003.safetensors" \
+        "model-00003-of-00003.safetensors"
+    assert_eq "in the kill/restart gap the lately running engine's model decides, not DOLPHIN_MODEL" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+    assert_eq "the model list in the gap is the lately running engine's" "${SINGLE_FILE_MODEL}" \
+        "$(hf_offline_models)"
+
+    # No engine has run yet and there is no ref: nothing says which snapshot the engine will open.
+    LAUNCHED_MODELS=()
+    LAUNCHED_REVISIONS=()
+    rm "$(single_file_repo_dir)/refs/main"
+    MODEL="${SINGLE_FILE_MODEL}"
+    assert_eq "no revision from anywhere is not complete" "no" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+    # pgrep exits 1 with no engine, and under the entrypoint's `set -euo pipefail` that status used to
+    # end the `$(...)` in hf_offline_models before its DOLPHIN_MODEL fallback — every cycle with no
+    # engine process evaluated no model at all.
+    assert_eq "with no engine process the model list falls back to DOLPHIN_MODEL under set -e" \
+        "${SINGLE_FILE_MODEL}" "$(set -euo pipefail; hf_offline_models)"
+
+    # A restarted container with the full 21 GiB on disk and a full-ish disk: before its first engine
+    # starts nothing names the revision, and the disk floor used to park it for ever (refs/main absent).
+    # This check is biased towards yes — any complete snapshot means no download is coming.
+    rm -rf "$(single_file_repo_dir)/snapshots/57926bac57926bac57926bac57926bac57926bac"
+    seed_single_file_snapshot model.safetensors model_mtp.safetensors
+    mock_df_free_gb 20
+    assert_eq "a complete pinned cache is not parked by the disk floor before the first engine start" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+    rm "$(single_file_repo_dir)/snapshots/${SERVE_REVISION}/model.safetensors"
+    assert_eq "an incomplete one still is" "yes" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+    unset DOLPHIN_TEST_PGREP_FILE
+}
+
+test_missing_weights_are_fetched_in_the_background_while_no_engine_serves() {
+    # The acceptance case: a node too slow for the worker's 10 min. The engine holds a socket that
+    # answers nothing, the worker kills and restarts it, and none of that may touch the fetch.
+    make_sandbox
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    export DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS=2
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    WORKER_LOG_DIR="${SANDBOX}/logs"
+    install_slow_fetcher_python 3
+    # A second, older runtime the worker left on disk. Its interpreter must not be the one that
+    # fetches: the engine runs from text-v, and the fetch has to share its huggingface_hub.
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-old/bin"
+    printf '#!/usr/bin/env bash\necho "wrong-runtime" >>"%s"\nexit 1\n' "${SANDBOX}/fetch_calls" \
+        >"${DOLPHIN_HOME}/runtimes/text-old/bin/python"
+    chmod +x "${DOLPHIN_HOME}/runtimes/text-old/bin/python"
+    mkdir -p "${SANDBOX}/dp-abc"
+    touch "${SANDBOX}/dp-abc/v.sock"
+    engine_answers_health no
+    mock_engine_command_line 1111
+    has_fetch_slot() { weights_fetch_pid_for "${SINGLE_FILE_MODEL}" "${SERVE_REVISION}" >/dev/null && echo slot || echo none; }
+
+    # Only a copy of the model under the root an older image used exists (the worker has moved its
+    # cache directory before). The engine has begun nothing there — no snapshots/<sha>/ — so no fetch
+    # may land 21 GiB in a root the engine never reads.
+    mkdir -p "${SHARED_CACHE}/huggingface/hub/$(hf_cache_dir_name "${SINGLE_FILE_MODEL}")/refs"
+    ensure_weights_fetch 0
+    assert_eq "a copy the engine has not begun gets no fetch" "none" "$(has_fetch_slot)"
+    rm -rf "${SHARED_CACHE}/huggingface"
+    seed_single_file_snapshot
+
+    # The cycle measured an engine answering /health: the weights it needs are on disk, whatever this
+    # file's check says.
+    ensure_weights_fetch 1
+    assert_eq "a serving engine means no fetch" "none" "$(has_fetch_slot)"
+
+    # DAH-2805: a download that fills the shared volume takes every filler on the node down.
+    mock_df_free_gb 20
+    ensure_weights_fetch 0 2>"${SANDBOX}/ensure.err"
+    ensure_weights_fetch 0 2>>"${SANDBOX}/ensure.err"
+    assert_eq "a full disk starts no fetch, and says so once per interval, not once per cycle" "1" \
+        "$(grep -c "only 20 GB free; not fetching ${SINGLE_FILE_MODEL}@" "${SANDBOX}/ensure.err")"
+    assert_eq "no fetch ran" "0" "$(fetch_call_count)"
+    mock_df_free_gb 900
+
+    # The worker's deadline passes and it kills the engine: a cycle with no serve process. The
+    # model, the revision and the runtime were remembered off the command line while it ran.
+    no_engine_process
+    sleep 2
+    assert_eq "with no engine process the remembered model is still the one to fetch, under set -e" \
+        "${SINGLE_FILE_MODEL}" "$(set -euo pipefail; hf_offline_models)"
+    ensure_weights_fetch 0
+    wait_for_fetch_calls 1
+    assert_eq "fetched in the gap, by the python of the runtime on the serve line, pinned to the serve revision, into the engine's cache root" \
+        "model=${SINGLE_FILE_MODEL} revision=${SERVE_REVISION} offline=0 hf_home=${SHARED_CACHE}/dolphinpod-worker/cache" \
+        "$(cat "${SANDBOX}/fetch_calls" 2>/dev/null)"
+    local fetch_pid
+    fetch_pid="$(weights_fetch_pid_for "${SINGLE_FILE_MODEL}" "${SERVE_REVISION}")"
+    assert_eq "the fetch runs in the background" "yes" \
+        "$([[ -n "${fetch_pid}" ]] && kill -0 "${fetch_pid}" 2>/dev/null && echo yes || echo no)"
+
+    # The worker starts a new engine under a new pid. Same revision, so the fetch in flight is the fetch.
+    mock_engine_command_line 2222
+    ensure_weights_fetch 0
+    ensure_weights_fetch 0
+    assert_eq "one fetch per revision across engine restarts" "1" "$(fetch_call_count)"
+    assert_eq "the fetch outlives the engine the worker killed" "yes" \
+        "$(kill -0 "${fetch_pid}" 2>/dev/null && echo yes || echo no)"
+
+    # The slow link delivers. The next engine the worker starts finds the file and serves.
+    wait_until_gone "${fetch_pid}"
+    ensure_weights_fetch 0 2>"${SANDBOX}/ensure.err"
+    assert_eq "the fetched snapshot is complete" "yes" \
+        "$(model_cache_is_complete && echo yes || echo no)"
+    assert_eq "the fetch is reported finished, not failed" "1" \
+        "$(grep -c 'background fetch of .* finished' "${SANDBOX}/ensure.err")"
+    assert_eq "a complete snapshot starts no second fetch" "1" "$(fetch_call_count)"
+    assert_eq "no fetch process is left behind" "" \
+        "$(weights_fetch_pid_for "${SINGLE_FILE_MODEL}" "${SERVE_REVISION}")"
+
+    # Driving the function here would still pass if nothing called it. The supervisor's 30 s cycle
+    # is proven by test_a_throttled_node_reaches_serving_through_the_background_fetch on procps
+    # hosts; on a Mac this line is the only guard of that wiring.
+    assert_eq "the supervisor drives the fetch every cycle" "1" \
+        "$(sed -n '/^supervise_running_workers_until_new_binary_published/,/^}/p' "${ENTRYPOINT}" \
+            | grep -c 'ensure_weights_fetch')"
+    # No deadline: a deadline on the fetch is the worker's 10 min under another name.
+    assert_eq "the fetch runs under no timeout" "0" \
+        "$(sed -n '/^start_weights_fetch/,/^}/p' "${ENTRYPOINT}" | grep -v '^ *#' | grep -c 'timeout')"
+    unset DOLPHIN_TEST_PGREP_FILE METRICS_SOCKET_GLOB DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS
+}
+
+test_a_model_the_worker_no_longer_launches_gets_no_fetch() {
+    # 10 Sep shape: the worker's update moves the model. The old model's half-downloaded snapshot
+    # must not earn a fetch of its own — tens of GB on the very link this exists for — so the
+    # remembered set follows the last engine seen, it does not accumulate.
+    make_sandbox
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    export DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS=2
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    WORKER_LOG_DIR="${SANDBOX}/logs"
+    install_slow_fetcher_python 0
+    export FETCH_EXIT=1
+    seed_single_file_snapshot
+    mkdir -p "${SANDBOX}/dp-abc"
+    touch "${SANDBOX}/dp-abc/v.sock"
+    engine_answers_health no
+    mock_engine_command_line 1111
+
+    ensure_weights_fetch 0
+    wait_for_fetch_calls 1
+    wait_until_gone "$(weights_fetch_pid_for "${SINGLE_FILE_MODEL}" "${SERVE_REVISION}")"
+    # This cycle reaps the failed fetch and holds its slot; the sleep lets that hold expire, so
+    # nothing but the remembered set can keep the old model from being fetched again below.
+    ensure_weights_fetch 0
+    sleep 3
+
+    # The worker now serves another model; its snapshot is as fresh as hf_hub leaves it after the
+    # first seconds (config, tokenizer, index, no weights).
+    local other="unsloth/Qwen4-Next-NVFP4" other_revision="beefdeadbeefdeadbeefdeadbeefdeadbeefdead"
+    local other_snapshot="${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${other}")/snapshots/${other_revision}"
+    mkdir -p "${other_snapshot}"
+    printf '%s' '{"weight_map":{"a":"model.safetensors"}}' >"${other_snapshot}/model.safetensors.index.json"
+    touch "${other_snapshot}/config.json" "${other_snapshot}/tokenizer.json"
+    mock_engine_command_line 2222 "${other_revision}" "${other}"
+    ensure_weights_fetch 0
+    wait_for_fetch_calls 2
+    assert_eq "the new model is fetched" \
+        "model=${other} revision=${other_revision} offline=0 hf_home=${SHARED_CACHE}/dolphinpod-worker/cache" \
+        "$(tail -1 "${SANDBOX}/fetch_calls")"
+
+    # The worker kills that engine too. In the gap the remembered set is what decides, and it must
+    # hold the last engine alone: with the old model still on it, its incomplete snapshot (whose
+    # retry slot expired above) would be fetched again here.
+    no_engine_process
+    assert_eq "in the gap the model list is the last engine seen, alone" "${other}" "$(hf_offline_models)"
+    ensure_weights_fetch 0
+    sleep 1
+    assert_eq "two fetches in all, one per model the worker launched; the old one is not fetched again" "2" \
+        "$(fetch_call_count)"
+    unset FETCH_EXIT DOLPHIN_TEST_PGREP_FILE METRICS_SOCKET_GLOB DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS
+}
+
+test_the_seed_wait_drives_the_fetch_and_docker_stop_ends_it() {
+    # A cold split node: instance 0 is spawned, then the entrypoint sits in wait_for_cache_seed for
+    # up to 90 min before the supervisor (and its fetch) runs. Instance 0 is exactly the engine that
+    # cannot land the file on a slow node, so the wait itself has to drive the fetch.
+    make_sandbox
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    WORKER_LOG_DIR="${SANDBOX}/logs"
+    install_slow_fetcher_python 120
+    seed_single_file_snapshot
+    mkdir -p "${SANDBOX}/dp-abc"
+    touch "${SANDBOX}/dp-abc/v.sock"
+    engine_answers_health no
+    mock_engine_command_line 1111
+
+    SEED_WAIT_SECONDS=30
+    local started elapsed
+    started=$(date +%s)
+    wait_for_cache_seed 2>/dev/null
+    elapsed=$(( $(date +%s) - started ))
+    assert_eq "the seed wait ran out (no engine ever answered)" "yes" \
+        "$([[ ${elapsed} -ge 30 ]] && echo yes || echo no)"
+    wait_for_fetch_calls 1
+    assert_eq "the seed wait started the fetch once" "1" "$(fetch_call_count)"
+    local fetch_pid
+    fetch_pid="$(weights_fetch_pid_for "${SINGLE_FILE_MODEL}" "${SERVE_REVISION}")"
+    assert_eq "the fetch is still running when the wait ends" "yes" \
+        "$(kill -0 "${fetch_pid}" 2>/dev/null && echo yes || echo no)"
+
+    # `docker stop` (the TERM trap) must take the fetch with it: the container is going away. In a
+    # subshell because on_term exits; no worker, watchdog or sidecar is running here.
+    ( WORKER_PIDS=(); WATCHDOG_PIDS=(); SIDECAR_PID=""; on_term )
+    sleep 1
+    assert_eq "docker stop ends the fetch" "no" \
+        "$(kill -0 "${fetch_pid}" 2>/dev/null && echo yes || echo no)"
+    unset DOLPHIN_TEST_PGREP_FILE METRICS_SOCKET_GLOB
+}
+
+test_a_failed_fetch_waits_before_it_is_retried() {
+    # A Hub that answers 429 must not be asked again on the next 30 s cycle: the hammering itself
+    # extends the ban (the DAH-2763 respawn backoff exists for the same reason).
+    make_sandbox
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    export DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS=2
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    WORKER_LOG_DIR="${SANDBOX}/logs"
+    install_slow_fetcher_python 0
+    export FETCH_EXIT=1
+    seed_single_file_snapshot
+    mkdir -p "${SANDBOX}/dp-abc"
+    touch "${SANDBOX}/dp-abc/v.sock"
+    engine_answers_health no
+    mock_engine_command_line 1111
+
+    ensure_weights_fetch 0
+    wait_for_fetch_calls 1
+    wait_until_gone "$(weights_fetch_pid_for "${SINGLE_FILE_MODEL}" "${SERVE_REVISION}")"
+    ensure_weights_fetch 0 2>"${SANDBOX}/ensure.err"
+    ensure_weights_fetch 0
+    sleep 1
+    assert_eq "a failed fetch is not retried on the next cycle" "1" "$(fetch_call_count)"
+    assert_eq "the failure and the wait are in the container log" "1" \
+        "$(grep -c 'background fetch of .* failed; next attempt in 2s' "${SANDBOX}/ensure.err")"
+
+    # The retry interval passes.
+    sleep 3
+    ensure_weights_fetch 0
+    wait_for_fetch_calls 2
+    assert_eq "it is retried once the interval has passed" "2" "$(fetch_call_count)"
+
+    # A fetch that exits 0 but leaves the snapshot incomplete by this file's measure (the library's
+    # notion of complete is not ours — a repo without tokenizer.json) must wait the same interval:
+    # forgotten at once, it would be one Hub API call per 30 s cycle.
+    wait_until_gone "$(weights_fetch_pid_for "${SINGLE_FILE_MODEL}" "${SERVE_REVISION}")"
+    ensure_weights_fetch 0
+    sleep 3
+    unset FETCH_EXIT
+    export FETCH_LANDS_NOTHING=1
+    ensure_weights_fetch 0
+    wait_for_fetch_calls 3
+    wait_until_gone "$(weights_fetch_pid_for "${SINGLE_FILE_MODEL}" "${SERVE_REVISION}")"
+    ensure_weights_fetch 0 2>"${SANDBOX}/ensure.err"
+    ensure_weights_fetch 0
+    sleep 1
+    assert_eq "a finished fetch that left the snapshot incomplete is not restarted on the next cycle" "3" \
+        "$(fetch_call_count)"
+    assert_eq "and it is reported finished" "1" "$(grep -c 'background fetch of .* finished' "${SANDBOX}/ensure.err")"
+    unset FETCH_LANDS_NOTHING DOLPHIN_TEST_PGREP_FILE METRICS_SOCKET_GLOB DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS
+}
+
+test_a_throttled_node_reaches_serving_through_the_background_fetch() {
+    # The acceptance case through the real entrypoint process: a worker whose engine cannot land
+    # the file inside its deadline kills and restarts it for ever; the node serves only because the
+    # entrypoint's own fetch, which no deadline touches, lands it. Needs procps (`pgrep -a` prints
+    # the command line the entrypoint reads the revision off); macOS pgrep spells -a differently.
+    make_sandbox
+    if ! pgrep -af "test_entrypoint" 2>/dev/null | grep -qE '^[0-9]+ .*test_entrypoint'; then
+        echo "SKIP a throttled node reaches serving: pgrep here does not print command lines (not procps)"
+        return 0
+    fi
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export METRICS_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    export DOLPHIN_WORKER_SPAWN_STATE="${SANDBOX}/spawns.json"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/bin"
+    mock_nvidia_smi
+    load_entrypoint
+    seed_single_file_snapshot
+    # The throttled link: 40 s for a file the worker below gives its engine 15 s to land — the
+    # 21 GiB at 20 MB/s against the worker's ten minutes, on a schedule a test can wait out.
+    install_slow_fetcher_python 40
+    local snapshot
+    snapshot="$(single_file_repo_dir)/snapshots/${SERVE_REVISION}"
+
+    # The engine: opens its socket at once (Aphrodite's shape, DAH-3341) and answers /health only
+    # once the weights are on disk. It downloads nothing itself: in prod its own download is the
+    # one that dies with it, so here only the entrypoint's fetch can land the file.
+    cat >"${DOLPHIN_HOME}/runtimes/text-v/bin/aphrodite" <<EOF
+#!/usr/bin/env bash
+mkdir -p "${SANDBOX}/dp-1" && touch "${SANDBOX}/dp-1/v.sock"
+while true; do
+    [[ -f "${snapshot}/model.safetensors" && -f "${snapshot}/model_mtp.safetensors" ]] && touch "${SANDBOX}/engine_healthy"
+    sleep 1
+done
+EOF
+    chmod +x "${DOLPHIN_HOME}/runtimes/text-v/bin/aphrodite"
+    # The worker: starts the engine from its runtime with the model, the revision and the socket on
+    # the command line, kills it when it is not ready in 15 s, and starts over.
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<EOF
+#!/usr/bin/env bash
+[[ "\$1" == "start" ]] || exit 0
+engine=""
+trap 'kill "\${engine}" 2>/dev/null; exit 0' TERM
+while true; do
+    "${DOLPHIN_HOME}/runtimes/text-v/bin/aphrodite" serve ${SINGLE_FILE_MODEL} --revision ${SERVE_REVISION} --uds ${SANDBOX}/dp-1/v.sock &
+    engine=\$!
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        sleep 1
+        [[ -f "${SANDBOX}/engine_healthy" ]] && wait "\${engine}"
+    done
+    echo "engine \${engine} killed: not ready in 15s" >>"${SANDBOX}/worker.log"
+    kill "\${engine}" 2>/dev/null
+    wait "\${engine}" 2>/dev/null
+done
+EOF
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+    engine_answers_health no
+
+    DOLPHIN_API_KEY="dp-test" DOLPHIN_WORKER_URL="file:///bin/true" DOLPHIN_WORKER_LOG_DIR="${SANDBOX}/logs" \
+        bash "${ENTRYPOINT}" >"${SANDBOX}/entry.log" 2>&1 &
+    local entry_pid=$! waited=0
+    while ! engine_is_serving && (( waited < 150 )); do
+        sleep 2
+        waited=$((waited + 2))
+    done
+    local serving=no
+    engine_is_serving && serving=yes
+    kill -TERM "${entry_pid}" 2>/dev/null
+    wait "${entry_pid}" 2>/dev/null
+
+    assert_eq "the node reaches serving (after ${waited}s)" "yes" "${serving}"
+    assert_eq "the worker killed engines meanwhile, and none of that touched the fetch" "yes" \
+        "$([[ "$(grep -c killed "${SANDBOX}/worker.log" 2>/dev/null)" -ge 2 ]] && echo yes || echo no)"
+    assert_eq "exactly one fetch, pinned to the revision on the serve command line" \
+        "model=${SINGLE_FILE_MODEL} revision=${SERVE_REVISION} offline=0 hf_home=${SHARED_CACHE}/dolphinpod-worker/cache" \
+        "$(cat "${SANDBOX}/fetch_calls" 2>/dev/null)"
+    assert_eq "the fetch ran to its end; nothing killed it" "done" "$(cat "${SANDBOX}/fetch_done" 2>/dev/null)"
+    assert_eq "the entrypoint never reported the fetch failed" "0" "$(grep -c 'background fetch of .* failed' "${SANDBOX}/entry.log")"
+    unset METRICS_SOCKET_GLOB DOLPHIN_WORKER_SPAWN_STATE
+}
+
+test_hf_offline_arms_on_a_cache_the_worker_pinned_by_revision() {
+    # With no refs/main, hf_cache_is_engine_ready skipped every copy and the switch could never arm
+    # on these nodes: every engine start went back through the Hub API — the DAH-2743 per-IP rate
+    # limit, on the very sites where the nodes share one address.
+    make_sandbox
+    load_entrypoint
+    DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    mkdir -p "${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages"
+    local pth_file="${DOLPHIN_HOME}/runtimes/text-v/lib/python3.12/site-packages/zz-dolphin-hf-offline.pth"
+    install_stub_python
+    touch "${SANDBOX}/topped_up"
+    ENGINE_SOCKET_GLOB="${SANDBOX}/dp-*/v.sock"
+    seed_single_file_snapshot model.safetensors model_mtp.safetensors
+    mock_engine_command_line 1111
+
+    sync_hf_offline_with_cache
+    assert_eq "a complete single-file cache with no refs/main arms offline mode" "yes" \
+        "$([[ -f "${pth_file}" ]] && echo yes || echo no)"
+    # The library resolves the revision like the engine does — from the command line, not from a
+    # ref it would not find.
+    assert_eq "the library is asked about the serve revision" "yes" \
+        "$(grep -q "^offline-revision=${SERVE_REVISION}\$" "${SANDBOX}/hf_calls" && echo yes || echo no)"
+    unset DOLPHIN_TEST_PGREP_FILE
+}
+
 # ---------------------------------------------------------------- DAH-2824 download retry
 test_binary_download_asks_curl_to_retry_within_time_bounds() {
     make_sandbox
@@ -1178,6 +1706,13 @@ test_hf_offline_needs_a_cache_the_library_can_read
 test_hf_offline_top_up_respects_the_disk_floor
 test_a_half_installed_runtime_never_arms
 test_hf_offline_stays_off_when_the_top_up_fails
+test_completeness_check_reads_the_serve_revision_and_the_index
+test_missing_weights_are_fetched_in_the_background_while_no_engine_serves
+test_a_failed_fetch_waits_before_it_is_retried
+test_a_model_the_worker_no_longer_launches_gets_no_fetch
+test_the_seed_wait_drives_the_fetch_and_docker_stop_ends_it
+test_a_throttled_node_reaches_serving_through_the_background_fetch
+test_hf_offline_arms_on_a_cache_the_worker_pinned_by_revision
 test_worker_log_and_spawn_counters
 test_backoff_counts_a_long_dead_download_as_failed
 test_respawns_are_staggered
