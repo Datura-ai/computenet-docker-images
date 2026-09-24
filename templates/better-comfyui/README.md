@@ -8,14 +8,14 @@ Base: `daturaai/pytorch:2.7.0-py3.12-cuda12.8.0-devel-ubuntu22.04`. The `comfyui
 
 ## Start path
 
-The image CMD is `/start.sh` (`scripts/start.sh`), which runs `/pre_start.sh` in the foreground: on the first start the venv is copied from `/venv` to `/workspace/venvs/better-comfyui` (~6.5 GB, a few minutes) and `/ComfyUI` to `/workspace/ComfyUI`, then ComfyUI starts on port 3000 (`--listen --port 3000 --enable-cors-header`, plus whatever `CUSTOM_ARGS` holds). The server log is `/workspace/comfyui.log`. If the server exits, the pod stays up for SSH. `NO_SYNC=true` skips the sync and the server — and everything `/start.sh` runs after `pre_start.sh` (its SSH setup, Jupyter, `post_start.sh`): the container just sleeps.
+The image CMD is `/start.sh` (`scripts/start.sh`), which runs `/pre_start.sh` in the foreground: on the first start the venv is copied from `/venv` to `/workspace/venvs/better-comfyui` (~6.5 GB, a few minutes) and `/ComfyUI` to `/workspace/ComfyUI`, then ComfyUI starts on port 3000 (`--listen --port 3000 --enable-cors-header`, plus whatever `CUSTOM_ARGS` holds). The server log is `/workspace/comfyui.log`. While ComfyUI runs, `/start.sh` is still waiting on `pre_start.sh`, so its own SSH setup, Jupyter and `post_start.sh` start only after the server exits. If the server exits, the pod stays up for SSH. `NO_SYNC=true` skips the sync and the server — and everything `/start.sh` runs after `pre_start.sh` (its SSH setup, Jupyter, `post_start.sh`): the container just sleeps.
 
 ## Ports
 
 - 3000/tcp (ComfyUI)
 - 22/tcp (SSH)
-- 8888/tcp (Jupyter Lab, only when `JUPYTER_PASSWORD` is set)
-- 3001/tcp (nginx in front of 3000, only when `REQUIRE_NGINIX=true`)
+- 3001/tcp (nginx in front of 3000, only when `REQUIRE_NGINIX=true`; started before `pre_start.sh`)
+- 8888/tcp (Jupyter Lab, only when `JUPYTER_PASSWORD` is set, and only after ComfyUI exits: `/start.sh` starts it after `pre_start.sh` returns)
 
 ## Checks
 
