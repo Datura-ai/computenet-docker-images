@@ -2,7 +2,7 @@
 # build-smoke.sh — every template's bake file resolves; every CHANGED template builds and boots.
 #
 #   scripts/build-smoke.sh                 # templates changed vs $BASE (default origin/master); scripts/** → ubuntu + pytorch
-#                                          # a template whose only diffs are .md / .txt is listed for bake --print only (no build/boot)
+#                                          # a template whose only diffs are .md is listed for bake --print only (no build/boot)
 #   scripts/build-smoke.sh ubuntu pytorch  # named templates
 #   E2E_GPU=1 scripts/build-smoke.sh …     # on a GPU host: run the built image with --gpus all and require torch.cuda
 #   scripts/build-smoke.sh --bases dolphin  # print the base image(s) the smoke target pulls; nothing is built
@@ -34,9 +34,10 @@ changed_templates() {
   files=$(git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1)
   # Markdown-only edits do not rebuild the image. bake --print still covers every template.
   # Engy and lium-rdma-probe exit in 5 s without MINER_KEY / probe args (computenet-docker-images#78).
+  # .txt is not skipped: requirements.txt, welcome.txt and downloads.txt are build inputs.
   {
     for t in $(printf '%s\n' "$files" | sed -n 's|^templates/\([^/]*\)/.*|\1|p' | sort -u); do
-      if printf '%s\n' "$files" | grep "^templates/$t/" | grep -qvE '\.(md|txt)$'; then
+      if printf '%s\n' "$files" | grep "^templates/$t/" | grep -qvE '\.md$'; then
         printf '%s\n' "$t"
       else
         echo "templates/$t is markdown-only vs $BASE — bake --print covers it, skip build/boot" >&2
