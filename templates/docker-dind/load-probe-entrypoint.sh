@@ -10,11 +10,14 @@
 # any setup we put in CMD is silently dropped. ENTRYPOINT cannot be overridden
 # without an explicit --entrypoint flag, and the validator does not pass one.
 #
-# Order of operations matches cruizba's original:
+# Order of operations matches cruizba's original, with one step in front:
+#   0. select-iptables-backend.sh -> nft (image default) unless only legacy works here (DAH-2856)
 #   1. start-docker.sh     -> brings dockerd up, returns once API is ready
 #   2. load-probe.sh       -> docker load -i /opt/probe/hello-world.tar (DAH-1959)
 #                             best-effort; failure falls back to registry pull
 #   3. exec "$@"           -> the user-supplied CMD (or default CMD if none)
+
+/usr/local/bin/select-iptables-backend.sh || true
 
 start-docker.sh
 
