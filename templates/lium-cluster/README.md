@@ -37,10 +37,25 @@ Nothing.
   NCCL_SOCKET_IFNAME` used to come back empty and NCCL then picked the inner bridge. A variable the
   renter passes with `-e` is left alone.
 - Pod-to-pod SSH works over the overlay (DAH-2664). The backend mints one keypair per cluster; the
-  entrypoint installs the private half at `/root/.ssh/lium_cluster_ed25519` (its own name, so a
-  restored backup's `id_ed25519` survives), appends the public half to `authorized_keys`, and
-  appends an `~/.ssh/config` block for the overlay subnet that skips the host-key prompt. This is what `mpirun`, DeepSpeed's pdsh launcher and the nccl-tests recipes need — without
+  entrypoint installs the private half at `/etc/lium/cluster_ed25519`, the public half at
+  `/etc/lium/cluster_authorized_keys` (an `AuthorizedKeysFile` drop-in in `/etc/ssh/sshd_config.d/`
+  makes sshd read it next to the renter's own `authorized_keys`; the key carries a `from=` limited
+  to the overlay subnet, since sshd also listens on the public port and the key is the whole
+  group's — without wg0's address nothing of the login is installed), and a `Host` block for the overlay
+  subnet in `/etc/ssh/ssh_config.d/lium-cluster.conf` that names the key and skips the host-key
+  prompt. This is what `mpirun`, DeepSpeed's pdsh launcher and the nccl-tests recipes need; without
   it the only working launcher is torchrun with a hand-typed `--node_rank` per node.
+  Nothing of it lives under `/root`: on an encrypted rental the validator mounts the
+  gocryptfs plaintext over `/root` after the entrypoint has run, and anything written to
+  `/root/.ssh` before that is hidden by the mount. The renter's own `~/.ssh` is never touched. One
+  consequence: a restored backup whose `~/.ssh/config` opens with `Host *` and
+  `StrictHostKeyChecking yes` keeps that setting for the peers too, since ssh reads the user's file
+  before the system one.
+- At start the entrypoint dials every peer `wg0` lists (`ssh root@<peer> true`, retried for
+  `LIUM_CLUSTER_SSH_CHECK_WAIT_SECONDS`, default 300) in the background and writes the verdict to
+  `/var/log/lium-cluster-ssh-check.log` and the container log: `verdict PASS: every peer answers
+  ssh`, or `FAIL` with the peers that never did. It never stops the pod; it is where to look first
+  when a launcher hangs.
 - `libibverbs` and the provider plugins are installed here. They are not in the base, and without
   them NCCL logs `Failed to open libibverbs.so[.1]` and silently falls back to its socket
   transport while every device check still passes.
@@ -83,7 +98,7 @@ API on 2026-08-11:
 
 ```bash
 cd templates/lium-cluster
-VERSION=0.0.7 docker buildx bake --push
+VERSION=0.0.8 docker buildx bake --push
 ```
 
 `docker-bake.hcl` pins amd64 and the base tag. Bump `VERSION` and the tag in the backend's
@@ -99,11 +114,19 @@ no fabric, and running twice over one bundle.
 index is picked per driver, the InfiniBand host it must stay silent on, rails that straddle two
 segments, and the exact-match `=` NCCL needs.
 
-`tests/test_entrypoint.sh` runs the entrypoint itself in a throwaway container (wg-quick and the
-base entrypoint stubbed) and checks where the overlay settings and the cluster login end up, with
-which permissions, and that a standalone pod gets neither. Needs Docker.
+`tests/test_entrypoint.sh` runs the entrypoint itself in a throwaway container (wg-quick, ssh and
+the base entrypoint stubbed) and checks where the overlay settings and the cluster login end up,
+with which permissions, that a standalone pod gets neither, that the login survives a mount over
+`/root` (the mount case needs `CAP_SYS_ADMIN` in the test container; it is skipped where Docker
+refuses the mount), and what the start-up peer check writes. Needs Docker.
+
+`tests/test_peer_login.sh` is the end-to-end proof: two containers with a real sshd,
+the volume mounted over `/root` after the entrypoint as the validator does it, then
+`ssh root@<peer> hostname` from one to the other, and the renter's own key still opening the peer.
+With `TEST_OLD_ENTRYPOINT=<file>` it runs that entrypoint too and expects the login to fail.
 
 ```bash
 pytest test_lium_rdma_runc.py test_lium_fabric_env.py
 bash tests/test_entrypoint.sh
+bash tests/test_peer_login.sh
 ```
