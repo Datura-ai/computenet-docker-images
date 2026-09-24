@@ -8,7 +8,8 @@
 # (the archived image's `kill $PID; wait $PID` returned 143 and errexit ended /pre_start.sh, so /start.sh and the
 # container exited before ComfyUI started); no `wait` in the script is left unguarded; the script parses (bash -n);
 # the whole first-time-sync block runs through on temp dirs (venv at its final path, staging dir gone); a failing
-# command — inside a function too — reports itself, stops the spinner and exits 0 so /start.sh keeps the pod up; and
+# command — inside a function too — reports itself, stops the spinner and exits 0 so /start.sh keeps the pod up; a
+# failure inside the spinner is not reported as the script failing; and
 # the ComfyUI command line is built from CUSTOM_ARGS the way the header documents.
 #
 # Against the old script it fails: `bash tests/test_pre_start.sh <(git show 210db17:templates/better-comfyui/pre_start.sh)`.
@@ -155,6 +156,30 @@ echo unreachable" 2>&1)
     else
         [[ -n "$spinner_pid" ]] && kill "$spinner_pid" 2>/dev/null
         check fail "on_error stops a running spinner before it exits: rc $rc, spinner '$spinner_pid', output '$out'"
+    fi
+fi
+
+# --- a failure inside the spinner is not reported as the script failing ------------------------------------------
+# set -E hands the ERR trap to the spinner subshell; unless the subshell drops it, a failing printf there prints
+# "pre_start.sh failed at line …" while the sync carries on.
+spinner=$(awk '/^    \($/{p=1} p{print} p&&/^    \) &$/{exit}' "$PRE_START")
+if [[ -z "$spinner" || -z "${handler:-}" ]]; then
+    check fail "found the spinner subshell and the ERR handler"
+else
+    set_line=$(grep -E '^set -[a-zA-Z]+$' "$PRE_START" | head -1)
+    out=$(timeout 10 bash -c "${set_line:-set -e}
+$handler
+printf() { return 1; }
+$spinner
+PROGRESS_PID=\$!
+sleep 0.3
+kill \$PROGRESS_PID 2>/dev/null || true
+wait \$PROGRESS_PID 2>/dev/null || true
+echo sync-carried-on" 2>&1)
+    if [[ "$out" == *sync-carried-on* && "$out" != *"pre_start.sh failed at line"* ]]; then
+        check pass "a failing printf in the spinner is not reported as the script failing"
+    else
+        check fail "a failing printf in the spinner is not reported as the script failing: output '$out'"
     fi
 fi
 

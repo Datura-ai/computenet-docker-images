@@ -88,6 +88,9 @@ EOF
 
     # Start background process to show progress
     (
+        # set -E hands the ERR trap to this subshell too: a failing printf here would print the script's failure
+        # line while the sync carries on
+        trap - ERR
         while true; do
             for s in / - \\ \|; do
                 printf "\r\033[1;31m[%s] \033[1;37mSYNC IN PROGRESS - PLEASE WAIT\033[0m" "$s"
