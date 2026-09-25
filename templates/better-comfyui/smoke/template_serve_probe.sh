@@ -3,6 +3,8 @@
 #
 #     templates/better-comfyui/smoke/template_serve_probe.sh <image> [port=3000]
 #
+# <port> is the host port; it always maps to 3000 in the container, the only port ComfyUI listens on.
+#
 # The container is started exactly as the platform starts a template whose row has no startup command: the image's own
 # CMD, no command override, no environment, `--gpus all` (needs the NVIDIA container toolkit on the host). The probe then
 # waits up to PROBE_TIMEOUT_MIN minutes (default 20 — the first start syncs a 6.5 GB venv into /workspace) for
@@ -55,7 +57,7 @@ echo "image CMD: $(docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # no command after the image and no -e: the image CMD is the start path under test
-CID=$(docker run -d --gpus "$GPUS" -p "127.0.0.1:${PORT}:${PORT}" --name "$NAME" "$IMAGE") \
+CID=$(docker run -d --gpus "$GPUS" -p "127.0.0.1:${PORT}:3000" --name "$NAME" "$IMAGE") \
     || { echo "FAIL: docker run --gpus $GPUS $IMAGE"; exit 1; }
 echo "started $NAME (${CID:0:12}); waiting up to $TIMEOUT_MIN min for http://127.0.0.1:$PORT ..."
 
