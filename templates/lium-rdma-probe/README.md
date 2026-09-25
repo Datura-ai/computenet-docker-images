@@ -1,6 +1,6 @@
 # lium-rdma-probe
 
-Measures whether two hosts on one RoCE segment really carry RDMA between them (DAH-2667).
+Measures whether two hosts on one RoCE segment really carry RDMA between them.
 
 A RoCE fabric has no subnet manager, so Lium can only infer it: one provider, one IPv4 segment,
 one address per host. A segment is not proof — a switch without lossless queueing (PFC/ECN) drops
@@ -21,7 +21,7 @@ docker run --rm --network host --device /dev/infiniband \
 ```
 
 `IPC_LOCK` and an unlimited memlock are not optional on a real card: `ibv_reg_mr` pins the buffer it
-registers, and without them the registration fails and the pair never measures (DAH-2571). Soft-RoCE
+registers, and without them the registration fails and the pair never measures. Soft-RoCE
 does not need them, which is exactly why the gap survives a test on an emulated device.
 
 The third argument is a write count, not a duration — the probe proves the wire carries RDMA at

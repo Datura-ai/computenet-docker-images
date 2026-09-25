@@ -28,7 +28,7 @@ Dolphin's reference install); the loop plays that role, re-running `update` befo
 so the worker comes back on the freshly published binary. As a fallback, the loop polls the
 download URL's etag every `DOLPHIN_UPDATE_CHECK_SECONDS` (default 3600) and gracefully restarts
 the worker when a new binary appears — so long-lived containers pick up Dolphin rollouts within
-about an hour even if the worker's self-update never fires (DAH-2457). `docker stop` still ends
+about an hour even if the worker's self-update never fires. `docker stop` still ends
 the worker cleanly: SIGTERM is forwarded and the container exits.
 
 ## Environment variables
@@ -45,7 +45,7 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                        | VRAM floor one worker's bundle must clear (the full model needs ~70 GB). Each worker gets the smallest card group above it. |
 | `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                      | Delay between initial worker spawns, once the shared cache is seeded. |
 | `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. `0` = no wait, plain stagger. |
-| `DOLPHIN_WEIGHTS_FETCH_ENABLED` | no | `1`                        | `0` turns off the entrypoint's own background fetch of the weights (DAH-3393, below); the engine is then the only downloader. |
+| `DOLPHIN_WEIGHTS_FETCH_ENABLED` | no | `1`                        | `0` turns off the entrypoint's own background fetch of the weights (below); the engine is then the only downloader. |
 | `DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS` | no | `300`                | How long a `<model>@<revision>` slot stays held after its background fetch ended (either way) or was refused by the disk floor, before another may start for it. |
 | `METRICS_TOKEN`       | no       | —                                | Bearer token for the metrics sidecar on `:9101`. Unset → the sidecar answers 503 to everything (fail closed). |
 | `DOLPHIN_ENGINES_EXPECTED` | no  | (set by the entrypoint)          | How many engines this container runs. The sidecar publishes it next to `dolphin_engines_up`, and above 1 it tags every engine's series with `dolphin_engine`. |
@@ -70,7 +70,7 @@ config with secrets that is readable beyond its owner.
 `linux/amd64`. ARM GPU hosts (NVIDIA Grace, GH200/GB200) can't run it; every current Lium executor
 is x86_64.
 
-## Worker split (DAH-2465)
+## Worker split
 
 On a multi-GPU node the entrypoint runs **one worker per minimal VRAM bundle** instead of one
 worker tensor-sharded over every card.
@@ -100,9 +100,9 @@ What running N instances in one container costs, and how each cost is paid:
 |---|---|
 | configs collide | per-instance `HOME`, so each worker reads its own `worker.json` |
 | N copies of the ~35 GB model + runtime | each instance's `HOME/.cache` is a **symlink** to the shared cache. The closed worker binary scrubs its child's environment, so `HF_HOME`/`XDG_CACHE_HOME` alone cannot be relied on — a path that resolves to one directory can. |
-| siblings corrupt the shared binary | every write to `DOLPHIN_HOME` goes through `flock`, staged to a temp file and renamed atomically (DAH-2475) |
-| Hub rate-limit livelock | once the model cache is complete the entrypoint writes a `.pth` file into each runtime's site-packages that sets `HF_HUB_OFFLINE=1` (DAH-2743). vLLM resolves the unpinned revision `main` through the Hub API on **every** engine start — cached weights do not spare it — and HuggingFace allows 500 anonymous API requests per 5 min **per IP**. On 2026-08-20 a farm of 13 machines behind one NAT IP blew that on a simultaneous cold start: hf_hub slept ~200 s on the 429, the worker's own startup timeout killed the engine first, and the restart spent another burst — seven prod machines sat at zero tokens for 13 h with complete weights on disk. Offline mode reads the local snapshot with no call at all. The switch is SYNCED with the cache, not only armed: when `DOLPHIN_MODEL` changes to a model this node does not hold, the same check removes the .pth and the Hub is reachable again for the download. It travels in a `.pth` file because the closed worker rebuilds its child's env from a fixed whitelist and drops `HF_HUB_OFFLINE`. Do NOT blackhole `huggingface.co` in `/etc/hosts` instead — measured 2026-08-21, hf_hub raises on the connection error rather than using the cache, and every engine dies. `updates.dphn.ai` is untouched, so the worker's self-update is unaffected. A serving engine is the second opinion and the only one that cannot be wrong: when the switch is on and no engine has served for `HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE` supervisor cycles (5 min), the switch comes off and is HELD off until an engine serves, so one wrong "complete" cannot leave the node dark. |
-| a slow link never lands the weights | the worker gives its engine 10 minutes to become ready, and the engine downloads the weights on the way. The model served since worker v2.4.2 (`unsloth/Qwen3.8-27B-NVFP4`) is one 21 GiB `model.safetensors`, so a node must hold 37.6 MB/s for ten minutes with no pause; below that the worker kills the engine, huggingface_hub 1.18+ does not resume the file, and the next try starts at byte 0 — on 2026-09-10 ten prod nodes (62 GPUs) looped like that for a day (DAH-3393). So while no engine answers `/health`, the entrypoint fetches the missing weights itself in the background (`ensure_weights_fetch`, once per 30 s supervisor cycle and every 30 s of the seed wait): the model and the revision come off the worker's own `serve <model> --revision <sha>` command line, the interpreter is the runtime's own `bin/python`, the cache root is the one the engine has begun writing (`<HF_HOME>/hub/models--<repo>/snapshots/<sha>/` exists), and there is no timeout. huggingface_hub takes a per-file lock with no timeout around every download, so the fetch and the engine never race for the file: the first fetch of a container starts up to 30 s after the engine and queues behind the engine's own attempt until the worker kills it (up to 10 min), then downloads at the link's speed while the engines the worker keeps starting queue behind it; the first engine start after it lands serves. One fetch per `<model>@<revision>`, remembered across the engine's kills and restarts; a fetch that ended, either way, holds its slot for `DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS`; none starts under the disk floor (said once per that interval); `docker stop` ends it (the `.incomplete` it leaves is swept by the validator, DAH-2805). The completeness check that gates offline mode reads the same revision (`refs/main` only when the command line carries none — hf_hub writes no ref for a commit sha) and accepts every `*.safetensors` the index names, or `model.safetensors` alone when there is no index; the disk floor's check (still about `DOLPHIN_MODEL`, as before) reads the same revision and, before any engine has run, accepts any complete snapshot. |
+| siblings corrupt the shared binary | every write to `DOLPHIN_HOME` goes through `flock`, staged to a temp file and renamed atomically |
+| Hub rate-limit livelock | once the model cache is complete the entrypoint writes a `.pth` file into each runtime's site-packages that sets `HF_HUB_OFFLINE=1`. vLLM resolves the unpinned revision `main` through the Hub API on **every** engine start — cached weights do not spare it — and HuggingFace allows 500 anonymous API requests per 5 min **per IP**. On 2026-08-20 a farm of 13 machines behind one NAT IP blew that on a simultaneous cold start: hf_hub slept ~200 s on the 429, the worker's own startup timeout killed the engine first, and the restart spent another burst — seven prod machines sat at zero tokens for 13 h with complete weights on disk. Offline mode reads the local snapshot with no call at all. The switch is SYNCED with the cache, not only armed: when `DOLPHIN_MODEL` changes to a model this node does not hold, the same check removes the .pth and the Hub is reachable again for the download. It travels in a `.pth` file because the closed worker rebuilds its child's env from a fixed whitelist and drops `HF_HUB_OFFLINE`. Do NOT blackhole `huggingface.co` in `/etc/hosts` instead — measured 2026-08-21, hf_hub raises on the connection error rather than using the cache, and every engine dies. `updates.dphn.ai` is untouched, so the worker's self-update is unaffected. A serving engine is the second opinion and the only one that cannot be wrong: when the switch is on and no engine has served for `HF_OFFLINE_MAX_CYCLES_WITHOUT_ENGINE` supervisor cycles (5 min), the switch comes off and is HELD off until an engine serves, so one wrong "complete" cannot leave the node dark. |
+| a slow link never lands the weights | the worker gives its engine 10 minutes to become ready, and the engine downloads the weights on the way. The model served since worker v2.4.2 (`unsloth/Qwen3.8-27B-NVFP4`) is one 21 GiB `model.safetensors`, so a node must hold 37.6 MB/s for ten minutes with no pause; below that the worker kills the engine, huggingface_hub 1.18+ does not resume the file, and the next try starts at byte 0 — on 2026-09-10 ten prod nodes (62 GPUs) looped like that for a day. So while no engine answers `/health`, the entrypoint fetches the missing weights itself in the background (`ensure_weights_fetch`, once per 30 s supervisor cycle and every 30 s of the seed wait): the model and the revision come off the worker's own `serve <model> --revision <sha>` command line, the interpreter is the runtime's own `bin/python`, the cache root is the one the engine has begun writing (`<HF_HOME>/hub/models--<repo>/snapshots/<sha>/` exists), and there is no timeout. huggingface_hub takes a per-file lock with no timeout around every download, so the fetch and the engine never race for the file: the first fetch of a container starts up to 30 s after the engine and queues behind the engine's own attempt until the worker kills it (up to 10 min), then downloads at the link's speed while the engines the worker keeps starting queue behind it; the first engine start after it lands serves. One fetch per `<model>@<revision>`, remembered across the engine's kills and restarts; a fetch that ended, either way, holds its slot for `DOLPHIN_WEIGHTS_FETCH_RETRY_SECONDS`; none starts under the disk floor (said once per that interval); `docker stop` ends it (the `.incomplete` it leaves is swept by the validator). The completeness check that gates offline mode reads the same revision (`refs/main` only when the command line carries none — hf_hub writes no ref for a commit sha) and accepts every `*.safetensors` the index names, or `model.safetensors` alone when there is no index; the disk floor's check (still about `DOLPHIN_MODEL`, as before) reads the same revision and, before any engine has run, accepts any complete snapshot. |
 | cold start stampede | the siblings wait for the first instance's engine socket (`DOLPHIN_SEED_WAIT_SECONDS`, default 5400) instead of merely pausing: once it serves, the runtime and the weights are on disk, so 2..N start warm. Measured 2026-07-23 — with a plain 30 s stagger both workers downloaded the same ~12 GB side by side over a link the miner throttles. `DOLPHIN_SPLIT_STAGGER_SECONDS` (default 30) then spaces the warm starts. |
 | metrics undercount | the sidecar scrapes **every** engine socket and tags each with its own `dolphin_engine` label (see below) |
 | one wedge kills all | one watchdog per worker instance, each scoped to its own HOME, so a wedged engine is killed on its own and the siblings — including siblings sharing its card — keep serving (see below) |
@@ -116,8 +116,7 @@ node's free GPUs.
 
 **Which nodes are eligible** — the 70 GB VRAM floor (summed across the node's GPUs; Dolphin's stated
 requirement, dphn.ai docs) and the A100 exclusion (Ampere, can't boot NVFP4) — is decided by
-the **scheduler**, not this image: see the DPHN strategy gate in `lium-io-backend`
-([PR #748](https://github.com/Datura-ai/lium-io-backend/pull/748)).
+the **scheduler**, not this image: see the DPHN strategy gate in the platform backend.
 
 ## Payouts
 
@@ -129,10 +128,9 @@ v2.dphn.ai dashboard.
 > **Draft.** The Dolphin team (GLRP) has not yet shipped an official public binary URL or
 > Docker image, and per-account bootstrap install links expire. Until then the binary URL is
 > supplied at runtime via `DOLPHIN_WORKER_URL`, and public templates should **not** be
-> published (the config format may still change). Tracked in DAH-1958; strategy wiring in
-> DAH-2302.
+> published (the config format may still change).
 
-## Metrics sidecar (DAH-2468)
+## Metrics sidecar
 
 `metrics_sidecar.py` (stdlib python, supervised by `entrypoint.sh` in its own
 restart loop) proxies the vLLM engine's unix-socket `/metrics` onto `:9101` so
@@ -188,7 +186,7 @@ instance's HOME in `DOLPHIN_WATCHDOG_INSTANCE_HOME`, and each acts on its own en
   and publishes `dolphin_watchdog_engine_found 0`. A wrong guess would cost a healthy engine,
   so refusing is the only safe answer.
 
-The cards cannot serve as that key: with several workers per card (DAH-2473) every engine
+The cards cannot serve as that key: with several workers per card every engine
 reports the same `CUDA_VISIBLE_DEVICES`, so a card-keyed watchdog would call each of them
 ambiguous and guard nothing — on exactly the layout the split exists for. Cards stay on the
 metrics as a label, and `DOLPHIN_WATCHDOG_GPU_SET` now only feeds that label.

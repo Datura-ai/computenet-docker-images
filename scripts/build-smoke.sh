@@ -2,6 +2,7 @@
 # build-smoke.sh — every template's bake file resolves; every CHANGED template builds and boots.
 #
 #   scripts/build-smoke.sh                 # templates changed vs $BASE (default origin/master); scripts/** → ubuntu + pytorch
+#                                          # a template whose only diffs are .md is listed for bake --print only (no build/boot)
 #   scripts/build-smoke.sh ubuntu pytorch  # named templates
 #   E2E_GPU=1 scripts/build-smoke.sh …     # on a GPU host: run the built image with --gpus all and require torch.cuda
 #   scripts/build-smoke.sh --bases dolphin  # print the base image(s) the smoke target pulls; nothing is built
@@ -29,9 +30,24 @@ step() {  # step <name> <timeout> <function-or-cmd...>  (functions below are exp
 
 changed_templates() {
   if [ $# -gt 0 ]; then printf '%s\n' "$@"; return; fi
-  local files; files=$(git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1)
-  { printf '%s\n' "$files" | sed -n 's|^templates/\([^/]*\)/.*|\1|p'
-    printf '%s\n' "$files" | grep -q '^scripts/' && printf 'ubuntu\npytorch\n'; } | sort -u
+  local files deleted t
+  files=$(git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1)
+  deleted=$(git diff --name-only --diff-filter=D "$BASE"...HEAD 2>/dev/null || git diff --name-only --diff-filter=D HEAD~1)
+  # Markdown-only edits do not rebuild the image. bake --print still covers every template.
+  # Engy and lium-rdma-probe exit in 5 s without MINER_KEY / probe args (computenet-docker-images#78).
+  # .txt is not skipped: requirements.txt, welcome.txt and downloads.txt are build inputs.
+  # A deleted file is always built: Dockerfiles `COPY README.md`, so a lost .md breaks the build.
+  {
+    for t in $(printf '%s\n' "$files" | sed -n 's|^templates/\([^/]*\)/.*|\1|p' | sort -u); do
+      if printf '%s\n' "$files" | grep "^templates/$t/" | grep -qvE '\.md$' \
+        || printf '%s\n' "$deleted" | grep -q "^templates/$t/"; then
+        printf '%s\n' "$t"
+      else
+        echo "templates/$t is markdown-only vs $BASE — bake --print covers it, skip build/boot" >&2
+      fi
+    done
+    printf '%s\n' "$files" | grep -q '^scripts/' && printf 'ubuntu\npytorch\n'
+  } | sort -u
 }
 
 bake_print_all() {  # every bake file must resolve and every default target's Dockerfile must exist — a broken HCL or a

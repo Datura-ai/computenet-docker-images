@@ -42,7 +42,7 @@ cards; with one worker per card it costs one, and the other seven keep earning t
 It is NOT about the GIL. That was the working theory for a day and it is disproven — see "What the
 GIL turned out not to explain" below.
 
-## Why more than one engine per card (`ENGY_ENGINES_PER_GPU`, DAH-2601)
+## Why more than one engine per card (`ENGY_ENGINES_PER_GPU`)
 
 The card is not what limits this workload. Prod sat at **2 concurrent requests across all eight
 engines** over a 7-minute sample, and declaring 64 inflight drew the same burst of 8 as declaring 8:
@@ -161,8 +161,8 @@ with `served only 7 CONCURRENT legs` while every HTTP response in the log is a 2
 Measured as a clean A/B on one rented H100 (2026-08-10, same box, same image 0.0.7): declared 8 ->
 failed after 790 requests, all of them successful; declared 16 -> `active`. Raising the declaration
 was never the fix, it just happened to buy the engine a spare slot. Prod paid for that confusion
-twice — DAH-2603 rolled 16 back to 8 on 2026-08-06 reading the symptom backwards, and prod
-onboarding failed from that day until DAH-2601 rolled it forward again on 2026-08-11.
+twice — a change rolled 16 back to 8 on 2026-08-06 reading the symptom backwards, and prod
+onboarding failed from that day until it was rolled forward again on 2026-08-11.
 
 **Additive, not a multiplier.** The gateway never sends more than the declaration — declaring 8 drew
 a burst of 8, declaring 64 drew the same 8 — so the only slots it cannot fill are the ones this
@@ -179,7 +179,7 @@ on that id. So every restart registers a **brand-new worker**, which enters `pen
 onboarded again; a stable `ENGY_WORKER_NAME` does not change that — the id is what counts, despite
 the upstream comment claiming a repeat HELLO with the same (key, name) supersedes.
 
-DAH-2531 therefore pinned the id: the entrypoint derived it from the worker name
+The fix therefore pinned the id: the entrypoint derived it from the worker name
 (`sha256(name)[:32]`) and the vendored miner honoured `ENGY_WORKER_ID`, which made a restart a
 re-dial. Verified live on 2026-07-30 — worker `04955ec4…` was restarted mid-`active` and came back as
 the same worker, request history intact.

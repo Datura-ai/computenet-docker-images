@@ -1,7 +1,6 @@
-# engy — Bittensor SN53 inference worker (DAH-2495)
+# engy — Bittensor SN53 inference worker
 
-Runs an engy miner as a Lium-owned filler on idle nodes. Backend side: `FillerRunStrategy.ENGY`
-(lium-io-backend #821).
+Runs an engy miner as a Lium-owned filler on idle nodes.
 
 ## Shape
 

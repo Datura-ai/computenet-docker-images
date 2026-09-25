@@ -1,4 +1,4 @@
-# lium-cluster — multi-node InfiniBand rentals (DAH-2620)
+# lium-cluster — multi-node InfiniBand rentals
 
 The image every pod of a group rental runs. The backend refuses a cluster rental whose image name
 does not start with `daturaai/lium-cluster` (`CLUSTER_TEMPLATE_IMAGE_PREFIX`), because only this
@@ -31,12 +31,12 @@ Nothing.
   and an unlimited memlock into every OCI spec. Docker can default a ulimit but not a device, hence
   the wrapper. It merges into the base image's `daemon.json` rather than replacing it, so the
   nvidia runtime survives.
-- Those same settings reach a **nested** container too (DAH-2664). The entrypoint writes them to
+- Those same settings reach a **nested** container too. The entrypoint writes them to
   `/etc/lium-cluster.env` and `lium-rdma-runc` copies them into every OCI spec it sees, because a
   container the inner daemon starts inherits nothing from the pod — `docker run … printenv
   NCCL_SOCKET_IFNAME` used to come back empty and NCCL then picked the inner bridge. A variable the
   renter passes with `-e` is left alone.
-- Pod-to-pod SSH works over the overlay (DAH-2664). The backend mints one keypair per cluster; the
+- Pod-to-pod SSH works over the overlay. The backend mints one keypair per cluster; the
   entrypoint installs the private half at `/etc/lium/cluster_ed25519`, the public half at
   `/etc/lium/cluster_authorized_keys` (an `AuthorizedKeysFile` drop-in in `/etc/ssh/sshd_config.d/`
   makes sshd read it next to the renter's own `authorized_keys`; the key carries a `from=` limited
@@ -63,7 +63,7 @@ Nothing.
 Only `uverbs*` and `rdma_cm` are ever forwarded, never `issm*` (subnet manager) or `umad*` (raw
 MAD) — the same allowlist the validator applies when it forwards devices into the pod.
 
-## RoCE clusters (DAH-2667)
+## RoCE clusters
 
 The same image serves a group rented over RoCE. The overlay, the devices and the nested-container
 runtime are the same; two things are not.
