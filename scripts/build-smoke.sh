@@ -30,14 +30,17 @@ step() {  # step <name> <timeout> <function-or-cmd...>  (functions below are exp
 
 changed_templates() {
   if [ $# -gt 0 ]; then printf '%s\n' "$@"; return; fi
-  local files t
+  local files deleted t
   files=$(git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1)
+  deleted=$(git diff --name-only --diff-filter=D "$BASE"...HEAD 2>/dev/null || git diff --name-only --diff-filter=D HEAD~1)
   # Markdown-only edits do not rebuild the image. bake --print still covers every template.
   # Engy and lium-rdma-probe exit in 5 s without MINER_KEY / probe args (computenet-docker-images#78).
   # .txt is not skipped: requirements.txt, welcome.txt and downloads.txt are build inputs.
+  # A deleted file is always built: Dockerfiles `COPY README.md`, so a lost .md breaks the build.
   {
     for t in $(printf '%s\n' "$files" | sed -n 's|^templates/\([^/]*\)/.*|\1|p' | sort -u); do
-      if printf '%s\n' "$files" | grep "^templates/$t/" | grep -qvE '\.md$'; then
+      if printf '%s\n' "$files" | grep "^templates/$t/" | grep -qvE '\.md$' \
+        || printf '%s\n' "$deleted" | grep -q "^templates/$t/"; then
         printf '%s\n' "$t"
       else
         echo "templates/$t is markdown-only vs $BASE — bake --print covers it, skip build/boot" >&2
