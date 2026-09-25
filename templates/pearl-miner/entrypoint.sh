@@ -47,8 +47,8 @@ mkdir -p "${LOG_DIR}"
 # One process for every GPU: PeakMiner drives them all itself and reports each card separately in
 # its stats API, so there is nothing left for per-GPU processes to buy. The flip side is that one
 # crash takes all the node's cards down, so the miner is supervised here rather than left to the
-# platform: the validator's `restart: on-failure:5` (lium-io#1370, DAH-3475; `unless-stopped` until
-# it ships) restarts a non-zero exit at most five times in a row, and the backend only
+# platform: the validator runs a filler under `unless-stopped`, or under plain `on-failure` (no
+# retry cap) when the backend marks the job `self_ending` (lium-io#1370), and the backend only
 # relaunches on its own scheduling cycle (self-heal is off by default), so an unsupervised crash
 # costs the whole node until a cycle notices.
 #
@@ -59,14 +59,13 @@ mkdir -p "${LOG_DIR}"
 RESTART_DELAY_SECONDS="${PEARL_MINER_RESTART_DELAY_SECONDS:-10}"
 # Crash-loop ceiling: a miner that dies for a reason restarting cannot fix (bad wallet, pool
 # rejecting us, a card gone) must NOT be hidden behind a forever-loop — past the cap the container
-# exits 0 and stays `exited`, the validator reports it missing, and the backend's reconciler
-# closes the run as FAILED with a launch strike (lium-platform#409), so the node goes to the next
-# strategy instead of looking alive and earning nothing. That is the failure mode this whole image
-# exists to end. Zero on purpose, the same contract as the Dolphin image (DAH-3475): under
-# `restart: on-failure` every non-zero exit is restarted and every restart begins with the counter
-# below at zero (it lives in this process), so a non-zero cap exit ended nothing and restarted five
-# times before the run closed with a misleading code. Genuine failures of this script (no wallet, no
-# GPU, the supervisor itself dying) still exit non-zero.
+# exits 0 so the run ends instead of looking alive and earning nothing. Zero on purpose: under
+# `restart: on-failure` every non-zero exit is restarted with no cap, and every restart begins with
+# the counter below at zero (it lives in this process), so a non-zero cap exit would never end the
+# run. A zero exit stays `exited` and the backend closes the run as STOPPED. That close carries no
+# launch strike, so the node can get this image again on its next scheduling cycle. Under
+# `unless-stopped` a zero exit is restarted too, so the cap ends nothing there. Genuine failures of
+# this script (no wallet, no GPU, the supervisor itself dying) still exit non-zero.
 MAX_RESTARTS="${PEARL_MINER_MAX_RESTARTS:-5}"
 RESTART_WINDOW_SECONDS="${PEARL_MINER_RESTART_WINDOW_SECONDS:-600}"
 

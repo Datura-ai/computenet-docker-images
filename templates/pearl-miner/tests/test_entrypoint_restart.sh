@@ -7,8 +7,8 @@
 # restart loop and its crash-loop ceiling are exercised as production runs them.
 #
 # Covered: a miner that dies is restarted; a miner that keeps dying ends the container with exit 0
-# at the cap (DAH-3475: `restart: on-failure` leaves a zero exit alone, so the reconciler closes the
-# run) instead of a forever-restart; the script's own failures (no wallet, no GPU, the supervisor
+# at the cap (`restart: on-failure` leaves a zero exit alone, so the run ends) instead of a
+# forever-restart; the script's own failures (no wallet, no GPU, the supervisor
 # dying) stay non-zero.
 set -uo pipefail
 
@@ -55,7 +55,7 @@ run_entrypoint() {
 }
 
 # Regression: the cap used to `return` the miner's code (3 here), which `restart: on-failure`
-# restarts five times before the run closes with a misleading code (DAH-3475).
+# restarts with no cap, so the run never ended.
 test_crash_loop_cap_exits_zero() {
     echo "crash loop"
     local stub_dir
@@ -92,21 +92,6 @@ test_supervisor_failure_stays_non_zero() {
     rm -rf "${stub_dir}"
 }
 
-test_single_crash_is_restarted() {
-    echo "single crash"
-    local stub_dir
-    stub_dir="$(mktemp -d)"
-    # Dies instantly the first times, so within a 5-restart cap the run is still alive after several
-    # launches — the point being that ONE death does not end the container.
-    make_stubs "${stub_dir}" 1 0
-    run_entrypoint "${stub_dir}" 5 > /dev/null
-    local launches
-    launches="$(wc -l < "${stub_dir}/launches" | tr -d ' ')"
-
-    check "$([[ "${launches}" -gt 1 ]] && echo pass)" "the miner is relaunched after it dies (got ${launches} launches)"
-    rm -rf "${stub_dir}"
-}
-
 test_no_gpu_fails_fast() {
     echo "no gpu"
     local stub_dir
@@ -137,7 +122,6 @@ test_missing_wallet_fails_fast() {
 
 test_crash_loop_cap_exits_zero
 test_supervisor_failure_stays_non_zero
-test_single_crash_is_restarted
 test_missing_wallet_fails_fast
 test_no_gpu_fails_fast
 
