@@ -7,11 +7,16 @@
 # and the pearlhash binary that survives it is datacenter-only. PeakMiner covers consumer and
 # datacenter cards from one build, speaks plain Stratum V1 (so the pool is a flag), and serves its
 # own stats — which is what finally makes rejected work visible to us.
+#
+# The baked build is the floor every filler starts on: the updater's release lookup is an anonymous
+# GitHub API call, limited per public IP, so a farm behind one address can stay on the baked build.
+# 2.16.4's notes list Pearl on B300 SXM6 AC at 814 TH/s; 2.17.0 is a Pearl hashrate release for every
+# card; 2.17.1 makes the CMP HX unlock opt-in (--cmp-unlock), which this image does not pass.
 FROM ubuntu:24.04
 
-ARG PEAKMINER_VERSION=2.11.0
+ARG PEAKMINER_VERSION=2.17.1
 ARG PEAKMINER_URL=https://github.com/peakminer/peakminer/releases/download/v${PEAKMINER_VERSION}/peakminer-${PEAKMINER_VERSION}-linux-x86_64
-ARG PEAKMINER_SHA256=24f415716f456554a0c39ad09a6fc4c2fe52ec61ee1e346449dad6ea39de8c90
+ARG PEAKMINER_SHA256=abdc8f915c149e5ca265a40dbafa59b92159a1d40478ced199e4e384060cbe3f
 
 # python3: only for the metrics sidecar, which is stdlib-only on purpose — the miner binary itself
 # needs nothing but glibc. NOT python3-minimal: it ships a cut-down stdlib without hmac or

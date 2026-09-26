@@ -170,8 +170,17 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
   local env_flag=""
   [ -f "templates/$t/smoke.env" ] && env_flag="--env-file templates/$t/smoke.env"
   # no --rm: a container that dies inside the 5 s wait must still have its logs; the main loop removes `smoke-<template>`
+  # A template whose entrypoint refuses to start without a GPU (the pearl miner exits on "no NVIDIA GPUs
+  # visible", which is correct) ships templates/<t>/smoke.needs-gpu: without E2E_GPU its image is started
+  # on a sleep instead, and its smoke.sh checks what can be checked without a card.
+  local entry_flags=()
+  [ -z "${E2E_GPU:-}" ] && [ -f "templates/$t/smoke.needs-gpu" ] && entry_flags=(--entrypoint sleep)
   docker rm -f "smoke-$t" >/dev/null 2>&1 || true
-  cid=$(docker run -d $gpu_flags $env_flag --name "smoke-$t" "$img") || return 1
+  if [ ${#entry_flags[@]} -gt 0 ]; then
+    cid=$(docker run -d $gpu_flags $env_flag "${entry_flags[@]}" --name "smoke-$t" "$img" infinity) || return 1
+  else
+    cid=$(docker run -d $gpu_flags $env_flag --name "smoke-$t" "$img") || return 1
+  fi
   sleep 5
   docker ps -q --no-trunc | grep -q "$cid" || { echo "container exited within 5 s:"; docker logs "$cid" 2>&1 | tail -20; return 1; }
   local rc=0
