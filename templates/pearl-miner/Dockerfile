@@ -10,7 +10,8 @@
 #
 # The baked build is the floor every filler starts on: the updater's release lookup is an anonymous
 # GitHub API call, limited per public IP, so a farm behind one address can stay on the baked build.
-# 2.16.4 added B300 (sm_103) kernels for Pearl; 2.17.0 is a Pearl hashrate release for every card.
+# 2.16.4's notes list Pearl on B300 SXM6 AC at 814 TH/s; 2.17.0 is a Pearl hashrate release for every
+# card; 2.17.1 makes the CMP HX unlock opt-in (--cmp-unlock), which this image does not pass.
 FROM ubuntu:24.04
 
 ARG PEAKMINER_VERSION=2.17.1
