@@ -119,16 +119,23 @@ RUN if [ -n "${PYTHON_VERSION}" ]; then \
     pip install --upgrade --no-cache-dir pip --break-system-packages && \
     if [ -n "${TORCH}" ]; then pip install --upgrade --no-cache-dir ${TORCH} --break-system-packages; fi && \
     pip install --upgrade --no-cache-dir jupyterlab ipywidgets jupyter-archive jupyter_contrib_nbextensions notebook==6.5.7 --break-system-packages && \
-    jupyter contrib nbextension install --user && \
-    jupyter nbextension enable --py widgetsnbextension
+    # /root is the renter's volume: Docker copies whatever the image keeps there into
+    # every new pod's empty volume at `docker create`, and an encrypted volume hides it.
+    jupyter contrib nbextension install --sys-prefix && \
+    jupyter nbextension enable --py widgetsnbextension --sys-prefix && \
+    rm -rf /root/.cache /root/.launchpadlib /root/.wget-hsts && \
+    # rfc3987-syntax builds ~30 Lark parsers at import, 1.2 s of every Jupyter start; jsonschema
+    # (via jupyter-events) imports it only when installed and then skips the iri formats.
+    pip uninstall -y --break-system-packages rfc3987-syntax lark
 
 COPY --from=scripts start.sh computenet.txt /tmp/computenet-scripts/
-COPY daemon.json config.toml nvidia-setup.sh pytorch-entrypoint.sh /tmp/pytorch-files/
+COPY daemon.json config.toml containerd.toml nvidia-setup.sh pytorch-entrypoint.sh /tmp/pytorch-files/
 RUN rm -f /etc/ssh/ssh_host_* && \
     install -m 0755 /tmp/computenet-scripts/start.sh /start.sh && \
     install -m 0644 /tmp/computenet-scripts/computenet.txt /etc/computenet.txt && \
     install -m 0644 -D /tmp/pytorch-files/daemon.json /etc/docker/daemon.json && \
     install -m 0644 -D /tmp/pytorch-files/config.toml /etc/nvidia-container-runtime/config.toml && \
+    install -m 0644 -D /tmp/pytorch-files/containerd.toml /etc/containerd/config.toml && \
     install -m 0755 /tmp/pytorch-files/nvidia-setup.sh /nvidia-setup.sh && \
     install -m 0755 /tmp/pytorch-files/pytorch-entrypoint.sh /pytorch-entrypoint.sh && \
     rm -rf /tmp/computenet-scripts /tmp/pytorch-files && \

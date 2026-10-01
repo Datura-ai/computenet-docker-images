@@ -30,7 +30,7 @@ Build one target:
 docker buildx bake 2120-py312-cuda132-devel-ubuntu2404-dind --set 2120-py312-cuda132-devel-ubuntu2404-dind.platform=linux/amd64
 ```
 
-The DinD-enabled image is published only with the explicit `-dind` tag. It uses the Datura DinD base image, installs Python/PyTorch/Jupyter, and keeps common developer tools such as `tmux`, `vim`, `nano`, `htop`, `jq`, `rsync`, `lsof`, `net-tools`, `iproute2`, `tree`, `zip`, and `unzip`. It then starts `dockerd` before the standard Computenet startup script. Running nested Docker requires Sysbox on the host:
+The DinD-enabled image is published only with the explicit `-dind` tag. It uses the Datura DinD base image, installs Python/PyTorch/Jupyter, and keeps common developer tools such as `tmux`, `vim`, `nano`, `htop`, `jq`, `rsync`, `lsof`, `net-tools`, `iproute2`, `tree`, `zip`, and `unzip`. It starts `containerd` and `dockerd` in the background and runs the standard Computenet startup script without waiting for them, so SSH answers first and `docker` inside the pod about half a second later (`Docker daemon is ready.` in the container log). If `dockerd` fails to start, the pod keeps running without Docker and the log shows why. Running nested Docker requires Sysbox on the host:
 
 ```bash
 docker run -d --rm --runtime=sysbox-runc --name pytorch-dind-test \

@@ -29,9 +29,9 @@ execute_script() {
 # into the container right after `docker run`, so everything here can race a
 # concurrent writer of /etc/ssh and the sshd daemon (DAH-2341):
 #   - a shared mkdir lock serializes the two writers when both take it
-#   - `ssh-keygen -A` never prompts and skips key types that already exist
-#     (the per-type `ssh-keygen -t -f` it replaces blocked PID 1 on an
-#     "Overwrite (y/n)?" prompt when the other side created the key first)
+#   - a host key is generated only when missing, with stdin from /dev/null:
+#     when the other side creates it first, the "Overwrite (y/n)?" prompt
+#     that once blocked PID 1 gets EOF and ssh-keygen gives up at once
 #   - an sshd that is already running counts as success, not an error
 # None of this may kill PID 1 (`set -e` is active): if SSH setup fails, the
 # container must stay alive so the validator bootstrap can still repair it.
@@ -73,15 +73,23 @@ setup_ssh() {
 
     acquire_ssh_setup_lock
 
-    ssh-keygen -A || echo "WARNING: ssh-keygen -A failed" >&2
+    # ED25519 and ECDSA only: an RSA key takes 0.4-1.5 s to generate and is
+    # the slowest step of the pod start. Clients without either type predate 2014.
+    local key_type key_file
+    for key_type in ed25519 ecdsa; do
+        key_file="/etc/ssh/ssh_host_${key_type}_key"
+        [ -f "$key_file" ] || { ssh-keygen -q -t "$key_type" -N "" -f "$key_file" < /dev/null \
+            || echo "WARNING: ssh-keygen -t $key_type failed" >&2; } &
+    done
+    wait
     mkdir -p /run/sshd
 
     if is_sshd_running; then
         echo "sshd is already running; skipping service start"
-    elif ! service ssh start; then
+    elif ! /usr/sbin/sshd; then
         # Lost a start race (port already bound by the validator bootstrap's
-        # sshd) or an init-script hiccup — only a real failure if sshd is
-        # genuinely not up afterwards.
+        # sshd) — only a real failure if sshd is genuinely not up afterwards.
+        # sshd is started directly: `service ssh start` costs 30 ms more.
         if is_sshd_running; then
             echo "sshd was started concurrently; continuing"
         else
