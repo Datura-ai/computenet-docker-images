@@ -1,0 +1,12 @@
+# The containerd that pytorch-entrypoint.sh starts for the nested dockerd.
+# Same settings dockerd writes when it starts containerd itself.
+version = 2
+root = "/var/lib/docker/containerd/daemon"
+state = "/var/run/docker/containerd/daemon"
+disabled_plugins = ["io.containerd.grpc.v1.cri"]
+
+[grpc]
+  address = "/var/run/docker/containerd/containerd.sock"
+
+[debug]
+  address = "/var/run/docker/containerd/containerd-debug.sock"
