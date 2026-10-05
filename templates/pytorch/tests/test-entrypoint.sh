@@ -5,6 +5,7 @@
 #     dockerd or the NVIDIA setup fails;
 #   - the default /start.sh starts before dockerd answers (sshd does not wait for Docker), and the pod ends
 #     when dockerd or the NVIDIA setup fails;
+#   - the wait for dockerd ends after its deadline when dockerd accepts but never answers (cut from 30 s to 3 s);
 #   - a containerd that dies is started again.
 #
 # Usage: templates/pytorch/tests/test-entrypoint.sh
@@ -35,8 +36,10 @@ case "$STUB_DOCKERD" in
   ready:*) echo $$ >> "$CASE_DIR/pids"; sleep "${STUB_DOCKERD#ready:}"; touch "$CASE_DIR/docker-ready"; exec sleep 30 ;;
 esac
 STUB
+# STUB_CURL=hang: the socket accepts and never answers, so curl waits out its --max-time 1 (exit 28).
 cat > "$work/bin/curl" <<'STUB'
 #!/usr/bin/env bash
+[ "${STUB_CURL:-}" = hang ] && { sleep 1; exit 28; }
 [ -e "$CASE_DIR/docker-ready" ]
 STUB
 cat > "$work/bin/docker" <<'STUB'
@@ -64,12 +67,13 @@ flunk() { echo "FAIL: $1" >&2; fail=1; }
 # run_entrypoint <seconds> <cmd…>: the entrypoint's exit status, or 124 when it still runs after <seconds>.
 # Each run gets a fresh $dir, so a process left by one case cannot write into the next one's files.
 # "@/x" in the command means "$dir/x"; the entrypoint's /var, /nvidia-setup.sh and /start.sh are moved
-# under $dir and $work.
+# under $dir and $work, and the 30 s deadline for dockerd is cut to 3 s.
 run_entrypoint() {
   local limit=$1 arg args=() tick rc=124; shift
   dir="$(mktemp -d "$work/case.XXXX")"
   mkdir -p "$dir/var/log"
   sed -e "s#/var/#$dir/var/#g" -e "s#/nvidia-setup.sh#$work/nvidia-setup.sh#g" -e "s#/start.sh#$work/start.sh#g" \
+    -e "s#SECONDS + 30#SECONDS + 3#" \
     "$entrypoint" > "$dir/entrypoint.sh"
   for arg in "$@"; do args+=("${arg/#@/$dir}"); done
   CASE_DIR="$dir" ENABLE_DIND=true PATH="$work/bin:$PATH" bash "$dir/entrypoint.sh" "${args[@]}" > "$dir/out.log" 2>&1 &
@@ -119,5 +123,11 @@ else flunk "default CMD with failed NVIDIA setup: exit $rc (124 = pod still up)"
 STUB_CONTAINERD=crash-once STUB_DOCKERD=ready:0 run_entrypoint 3 "$work/start.sh"; rc=$?
 if [ $rc -eq 124 ] && [ -e "$dir/containerd-restarted" ]; then pass "a crashed containerd is restarted"
 else flunk "crashed containerd: exit $rc (124 = still up), restarted: $([ -e "$dir/containerd-restarted" ] && echo yes || echo no)"; fi
+
+# 8. dockerd is alive and its socket accepts but never answers → the wait ends at the deadline (3 s here),
+#    the renter command does not run, the container exits non-zero.
+STUB_CURL=hang STUB_DOCKERD=ready:60 run_entrypoint 6 touch @/cmd-ran; rc=$?
+if [ $rc -ne 0 ] && [ $rc -ne 124 ] && [ ! -e "$dir/cmd-ran" ]; then pass "a dockerd that never answers is given up at the deadline"
+else flunk "dockerd that never answers: exit $rc (124 = still waiting), command ran: $([ -e "$dir/cmd-ran" ] && echo yes || echo no)"; fi
 
 exit "$fail"

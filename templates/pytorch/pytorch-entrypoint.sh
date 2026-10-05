@@ -32,7 +32,10 @@ start_docker() {
         return 1
     fi
 
-    for _ in {1..1500}; do
+    # A deadline in wall time: a dockerd that accepts on its socket but never
+    # answers makes every probe wait its full --max-time.
+    local deadline=$((SECONDS + 30))
+    while (( SECONDS < deadline )); do
         if curl -sf --max-time 1 --unix-socket /var/run/docker.sock http://localhost/_ping >/dev/null 2>&1; then
             echo "Docker daemon is ready."
             return 0
