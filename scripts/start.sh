@@ -73,8 +73,8 @@ setup_ssh() {
 
     acquire_ssh_setup_lock
 
-    # ED25519 and ECDSA only: an RSA key takes 0.4-1.5 s to generate and is
-    # the slowest step of the pod start. Clients without either type predate 2014.
+    # ED25519 and ECDSA before sshd starts; RSA takes 0.4-1.5 s to generate,
+    # so add_rsa_host_key makes it after sshd answers.
     local key_type key_file
     for key_type in ed25519 ecdsa; do
         key_file="/etc/ssh/ssh_host_${key_type}_key"
@@ -98,6 +98,7 @@ setup_ssh() {
     fi
 
     release_ssh_setup_lock
+    add_rsa_host_key &
 
     echo "SSH host keys:"
     for key in /etc/ssh/*.pub; do
@@ -105,6 +106,22 @@ setup_ssh() {
         echo "Key: $key"
         ssh-keygen -lf "$key" || true
     done
+}
+
+# For clients that know neither ED25519 nor ECDSA.
+add_rsa_host_key() {
+    local key_file=/etc/ssh/ssh_host_rsa_key
+    acquire_ssh_setup_lock
+    [ -f "$key_file" ] || ssh-keygen -q -t rsa -N "" -f "$key_file" < /dev/null \
+        || echo "WARNING: ssh-keygen -t rsa failed" >&2
+    release_ssh_setup_lock
+    [ -f "$key_file" ] || return 0
+    # sshd before OpenSSH 9.8 reads its host keys on every connection and offers the
+    # new key at once; 9.8+ needs a reload, which refuses connections for a few ms.
+    if ! ssh-keyscan -t rsa 127.0.0.1 2>/dev/null | grep -q ssh-rsa && [ -f /run/sshd.pid ]; then
+        echo "Reloading sshd to offer the RSA host key"
+        kill -HUP "$(cat /run/sshd.pid)" || true
+    fi
 }
 
 # Start jupyter lab
