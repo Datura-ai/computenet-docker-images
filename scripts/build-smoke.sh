@@ -169,9 +169,14 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
   # the dolphin filler refuses to run without its API key, and refusing is correct behaviour.
   local env_flag=""
   [ -f "templates/$t/smoke.env" ] && env_flag="--env-file templates/$t/smoke.env"
+  # A DinD pod image ends the pod when its nested dockerd cannot start; rentals run it under sysbox, and
+  # --privileged with /var/lib/docker off the overlay is the runner's stand-in, so the nested daemon really starts.
+  local dind_flags=""
+  grep -qx ENABLE_DIND=true <<< "$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$img")" \
+    && dind_flags="--privileged -v /var/lib/docker"
   # no --rm: a container that dies inside the 5 s wait must still have its logs; the main loop removes `smoke-<template>`
   docker rm -f "smoke-$t" >/dev/null 2>&1 || true
-  cid=$(docker run -d $gpu_flags $env_flag --name "smoke-$t" "$img") || return 1
+  cid=$(docker run -d $gpu_flags $env_flag $dind_flags --name "smoke-$t" "$img") || return 1
   sleep 5
   docker ps -q --no-trunc | grep -q "$cid" || { echo "container exited within 5 s:"; docker logs "$cid" 2>&1 | tail -20; return 1; }
   local rc=0
@@ -189,6 +194,8 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
     docker exec "$cid" python3 -c 'import torch; print("torch", torch.__version__, "cuda build", torch.version.cuda)' || rc=1
     [ -n "${E2E_GPU:-}" ] && { docker exec "$cid" python3 -c 'import torch, sys; ok = torch.cuda.is_available(); print("cuda available", ok, torch.cuda.get_device_name(0) if ok else ""); sys.exit(0 if ok else 1)' || rc=1; }
   elif [ "$t" = pytorch ]; then echo "pytorch image without importable torch"; rc=1; fi
+  # a renter's startup command replaces CMD and may call docker at once: it must find the nested daemon up
+  if [ -n "$dind_flags" ]; then docker run --rm $dind_flags "$img" docker info >/dev/null || { echo "docker info as the container command failed"; rc=1; }; fi
   if [ -f "templates/$t/smoke.sh" ]; then docker cp "templates/$t/smoke.sh" "$cid:/tmp/smoke.sh" && docker exec "$cid" sh /tmp/smoke.sh || { echo "templates/$t/smoke.sh failed"; rc=1; }; fi
   docker stop -t 5 "$cid" >/dev/null 2>&1 || true
   return $rc
