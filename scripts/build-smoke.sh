@@ -185,8 +185,11 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
   if docker exec "$cid" sh -c 'test -e /start.sh'; then
     docker exec "$cid" sh -c 'command -v python3 >/dev/null && python3 --version' || { echo "pod template without python3"; rc=1; }
     docker exec "$cid" sh -c 'test -d /workspace' || echo "note: no /workspace in the image (start.sh creates it only for Jupyter; the docs point renters at /workspace)"
-    # start.sh adds the RSA host key after sshd is up, for clients that know no other key type
-    docker exec "$cid" sh -c 'ssh-keyscan -t rsa 127.0.0.1 2>/dev/null | grep -q ssh-rsa' || { echo "sshd offers no RSA host key"; rc=1; }
+    # start.sh adds the RSA host key after sshd is up, for clients that know no other key type. Only templates whose
+    # sshd is up at boot are held to it: better-* run /pre_start.sh's app before SSH setup, vscode ships no sshd.
+    case $t in pytorch|ubuntu)
+      docker exec "$cid" sh -c 'ssh-keyscan -t rsa 127.0.0.1 2>/dev/null | grep -q ssh-rsa' || { echo "sshd offers no RSA host key"; rc=1; } ;;
+    esac
   else
     echo "infrastructure image (no /start.sh): boot check only"
   fi
