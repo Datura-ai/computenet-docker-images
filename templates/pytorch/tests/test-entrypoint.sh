@@ -4,7 +4,8 @@
 #   - an overridden CMD (a renter's startup command) runs only after dockerd answers, and not at all when
 #     dockerd or the NVIDIA setup fails;
 #   - the default /start.sh starts before dockerd answers (sshd does not wait for Docker), and the pod ends
-#     when dockerd or the NVIDIA setup fails.
+#     when dockerd or the NVIDIA setup fails;
+#   - a containerd that dies is started again.
 #
 # Usage: templates/pytorch/tests/test-entrypoint.sh
 #        ENTRYPOINT=<file> templates/pytorch/tests/test-entrypoint.sh   (another revision of the entrypoint)
@@ -17,8 +18,13 @@ trap 'rm -rf "$work"' EXIT
 
 # Stubs read the case's dir from CASE_DIR; every stub that stays up records its PID there for the cleanup.
 mkdir -p "$work/bin"
+# STUB_CONTAINERD=crash-once: the first run dies like a killed containerd, the next one stays up.
 cat > "$work/bin/containerd" <<'STUB'
 #!/usr/bin/env bash
+if [ "${STUB_CONTAINERD:-}" = crash-once ] && [ ! -e "$CASE_DIR/containerd-crashed" ]; then
+  touch "$CASE_DIR/containerd-crashed"; exit 137
+fi
+[ -e "$CASE_DIR/containerd-crashed" ] && touch "$CASE_DIR/containerd-restarted"
 echo $$ >> "$CASE_DIR/pids"; exec sleep 30
 STUB
 # STUB_DOCKERD: ready:<seconds> answers after a delay; fail exits at once, like dockerd with a broken daemon.json.
@@ -108,5 +114,10 @@ else flunk "default CMD with failed dockerd: exit $rc (124 = pod still up)"; fi
 STUB_NVIDIA_EXIT=1 STUB_DOCKERD=ready:0 run_entrypoint 5 "$work/start.sh"; rc=$?
 if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then pass "a failed NVIDIA setup ends a /start.sh pod"
 else flunk "default CMD with failed NVIDIA setup: exit $rc (124 = pod still up)"; fi
+
+# 7. containerd dies once → it is started again, the pod stays up.
+STUB_CONTAINERD=crash-once STUB_DOCKERD=ready:0 run_entrypoint 3 "$work/start.sh"; rc=$?
+if [ $rc -eq 124 ] && [ -e "$dir/containerd-restarted" ]; then pass "a crashed containerd is restarted"
+else flunk "crashed containerd: exit $rc (124 = still up), restarted: $([ -e "$dir/containerd-restarted" ] && echo yes || echo no)"; fi
 
 exit "$fail"
