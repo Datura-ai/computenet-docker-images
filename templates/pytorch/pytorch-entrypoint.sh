@@ -19,9 +19,10 @@ start_docker() {
     # containerd it starts itself before its socket exists and retries after
     # gRPC's 1 s backoff, while with --containerd a missing socket is retried
     # every 10 ms. Config: /etc/containerd/config.toml, same paths as before.
-    # dockerd restarts a containerd it started itself, so a crashed one is restarted
-    # here; the shims keep the nested containers running meanwhile.
-    until containerd >> /var/log/containerd.log 2>&1; do sleep 1; done &
+    # dockerd restarts a containerd it started itself, so an exited one is restarted
+    # here whatever its exit code (SIGTERM gives 0); the shims keep the nested
+    # containers running meanwhile.
+    while :; do containerd >> /var/log/containerd.log 2>&1; sleep 1; done &
     dockerd --host=unix:///var/run/docker.sock --containerd="$CONTAINERD_SOCKET" > /var/log/dockerd.log 2>&1 &
     local dockerd_pid=$!
 

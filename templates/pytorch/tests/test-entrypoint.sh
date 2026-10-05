@@ -6,7 +6,7 @@
 #   - the default /start.sh starts before dockerd answers (sshd does not wait for Docker), and the pod ends
 #     when dockerd or the NVIDIA setup fails;
 #   - the wait for dockerd ends after its deadline when dockerd accepts but never answers (cut from 30 s to 3 s);
-#   - a containerd that dies is started again.
+#   - a containerd that exits is started again, whatever its exit code.
 #
 # Usage: templates/pytorch/tests/test-entrypoint.sh
 #        ENTRYPOINT=<file> templates/pytorch/tests/test-entrypoint.sh   (another revision of the entrypoint)
@@ -19,13 +19,14 @@ trap 'rm -rf "$work"' EXIT
 
 # Stubs read the case's dir from CASE_DIR; every stub that stays up records its PID there for the cleanup.
 mkdir -p "$work/bin"
-# STUB_CONTAINERD=crash-once: the first run dies like a killed containerd, the next one stays up.
+# STUB_CONTAINERD=exit-once:<code>: the first run exits with <code> (137 = killed, 0 = stopped by SIGTERM),
+# the next one stays up.
 cat > "$work/bin/containerd" <<'STUB'
 #!/usr/bin/env bash
-if [ "${STUB_CONTAINERD:-}" = crash-once ] && [ ! -e "$CASE_DIR/containerd-crashed" ]; then
-  touch "$CASE_DIR/containerd-crashed"; exit 137
+if [[ "${STUB_CONTAINERD:-}" = exit-once:* ]] && [ ! -e "$CASE_DIR/containerd-exited" ]; then
+  touch "$CASE_DIR/containerd-exited"; exit "${STUB_CONTAINERD#exit-once:}"
 fi
-[ -e "$CASE_DIR/containerd-crashed" ] && touch "$CASE_DIR/containerd-restarted"
+[ -e "$CASE_DIR/containerd-exited" ] && touch "$CASE_DIR/containerd-restarted"
 echo $$ >> "$CASE_DIR/pids"; exec sleep 30
 STUB
 # STUB_DOCKERD: ready:<seconds> answers after a delay; fail exits at once, like dockerd with a broken daemon.json.
@@ -120,7 +121,7 @@ if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then pass "a failed NVIDIA setup ends a /st
 else flunk "default CMD with failed NVIDIA setup: exit $rc (124 = pod still up)"; fi
 
 # 7. containerd dies once → it is started again, the pod stays up.
-STUB_CONTAINERD=crash-once STUB_DOCKERD=ready:0 run_entrypoint 3 "$work/start.sh"; rc=$?
+STUB_CONTAINERD=exit-once:137 STUB_DOCKERD=ready:0 run_entrypoint 3 "$work/start.sh"; rc=$?
 if [ $rc -eq 124 ] && [ -e "$dir/containerd-restarted" ]; then pass "a crashed containerd is restarted"
 else flunk "crashed containerd: exit $rc (124 = still up), restarted: $([ -e "$dir/containerd-restarted" ] && echo yes || echo no)"; fi
 
@@ -129,5 +130,10 @@ else flunk "crashed containerd: exit $rc (124 = still up), restarted: $([ -e "$d
 STUB_CURL=hang STUB_DOCKERD=ready:60 run_entrypoint 6 touch @/cmd-ran; rc=$?
 if [ $rc -ne 0 ] && [ $rc -ne 124 ] && [ ! -e "$dir/cmd-ran" ]; then pass "a dockerd that never answers is given up at the deadline"
 else flunk "dockerd that never answers: exit $rc (124 = still waiting), command ran: $([ -e "$dir/cmd-ran" ] && echo yes || echo no)"; fi
+
+# 9. containerd exits 0 once (a SIGTERM) → it is started again, the pod stays up.
+STUB_CONTAINERD=exit-once:0 STUB_DOCKERD=ready:0 run_entrypoint 3 "$work/start.sh"; rc=$?
+if [ $rc -eq 124 ] && [ -e "$dir/containerd-restarted" ]; then pass "a containerd that exits 0 is restarted"
+else flunk "containerd exited 0: exit $rc (124 = still up), restarted: $([ -e "$dir/containerd-restarted" ] && echo yes || echo no)"; fi
 
 exit "$fail"
