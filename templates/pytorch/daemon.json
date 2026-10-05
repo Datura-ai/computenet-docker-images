@@ -1,5 +1,4 @@
 {
-    "ip6tables": false,
     "runtimes": {
         "nvidia": {
             "args": [],

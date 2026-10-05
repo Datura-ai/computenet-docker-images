@@ -45,8 +45,6 @@ The nested daemon registers the NVIDIA runtime, but does not make it the default
 
 If `containerd` exits, the entrypoint starts it again after a second, as `dockerd` does for a `containerd` it runs itself; nested containers keep running meanwhile. `dockerd` is not restarted: if it exits after the pod is up, `docker` inside the pod stops answering until the pod restarts.
 
-The nested daemon writes no IPv6 firewall rules (`"ip6tables": false` in `daemon.json`, which saves dockerd about 0.1 s per start). Nested containers talk over IPv4: an IPv6 network created inside the pod (`docker network create --ipv6`) gets no IPv6 NAT or published ports from Docker. Lium pods have no IPv6 today, so a renter loses nothing now; if pods get IPv6, this setting has to go for nested containers to use it.
-
 ## `-lium1` variants (group `lium`)
 
 | Target | Tag | torch | nvcc |
