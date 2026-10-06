@@ -1,0 +1,30 @@
+name: pytorch template — install chain can fail
+
+# DAH-2433: the install RUN chain in templates/pytorch/Dockerfile must go red when one of the files it
+# installs (/start.sh, the entrypoint, daemon.json, …) is missing. Runs the chain lifted verbatim from
+# the Dockerfile on a plain ubuntu base — no CUDA pull, ~20 s — once broken (must fail) and once
+# complete (must pass). See templates/pytorch/tests/test-install-chain.sh.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'templates/pytorch/Dockerfile'
+      - 'templates/pytorch/tests/**'
+      - '.github/workflows/pytorch-install-chain.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'templates/pytorch/Dockerfile'
+      - 'templates/pytorch/tests/**'
+      - '.github/workflows/pytorch-install-chain.yml'
+
+jobs:
+  install-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Broken install must fail the build, complete install must pass
+        run: templates/pytorch/tests/test-install-chain.sh

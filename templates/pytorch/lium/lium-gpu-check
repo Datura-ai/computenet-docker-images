@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Print what this pod's GPU, driver and torch build agree on. Exit 1 if torch cannot run a kernel here.
+
+    lium-gpu-check          human-readable report
+    lium-gpu-check --json   machine-readable (for agents and the template smoke test)
+"""
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
+    except Exception:
+        return ""
+
+
+def has_kernels_for(arch_list, major, minor):
+    """True if a build with these arch flags runs on compute capability major.minor.
+
+    SASS is forward compatible within a major version (sm_86 runs on 8.9, sm_100 on 10.3),
+    and any compute_XX PTX with XX <= the device's CC can be JIT-compiled.
+    """
+    for arch in arch_list:
+        kind, _, cc = arch.partition("_")
+        if not cc.isdigit() or len(cc) < 2:
+            continue
+        a_major, a_minor = int(cc[:-1]), int(cc[-1])
+        if kind == "sm" and a_major == major and a_minor <= minor:
+            return True
+        if kind == "compute" and (a_major, a_minor) <= (major, minor):
+            return True
+    return False
+
+
+def main():
+    report = {"ok": True, "problems": []}
+    try:
+        report["image"] = json.load(open("/etc/lium-image.json"))
+    except Exception:
+        report["image"] = {}
+
+    smi = run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total,compute_cap", "--format=csv,noheader"])
+    gpus = [[c.strip() for c in line.split(",")] for line in smi.splitlines() if line.strip()]
+    report["gpus"] = [{"name": g[0], "driver": g[1], "memory": g[2], "compute_cap": g[3]} for g in gpus if len(g) >= 4]
+    if not report["gpus"]:
+        report["ok"] = False
+        report["problems"].append("nvidia-smi lists no GPU")
+
+    try:
+        import torch
+
+        report["torch"] = {
+            "version": torch.__version__,
+            "cuda": torch.version.cuda,
+            "arch_list": torch.cuda.get_arch_list(),
+            "cuda_available": torch.cuda.is_available(),
+        }
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(0)
+            report["torch"]["device_capability"] = f"{major}.{minor}"
+            report["torch"]["kernels_for_this_gpu"] = has_kernels_for(torch.cuda.get_arch_list(), major, minor)
+            if not report["torch"]["kernels_for_this_gpu"]:
+                report["problems"].append(
+                    f"torch {torch.__version__} has no sm_{major}{minor}-compatible kernels for "
+                    f"{torch.cuda.get_device_name(0)}; pick a template whose torch build lists them "
+                    "(cu128+ for Blackwell)"
+                )
+                report["ok"] = False
+            x = torch.randn(2048, 2048, device="cuda")
+            y = (x @ x).sum().item()
+            torch.cuda.synchronize()
+            report["torch"]["matmul_ok"] = y == y  # not NaN
+        else:
+            report["ok"] = False
+            report["problems"].append("torch.cuda.is_available() is False")
+    except Exception as exc:  # torch missing or broken
+        report["ok"] = False
+        report["torch"] = {"error": str(exc)[:200]}
+        report["problems"].append(f"torch failed: {str(exc)[:120]}")
+
+    nvcc = shutil.which("nvcc")
+    report["nvcc"] = run([nvcc, "--version"]).splitlines()[-2:] if nvcc else None
+    report["tools"] = {t: bool(shutil.which(t)) for t in ("ffmpeg", "tesseract", "rsync", "uv", "git-lfs", "docker")}
+    report["ffmpeg_nvenc"] = "h264_nvenc" in run(["ffmpeg", "-hide_banner", "-encoders"]) if report["tools"]["ffmpeg"] else False
+    report["optix"] = bool(glob.glob("/usr/lib/x86_64-linux-gnu/libnvoptix.so*"))
+    report["fast_path"] = {
+        "/workspace": run(["df", "--output=fstype", "/workspace"]).splitlines()[-1:] or [""],
+        "/root": run(["df", "--output=fstype", "/root"]).splitlines()[-1:] or [""],
+        "HF_HOME": os.environ.get("HF_HOME", ""),
+    }
+
+    if "--json" in sys.argv:
+        print(json.dumps(report, indent=1))
+    else:
+        for g in report["gpus"]:
+            print(f"GPU     : {g['name']}  cc {g['compute_cap']}  driver {g['driver']}  {g['memory']}")
+        t = report.get("torch", {})
+        if "version" in t:
+            print(f"torch   : {t['version']}  CUDA {t['cuda']}  kernels {' '.join(t['arch_list'])}")
+            if "device_capability" in t:
+                print(f"          device cc {t['device_capability']} -> kernels present: {t['kernels_for_this_gpu']}, matmul ok: {t.get('matmul_ok')}")
+        else:
+            print(f"torch   : {t.get('error')}")
+        print(f"nvcc    : {report['nvcc'][-1] if report['nvcc'] else 'missing'}")
+        print(f"tools   : {' '.join(k for k, v in report['tools'].items() if v)}  | ffmpeg nvenc: {report['ffmpeg_nvenc']}")
+        print(f"optix   : {'available (Blender Cycles OPTIX ok)' if report['optix'] else 'absent on this host - use --cycles-device CUDA'}")
+        print(f"paths   : /workspace={report['fast_path']['/workspace'][0]}  /root={report['fast_path']['/root'][0]}  HF_HOME={report['fast_path']['HF_HOME']}")
+        for p in report["problems"]:
+            print(f"PROBLEM : {p}")
+    sys.exit(0 if report["ok"] else 1)
+
+
+if __name__ == "__main__":
+    main()

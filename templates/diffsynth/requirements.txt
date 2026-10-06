@@ -1,7 +1,7 @@
 torch>=2.0.0
 torchvision
 cupy-cuda12x
-transformers==4.46.2
+transformers==5.10.1
 controlnet-aux==0.0.7
 imageio
 imageio[ffmpeg]

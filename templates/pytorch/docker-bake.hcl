@@ -2,6 +2,12 @@ variable "PUBLISHER" {
     default = "daturaai"
 }
 
+# The one target scripts/build-smoke.sh builds and boots when this template changes (the image lium-platform's default template points at). Every target's
+# bake definition is still resolved on every PR (bake --print); a GPU host runs the same script with E2E_GPU=1.
+group "smoke" {
+    targets = ["2120-py312-cuda1302-devel-ubuntu2404-dind"]
+}
+
 group "default" {
     targets = [
         ### CUDA ###
@@ -71,6 +77,12 @@ group "default" {
         "260-py312-cuda1260-devel-ubuntu2404",
         "260-py312-cuda1263-devel-ubuntu2404",
         "270-py312-cuda1280-devel-ubuntu2404",
+
+        # PyTorch 2.12.0 Docker-in-Docker targets
+        "2120-py312-cuda126-devel-ubuntu2404-dind",
+        "2120-py312-cuda128-devel-ubuntu2404-dind",
+        "2120-py312-cuda1302-devel-ubuntu2404-dind",
+        "2120-py312-cuda132-devel-ubuntu2404-dind",
     ]
 }
 
@@ -128,7 +140,93 @@ group "cuda" {
         "260-py311-cuda1260-devel-ubuntu2404",
         "260-py311-cuda1263-devel-ubuntu2404",
         "270-py311-cuda1280-devel-ubuntu2404",
+
+        # PyTorch 2.12.0 Docker-in-Docker targets
+        "2120-py312-cuda126-devel-ubuntu2404-dind",
+        "2120-py312-cuda128-devel-ubuntu2404-dind",
+        "2120-py312-cuda1302-devel-ubuntu2404-dind",
+        "2120-py312-cuda132-devel-ubuntu2404-dind",
     ]
+}
+
+group "cuda-dind" {
+    targets = [
+        "2120-py312-cuda126-devel-ubuntu2404-dind",
+        "2120-py312-cuda128-devel-ubuntu2404-dind",
+        "2120-py312-cuda1302-devel-ubuntu2404-dind",
+        "2120-py312-cuda132-devel-ubuntu2404-dind",
+    ]
+}
+
+# Lium "-lium1" variants: the DinD image plus a matching CUDA toolkit (nvcc), media/OCR
+# tools, PEP 668-ready pip, a torch constraints file and a first-hour MOTD. Built in two
+# stages so the published tag is exactly "the regular image + lium/install.sh"; the base
+# stage is never tagged or pushed. Not part of the default group on purpose: these tags
+# are opt-in until the backend's DOCKER_IMAGES list adopts them.
+group "lium" {
+    targets = [
+        "2120-py312-cuda1302-devel-ubuntu2404-dind-lium1",
+        "2110-py312-cuda128-devel-ubuntu2404-dind-lium1",
+    ]
+}
+
+target "_lium-base-2120-cu130" {
+    dockerfile = "Dockerfile"
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130"
+    }
+}
+
+# General / Hopper image. torch 2.12.0+cu130 already ships sm_90, sm_100 and sm_120
+# kernels, so this also serves Blackwell on hosts whose driver supports CUDA 13
+# (>= 580); nvcc 13.0 matches the wheels.
+target "2120-py312-cuda1302-devel-ubuntu2404-dind-lium1" {
+    dockerfile = "Dockerfile.lium"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind-lium1"]
+    contexts = {
+        base = "target:_lium-base-2120-cu130"
+    }
+    args = {
+        CUDA_TOOLKIT_VERSION = "13-0"
+        LIUM_IMAGE_TAG = "2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind-lium1"
+    }
+}
+
+target "_lium-base-2110-cu128" {
+    dockerfile = "Dockerfile"
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128"
+    }
+}
+
+# Blackwell-capable image for the CUDA 12.8 slot (hosts on 570/575 drivers). The existing
+# cuda12.8 tag installs cu126 wheels, which carry no sm_100/sm_120 kernels, so B200/B300/
+# RTX PRO 6000/RTX 5090 renters had to reinstall torch. cu128 wheels do carry them; the
+# newest cu128 build is torch 2.11.0 (there is no 2.12.x cu128 wheel). nvcc 12.8 matches.
+target "2110-py312-cuda128-devel-ubuntu2404-dind-lium1" {
+    dockerfile = "Dockerfile.lium"
+    tags = ["${PUBLISHER}/pytorch:2.11.0-py3.12-cuda12.8-devel-ubuntu24.04-dind-lium1"]
+    contexts = {
+        base = "target:_lium-base-2110-cu128"
+    }
+    args = {
+        CUDA_TOOLKIT_VERSION = "12-8"
+        LIUM_IMAGE_TAG = "2.11.0-py3.12-cuda12.8-devel-ubuntu24.04-dind-lium1"
+    }
 }
 
 
@@ -624,7 +722,67 @@ target "270-py311-cuda1280-devel-ubuntu2404" {
     }
 }
 
-arget "260-py312-cuda1251-devel-ubuntu2204" {
+target "2120-py312-cuda126-devel-ubuntu2404-dind" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu126"
+    }
+}
+
+target "2120-py312-cuda128-devel-ubuntu2404-dind" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu126"
+    }
+}
+
+target "2120-py312-cuda1302-devel-ubuntu2404-dind" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130"
+    }
+}
+
+target "2120-py312-cuda132-devel-ubuntu2404-dind" {
+    dockerfile = "Dockerfile"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda13.2-devel-ubuntu24.04-dind"]
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.2"
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu132"
+    }
+}
+
+target "260-py312-cuda1251-devel-ubuntu2204" {
     dockerfile = "Dockerfile"
     tags = ["${PUBLISHER}/pytorch:2.6.0-py3.12-cuda12.5.1-devel-ubuntu22.04"]
     contexts = {

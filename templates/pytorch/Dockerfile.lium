@@ -1,0 +1,29 @@
+# Lium extras layered on a freshly built PyTorch DinD image.
+#
+# `base` is a bake context that points at an intermediate target built from the
+# regular ./Dockerfile (see the *-lium1 targets in docker-bake.hcl), so the
+# published `-lium1` tags are the existing image plus exactly what lium/install.sh
+# adds: a CUDA toolkit matching the torch wheels (nvcc), media/OCR tools, a pip
+# that works on Ubuntu 24.04 (PEP 668), a torch constraints file, and a MOTD
+# with the pod gotchas. The existing targets and their tags are not touched.
+FROM base
+
+ARG CUDA_TOOLKIT_VERSION=""
+ARG LIUM_IMAGE_TAG=""
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+COPY lium/ /tmp/lium/
+RUN bash /tmp/lium/install.sh "${CUDA_TOOLKIT_VERSION}" "${LIUM_IMAGE_TAG}" && rm -rf /tmp/lium
+
+# Runtime env for processes started by the entrypoint (dockerd, jupyter, /start.sh).
+# SSH sessions do not inherit container env, so install.sh writes the same values
+# to /etc/environment (pam_env) and /etc/profile.d/lium-env.sh as well.
+ENV CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH} \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    HF_HOME=/workspace/hf \
+    NVIDIA_DRIVER_CAPABILITIES=all
+
+LABEL lium.image.variant="lium1" \
+      lium.image.tag="${LIUM_IMAGE_TAG}"

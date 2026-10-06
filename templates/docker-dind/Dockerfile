@@ -1,6 +1,8 @@
 
-# Use the docker:dind image as the base
-FROM cruizba/ubuntu-dind:latest
+# Base: Ubuntu 24.04 + Docker 28.0.4, what daturaai/dind:0.0.1 was built from. Pinned (DAH-2856): `latest`
+# moved to Ubuntu 26.04 / Docker 29.7.2 in Sep 2026, and a rebuild for one fix should not also change the OS
+# and the dockerd version the probe runs on. Bump on purpose, in its own change.
+FROM cruizba/ubuntu-dind:noble-28.0.4
 
 # Install OpenSSH server and NVIDIA dependencies
 RUN apt-get update && apt-get install -y \
@@ -25,6 +27,11 @@ RUN nvidia-ctk runtime configure --runtime=docker
 COPY daemon.json /etc/docker/daemon.json
 COPY config.toml /etc/nvidia-container-runtime/config.toml
 
+# DAH-2856: default to iptables-nft, which needs only nf_tables on the host; legacy needs kernel modules
+# a sysbox container cannot load. select-iptables-backend.sh (header has the why) falls back to legacy at start.
+RUN update-alternatives --set iptables /usr/sbin/iptables-nft \
+    && update-alternatives --set ip6tables /usr/sbin/ip6tables-nft
+
 # Start Scripts
 COPY --from=scripts start.sh /
 RUN chmod +x /start.sh
@@ -35,10 +42,30 @@ RUN chmod +x /entrypoint.sh
 COPY nvidia-setup.sh /
 RUN chmod +x /nvidia-setup.sh
 
+# Bundle the official hello-world image so the validator's DinD sysbox probe (DAH-1959)
+# can confirm nested docker works without ever pulling from Docker Hub. Anonymous pulls
+# hit per-IP rate limits when many executors share a NAT, which falsely flagged miners
+# as sysbox=False and cut their reward multiplier.
+#
+# The tarball is loaded by load-probe.sh, which is invoked through an ENTRYPOINT chain
+# (load-probe-entrypoint.sh -> cruizba's start-docker.sh -> load-and-exec.sh -> user CMD)
+# so the load completes BEFORE any user-supplied command (in particular, the lium
+# validator's `service ssh start` chain) runs. ENTRYPOINT was chosen because lium's
+# validator overrides CMD, so any setup we put in CMD would be silently dropped.
+# A failed load is best-effort: the validator probe just falls back to a registry pull.
+COPY hello-world.tar /opt/probe/hello-world.tar
+COPY load-probe.sh load-probe-entrypoint.sh select-iptables-backend.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/load-probe.sh /usr/local/bin/load-probe-entrypoint.sh /usr/local/bin/select-iptables-backend.sh
+ENTRYPOINT ["/usr/local/bin/load-probe-entrypoint.sh"]
+
 # Welcome Message
 COPY --from=scripts computenet.txt /etc/computenet.txt
 RUN echo 'cat /etc/computenet.txt' >> /root/.bashrc
 RUN echo 'echo -e "\nmade with ❤️  by Datura\n\n"' >> /root/.bashrc
 
-# Start SSH and Docker daemon
+# Default CMD when nobody overrides it. load-probe runs via the ENTRYPOINT chain above,
+# not here, so this is just the regular pod-bring-up path for interactive use.
+# (The lium validator overrides CMD with its own `sh -c '... service ssh start ...'`,
+# but the ENTRYPOINT chain still runs load-probe before that override — that is the
+# whole point of moving load-probe out of CMD.)
 CMD ["bash", "-c", "/nvidia-setup.sh && /start.sh"]

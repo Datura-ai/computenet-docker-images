@@ -1,0 +1,851 @@
+#!/usr/bin/env bash
+#
+# Boot engy (Bittensor SN53) workers inside a Lium filler container.
+#
+# Shape: ENGY_ENGINES_PER_GPU sglang engines PER GPU (each --tp-size 1, its own port) and ONE
+# engy_miner PER ENGINE. The default of one engine per card is the shape this image has always run.
+# The reasoning behind every decision here, with the measurements, is in ARCHITECTURE.md next to
+# this file — read that before changing anything below.
+set -euo pipefail
+
+ENGY_HOME="${ENGY_HOME:-/opt/engy}"
+ENGY_MINER_DIR="${ENGY_MINER_DIR:-/opt/engy-miner}"
+
+MINER_KEY="${MINER_KEY:-}"
+GW="${GW:-wss://api.engy.ai/gw}"
+MODEL="${MODEL:-qwen3.6-35b-a3b}"
+CKPT_REPO="${ENGY_CKPT_REPO:-Qwen/Qwen3.6-35B-A3B-FP8}"
+CKPT_REVISION="${ENGY_CKPT_REVISION:-95a723d08a9490559dae23d0cff1d9466213d989}"
+CKPT_DIR="${ENGY_HOME}/models/${CKPT_REPO}"
+
+# DAH-2805: below this much free space the checkpoint pull is refused instead of filling the host
+# disk, and the container exits so the backend frees the GPU. The number sits BELOW the smallest fit
+# gate the backend uses — workload size plus EXECUTORS_FILTER_MIN_GB, i.e. ENGY admitted at 110 GB
+# free in prod and 75 GB on staging — because a floor above the gate would refuse nodes the platform
+# just granted. 60 clears the ~35 GB the checkpoint needs. The garbage that puts a node here is
+# swept by the validator, which reaches the node whatever image runs on it.
+DOWNLOAD_FLOOR_GB="${ENGY_DOWNLOAD_FLOOR_GB:-60}"
+# The gateway's worker count when GW/meta cannot be read. Every miner must hold one leg per gateway
+# worker or it is refused onboarding, so this stands in for the live count everywhere the live count
+# is not available yet — the real one (resolve_gateway_worker_count) always wins over it.
+ASSUMED_GATEWAY_WORKERS=8
+# How much ONE gateway leg may hold. The miner splits its declaration evenly across the legs
+# (_leg_plan), so this — not the total — is the number onboarding actually turns on, and the total
+# is derived from it once the live leg count is known.
+# Measured A/B on a rented H100x8 (2026-08-12), same image and box, only this changed: at 2 the node
+# onboarded 6 of 8, failing the other two with "served only 7 concurrent legs" and "offered 7
+# distinct clean legs" — the pair prod shows — and at 3 it onboarded 8 of 8, neither failure in 16
+# worker-starts. See ARCHITECTURE.md, "Why a leg needs three inflight, not one".
+MEASURED_REQUESTS_PER_GATEWAY_LEG=3
+REQUESTS_PER_GATEWAY_LEG="${ENGY_REQUESTS_PER_GATEWAY_LEG:-${MEASURED_REQUESTS_PER_GATEWAY_LEG}}"
+# Checked as text before any arithmetic: under `set -u` a non-numeric value makes (( )) treat it as
+# an unset variable NAME and kill the script here, before the log capture that would explain why.
+# Zero is refused with it — a leg that may hold nothing is routed nothing, and earns nothing.
+if [[ ! "${REQUESTS_PER_GATEWAY_LEG}" =~ ^[0-9]+$ ]] || (( REQUESTS_PER_GATEWAY_LEG < 1 )); then
+    echo "[engy] ENGY_REQUESTS_PER_GATEWAY_LEG='${REQUESTS_PER_GATEWAY_LEG}' is not a positive" \
+         "number; using ${MEASURED_REQUESTS_PER_GATEWAY_LEG}." >&2
+    REQUESTS_PER_GATEWAY_LEG="${MEASURED_REQUESTS_PER_GATEWAY_LEG}"
+fi
+# The gateway never sends more than the declaration, so the only slots it cannot fill are ours: the
+# supervisor's /health_generate, and a leg that has not drained. Without them the prober, which
+# needs every leg serving CONCURRENTLY, fails the worker with "served only 7 CONCURRENT legs".
+# Additive on purpose — a multiplier would grow this with the gateway, which nothing requires.
+# See ARCHITECTURE.md, "Why the engine holds more than it declares".
+ENGINE_SLOTS_FOR_OUR_OWN_PROBES=2
+# How many engines share ONE card, each with its own miner and therefore its own gateway worker.
+# The card is not the constraint on an H200/B200 — prod measured 2 concurrent requests across eight
+# engines — so this exists to buy routing share, which the gateway hands out per WORKER.
+# See ARCHITECTURE.md, "Why more than one engine per card".
+ENGINES_PER_GPU="${ENGY_ENGINES_PER_GPU:-1}"
+if [[ ! "${ENGINES_PER_GPU}" =~ ^[0-9]+$ ]] || (( ENGINES_PER_GPU < 1 )); then
+    echo "[engy] ENGY_ENGINES_PER_GPU='${ENGINES_PER_GPU}' is not a positive number; using 1." >&2
+    ENGINES_PER_GPU=1
+fi
+# What one engine must be able to hold: ~35GB of FP8 weights plus enough KV cache to serve. Engines
+# sharing a card split its VRAM, so this is also the ceiling on how many fit — see size_engines_to_the_card.
+MIN_ENGINE_VRAM_MB=49152
+FIRST_PORT="${ENGY_FIRST_PORT:-8000}"
+# The gateway's own model spec forces this; sglang refuses a shorter context for it.
+CONTEXT_LENGTH="${ENGY_CONTEXT_LENGTH:-262144}"
+# How often the supervisor checks its children, and how long an engine may hold requests without
+# producing a token before it counts as wedged.
+LIVENESS_INTERVAL_SECONDS="${ENGY_LIVENESS_INTERVAL_SECONDS:-60}"
+ENGINE_STALL_SECONDS="${ENGY_ENGINE_STALL_SECONDS:-300}"
+# After a kill, an engine reloads ~35GB of weights and re-JITs its kernels, and it answers /metrics
+# with requests still attributed to it long before it generates again. Without this grace the
+# supervisor reads that reload as a fresh wedge and kills the engine it is waiting for, forever.
+# Borrowed from templates/dolphin's watchdog (DOLPHIN_WATCHDOG_GRACE_SECONDS).
+ENGINE_RESTART_GRACE_SECONDS="${ENGY_ENGINE_RESTART_GRACE_SECONDS:-900}"
+# How long a cold start may take before an engine is left to the supervisor instead of held for.
+# A 35GB load plus ~16k JIT-compiled FP8 kernels is 10-20 minutes on an empty cache.
+ENGINE_READY_TIMEOUT_SECONDS="${ENGY_ENGINE_READY_TIMEOUT_SECONDS:-2400}"
+# How long the first engine gets to seed the shared DeepGEMM cache before the rest are started.
+# See start_engines_seeding_the_kernel_cache_first.
+CACHE_SEED_WAIT_SECONDS="${ENGY_CACHE_SEED_WAIT_SECONDS:-1500}"
+# A miner exiting means something is genuinely wrong (it has its own websocket reconnect loop), so
+# back off before respawning rather than spinning against the gateway.
+MINER_RESTART_BACKOFF_SECONDS="${ENGY_MINER_RESTART_BACKOFF_SECONDS:-60}"
+# Gap between STARTING one miner and the next, so each worker finishes dialing its 8 gateway legs
+# before the following one begins. The gateway claims a worker for capacity probing ~3s after its
+# first HELLO and judges it on the legs live AT THAT MOMENT — a worker caught mid-dial is failed
+# outright with "offered N distinct clean legs, below the required 8" and earns nothing until
+# someone re-onboards it. Measured on an 8-card node (2026-08-10): all 8 miners started in the same
+# pass, 64 handshakes raced, and two workers were judged at 7/8 — one of them landed its last leg 15s
+# AFTER the verdict. Started one at a time, a miner's 8 legs settle in about a second.
+MINER_START_STAGGER_SECONDS="${ENGY_MINER_START_STAGGER_SECONDS:-15}"
+# How long engines and miners get to act on TERM during a refusal before they are killed outright.
+REFUSAL_KILL_GRACE_SECONDS="${ENGY_REFUSAL_KILL_GRACE_SECONDS:-10}"
+# Where the miner is refreshed from on every boot, and the switch to stop doing that. Upstream tags
+# lag their own default branch badly (the newest release was v0.4.1 while tags were at v0.4.4), so
+# the branch is the honest source of "current".
+ENGY_MINER_SOURCE_URL="${ENGY_MINER_SOURCE_URL:-https://raw.githubusercontent.com/hanlinai/engy/main/miner/engy_miner.py}"
+# The container's output is the ONLY record of why a routed request failed, and on a miner's host it
+# goes to a docker pipe we cannot reach.
+LOG_FILE="${ENGY_HOME}/logs/miner.log"
+LOG_MAX_BYTES="${ENGY_LOG_MAX_BYTES:-268435456}"   # 256MB, head-trimmed in place
+# Each miner publishes its event-loop lag here and the sidecar merges the files into /metrics. This
+# is how we tell OUR stall (GIL saturated by hidden-state parsing) from the gateway going quiet —
+# both show up in the log as the same Close(1011, 'keepalive ping timeout').
+PROBE_DIR="${ENGY_HOME}/probe"
+# The trim keeps half the cap, so anything under 2 bytes would round to `tail -c 0` and wipe the log.
+if (( LOG_MAX_BYTES < 8192 )); then LOG_MAX_BYTES=8192; fi
+
+engine_pids=()
+engine_ports=()
+engine_gpus=()
+miner_pids=()
+miner_names=()
+trim_log_pid=""
+sidecar_pid=""
+log_pipe_pid=""
+gpu_count=0
+mining_engines=0
+GPU_NAME=""
+GATEWAY_WORKERS=""
+
+# Everything after this lands in the log: the engines, the miners and this script. Redirect BEFORE
+# the first check — a container that refuses to start is exactly the one whose reason we cannot
+# otherwise see. `stdbuf -oL` is load-bearing, not a nicety: ts block-buffers into a pipe and bash
+# does not wait for a process substitution on exit, so an early exit used to drop the refusal
+# entirely. Falling back to a bare tee when ts is absent keeps the whole output path off one
+# optional binary.
+start_capturing_output() {
+    mkdir -p "${LOG_FILE%/*}"
+    if command -v ts >/dev/null 2>&1; then
+        exec > >(stdbuf -oL ts "%Y-%m-%dT%H:%M:%S%z" | tee -a "${LOG_FILE}") 2>&1
+    else
+        exec > >(tee -a "${LOG_FILE}") 2>&1
+    fi
+    log_pipe_pid=$!
+}
+
+# Refuse to start, with the reason guaranteed to be ON DISK. Anything still holding the log pipe
+# keeps it from draining, so every child goes first; at the early call sites they are all empty and
+# that loop is a no-op. Then closing our end lets the pipe reach EOF and we wait for it to flush.
+refuse_to_start() {
+    echo "[engy] $1" >&2
+    local children=(${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"})
+    local pid
+    for pid in ${children[@]+"${children[@]}"}; do
+        [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
+    done
+    terminate_supervised_loop "${trim_log_pid}"
+    terminate_supervised_loop "${sidecar_pid}"
+    # Everything above is a request; this is not. An engine wedged in a driver call never acts on
+    # TERM, and whether a signalled subshell dies before or after its child is bash semantics we
+    # would rather not depend on — either way something can still hold the log pipe and the wait
+    # below would never return, hanging the container instead of refusing loudly.
+    if (( ${#children[@]} > 0 )); then
+        sleep "${REFUSAL_KILL_GRACE_SECONDS}"
+        for pid in "${children[@]}"; do
+            [[ -n "${pid}" ]] && kill -KILL "${pid}" 2>/dev/null || true
+        done
+    fi
+    kill_supervised_loop_hard "${trim_log_pid}"
+    kill_supervised_loop_hard "${sidecar_pid}"
+    exec 1>&- 2>&-
+    wait "${log_pipe_pid}" 2>/dev/null || true
+    exit 1
+}
+
+free_gb_on_checkpoint_volume() {
+    # POSIX df, in KiB: --output/-BG are GNU-only and the test suite also runs outside the image.
+    # `|| true` inside the pipe: under `set -e` + pipefail a df that fails would otherwise end the
+    # container at the assignment below, killing a node this check exists to keep alive.
+    { df -Pk "${ENGY_HOME}" 2>/dev/null || true; } | awk 'NR == 2 { print int($4 / 1048576) }'
+}
+
+# Start a supervised loop in a session of its own and echo its pid, which `setsid` also makes the
+# process-GROUP id. That group is the only reliable handle on it: the loop's child is reparented to
+# PID 1 the moment the loop dies, and `pkill -P <loop>` then finds nothing. Measured on the H100 test
+# node — the sidecar's python survived TERM and KILL, kept the log pipe open, and a refusal that had
+# already printed its reason hung for 400s instead of exiting.
+# The pid lands in started_loop_pid rather than on stdout: a $(…) around a background job never
+# returns, because the job inherits the substitution's pipe and holds it open for its whole life.
+start_supervised_loop() {
+    local loop_function="$1"
+    export -f "${loop_function}" interruptible_sleep
+    export LOG_FILE ENGY_MINER_DIR PROBE_DIR ENGY_LOG_MAX_BYTES
+    # Without setsid the loop shares our process group and signalling the group would hit the whole
+    # container, so that case falls back to the parent/child handles the kill helpers also accept.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid bash -c "${loop_function}" &
+    else
+        bash -c "${loop_function}" &
+    fi
+    started_loop_pid=$!
+}
+
+# Kill a supervised background loop AND the child it is currently running.
+#
+# The sidecar and the log trimmer are subshells; TERM to the subshell leaves its python/`tail`
+# grandchild alive, and that grandchild still holds the log pipe open. `refuse_to_start` then waits
+# for the pipe to drain and never returns: a container that was supposed to refuse loudly hangs
+# forever instead, and the platform sees it as running. Reproduced on bare bash.
+#
+# The loop is signalled BEFORE its child: bash defers a TERM taken while it waits on a foreground
+# child until that child exits, so the loop dies instead of starting one more iteration. Killing the
+# child first leaves a window in which the loop spawns a fresh pipe holder and the hang comes back.
+# Neither race reproduced in 20 trials on bare bash, which is exactly why `refuse_to_start` does not
+# rely on this ordering being right and follows up with kill_supervised_loop_hard.
+terminate_supervised_loop() {
+    local pid="$1"
+    [[ -n "${pid}" ]] || return 0
+    kill -TERM -"${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+    pkill -TERM -P "${pid}" 2>/dev/null || true
+}
+
+# The same pair with KILL, for when the container is going down anyway and nothing may be left
+# holding the log pipe. The loop dies first so it cannot answer its child's death with a new one.
+kill_supervised_loop_hard() {
+    local pid="$1"
+    [[ -n "${pid}" ]] || return 0
+    kill -KILL -"${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+    pkill -KILL -P "${pid}" 2>/dev/null || true
+}
+
+# SIGTERM is a DROP, not a drain. A customer rental stops the filler and must not wait: the platform
+# allows FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s) and draining 262k-context requests can exceed it.
+# Killing the miners first closes their gateway websockets, so routing stops within ~1 min and only
+# the in-flight requests are lost.
+shutdown() {
+    local pid
+    for pid in ${miner_pids[@]+"${miner_pids[@]}"} ${engine_pids[@]+"${engine_pids[@]}"}; do
+        [[ -n "${pid}" ]] && kill -TERM "${pid}" 2>/dev/null || true
+    done
+    terminate_supervised_loop "${trim_log_pid}"
+    terminate_supervised_loop "${sidecar_pid}"
+    # Wait for the MINERS only, never a bare `wait`. The tee behind the exec redirect is a child too
+    # and cannot see EOF while this script holds the pipe open, so a bare wait never returns under
+    # bash 5 and the stop blows the platform's 30s budget.
+    for pid in ${miner_pids[@]+"${miner_pids[@]}"}; do
+        [[ -n "${pid}" ]] && wait "${pid}" 2>/dev/null || true
+    done
+    exit 0
+}
+
+# Backgrounded sleep + wait, the idiom templates/dolphin uses: a foreground sleep holds a TERM until
+# the nap ends, leaving an orphaned sleep behind on every stop.
+interruptible_sleep() {
+    sleep "$1" &
+    wait $! || true
+}
+
+# Indexed by ENGINE, not by card: with several engines per card the two stopped being the same
+# number, and restart_engine used to hand its engine index straight to CUDA_VISIBLE_DEVICES.
+start_engine() {
+    local index="$1" port="${engine_ports[$1]}"
+    CUDA_VISIBLE_DEVICES="${engine_gpus[$index]}" python3 -m sglang.launch_server \
+        --model-path "${CKPT_DIR}" \
+        --served-model-name Qwen3.6 --tp-size 1 --trust-remote-code \
+        --kv-cache-dtype fp8_e4m3 \
+        --mem-fraction-static "$(engine_mem_fraction "$(( index % ENGINES_PER_GPU ))")" \
+        --chunked-prefill-size 8192 --max-running-requests "${ENGINE_SLOTS}" \
+        --context-length "${CONTEXT_LENGTH}" --enable-return-hidden-states --enable-cache-report \
+        --enable-metrics \
+        --host 127.0.0.1 --port "${port}" &
+    engine_pids[index]=$!
+    # Every start earns the reload grace, first one included: a cold start JITs ~16k FP8 kernels and
+    # is the longest window in which a healthy engine looks wedged.
+    engine_kill_allowed_at[index]=$(( SECONDS + ENGINE_RESTART_GRACE_SECONDS ))
+    engine_started_at[index]="${SECONDS}"
+}
+
+# Two engines on one card means two copies of the 35GB checkpoint in VRAM, so the knob is capped by
+# the hardware rather than trusted: the value comes from platform config and a wrong one costs a
+# crash-loop of 35GB loads, not a clean refusal. A card whose size nvidia-smi will not report is
+# taken at the operator's word — an unreadable card must not silently halve a healthy node.
+size_engines_to_the_card() {
+    local smallest_card_mb engines_that_fit
+    # `|| true` for the same reason as the GPU count below: grep exits 1 when nothing matches, and
+    # under `set -e` + pipefail that would kill the script at this assignment, with nothing logged.
+    smallest_card_mb="$( { nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null |
+        tr -d ' ' | grep -E '^[0-9]+$' | sort -n | head -1; } || true)"
+    if [[ -n "${smallest_card_mb}" ]]; then
+        # Against the 85% the engines actually get, not the whole card: sizing the count on total
+        # VRAM and the allocation on 0.85/N lets a card pass the clamp and still hand each engine
+        # less than one needs — the crash-loop this clamp exists to prevent.
+        engines_that_fit=$(( smallest_card_mb * 85 / 100 / MIN_ENGINE_VRAM_MB ))
+        (( engines_that_fit < 1 )) && engines_that_fit=1
+        if (( ENGINES_PER_GPU > engines_that_fit )); then
+            echo "[engy] ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} does not fit a ${smallest_card_mb}MB card at" \
+                 "${MIN_ENGINE_VRAM_MB}MB usable per engine; using ${engines_that_fit}." >&2
+            ENGINES_PER_GPU="${engines_that_fit}"
+        fi
+    else
+        echo "[engy] could not read card size; keeping ENGY_ENGINES_PER_GPU=${ENGINES_PER_GPU} as given" >&2
+    fi
+}
+
+# What ONE engine passes to --mem-fraction-static, given its slot on the card it shares.
+#
+# sglang does NOT read this as a share of the whole card. Its budget is
+# `free_after_loading_weights - free_before_loading_weights * (1 - fraction)` (model_runner's
+# rest_memory), so the reserve it keeps is a fraction of what THIS engine found free at its own
+# start — which shrinks with every sibling already resident. Giving each engine 0.85/N therefore
+# starves the later ones: measured live on an H200 (2026-08-06), engine 0 took its 0.42 and engine 1
+# then computed a NEGATIVE pool and died with "Not enough memory. Please try to increase
+# --mem-fraction-static". Solving for an equal share per engine gives fraction = s/(1 - slot*s)
+# where s = 0.85/N; at N=1 that is the plain 0.85 this image has always used.
+engine_mem_fraction() {
+    awk -v slot="$1" -v engines="${ENGINES_PER_GPU}" \
+        'BEGIN { share = 0.85 / engines; printf "%.4g", share / (1 - slot * share) }'
+}
+
+# Engines sharing a card get adjacent indexes, and card 0 keeps engine 0 — the one that seeds the
+# kernel cache.
+assign_engines_to_ports_and_cards() {
+    local index
+    for index in $(seq 0 $(( gpu_count * ENGINES_PER_GPU - 1 ))); do
+        engine_ports[index]=$((FIRST_PORT + index))
+        engine_gpus[index]=$((index / ENGINES_PER_GPU))
+    done
+}
+
+# Start engine 0 alone, let it fill the shared kernel cache, then release the rest.
+#
+# sglang JIT-compiles ~16k FP8 DeepGEMM kernels on a cold engine, 10-20 minutes, into
+# DG_JIT_CACHE_DIR — which lives on the shared volume precisely so it is paid once. Started
+# together, all N engines compile the same kernels at the same time into the same directory: N times
+# the CPU for one cache, and N writers racing over the same files. Started one behind the seed, the
+# rest find the cache warm. Borrowed from templates/dolphin (wait_for_cache_seed + its stagger).
+#
+# The wait is capped and never fatal: an engine that dies during seeding must not hold the node
+# hostage, so when the budget runs out the siblings start anyway and pay their own compile.
+start_engines_seeding_the_kernel_cache_first() {
+    local slot index
+    for slot in $(seq 0 $((ENGINES_PER_GPU - 1))); do
+        for index in "${!engine_ports[@]}"; do
+            (( index % ENGINES_PER_GPU == slot )) || continue
+            start_engine "${index}"
+            # `if`, never `(( … )) && …`: a false arithmetic test is the LAST status the loop (and
+            # then this function) returns, and under `set -e` that kills the container silently
+            # right after the engines start. Measured on the H200 test node.
+            if (( index == 0 )); then
+                seed_the_kernel_cache_with_the_first_engine
+            fi
+        done
+        # Engines sharing a card size their KV pool against the memory they find FREE (see
+        # engine_mem_fraction), so the next slot must not start until this one has finished loading —
+        # otherwise both measure the same empty card and the second gets no pool at all.
+        if (( slot + 1 < ENGINES_PER_GPU )); then
+            wait_for_slot_to_load "${slot}"
+        fi
+    done
+}
+
+# Hold every card's slot-0 engine while the first one JIT-compiles the shared kernel cache.
+seed_the_kernel_cache_with_the_first_engine() {
+    local waited=0
+    (( ${#engine_ports[@]} > 1 )) || return 0
+    echo "[engy] engine on port ${engine_ports[0]} is seeding the shared kernel cache; the other $(( ${#engine_ports[@]} - 1 )) wait up to ${CACHE_SEED_WAIT_SECONDS}s"
+    while (( waited < CACHE_SEED_WAIT_SECONDS )) && ! engine_is_generating "${engine_ports[0]}"; do
+        # A dead seed will never warm anything, and holding the other cards for the rest of
+        # the budget is pure lost mining. The supervisor restarts it either way.
+        if ! kill -0 "${engine_pids[0]}" 2>/dev/null; then
+            echo "[engy] the seeding engine exited after ${waited}s; starting the rest now" >&2
+            return 0
+        fi
+        interruptible_sleep 10
+        waited=$((waited + 10))
+    done
+    if engine_is_generating "${engine_ports[0]}"; then
+        echo "[engy] kernel cache seeded after ${waited}s; starting the remaining engines warm"
+    else
+        echo "[engy] cache not seeded after ${waited}s; starting the remaining engines anyway" >&2
+    fi
+}
+
+# Hold the next slot until every engine of this one has taken its memory. Capped and never fatal:
+# a card whose engine never comes up must not stop its siblings from starting at all.
+wait_for_slot_to_load() {
+    local slot="$1" waited=0 index pending
+    while (( waited < ENGINE_READY_TIMEOUT_SECONDS )); do
+        pending=0
+        for index in "${!engine_ports[@]}"; do
+            (( index % ENGINES_PER_GPU == slot )) || continue
+            kill -0 "${engine_pids[$index]}" 2>/dev/null || continue   # dead: nothing left to wait for
+            engine_is_generating "${engine_ports[$index]}" || pending=$((pending + 1))
+        done
+        (( pending == 0 )) && return 0
+        interruptible_sleep 10
+        waited=$((waited + 10))
+    done
+    echo "[engy] slot ${slot} did not finish loading in ${waited}s; starting slot $((slot + 1)) anyway" >&2
+}
+
+# /health_generate, not /health: it answers only once the engine can actually GENERATE. A miner
+# connected to a loaded-but-not-generating serve is how you fail the acceptance gate.
+engine_is_generating() {
+    curl -sf -m 5 "http://127.0.0.1:$1/health_generate" >/dev/null 2>&1
+}
+
+# Give each engine its miner the moment THAT engine can generate, and return how many got one.
+#
+# Polled in rounds against one shared deadline rather than waiting on each engine in turn: a card
+# that never comes up would otherwise hold the whole deadline before the next card is even looked
+# at, so one sick GPU delayed seven healthy ones by the full timeout. Cards also warm at different
+# speeds, and there is no reason a fast one should wait for a slow one.
+start_miners_as_engines_become_ready() {
+    # The deadline covers the readiness WAIT; the staggered starts are added on top so a node with
+    # many cards cannot run out of budget purely because it has more miners to bring up.
+    local deadline=$(( SECONDS + ENGINE_READY_TIMEOUT_SECONDS
+                       + ${#engine_ports[@]} * MINER_START_STAGGER_SECONDS )) index
+    mining_engines=0
+    while true; do
+        for index in "${!engine_ports[@]}"; do
+            [[ -n "${miner_pids[$index]:-}" ]] && continue
+            if engine_is_generating "${engine_ports[$index]}"; then
+                echo "[engy] engine on port ${engine_ports[$index]} ready"
+                # One miner per pass-through, then a gap: see MINER_START_STAGGER_SECONDS. Starting
+                # the whole ready batch at once is what gets workers judged mid-dial at 7/8 legs.
+                if (( mining_engines > 0 )); then
+                    interruptible_sleep "${MINER_START_STAGGER_SECONDS}"
+                fi
+                start_miner "${index}"
+                mining_engines=$((mining_engines + 1))
+            fi
+        done
+        (( mining_engines == ${#engine_ports[@]} )) && break
+        (( SECONDS >= deadline )) && break
+        interruptible_sleep 10
+    done
+    for index in "${!engine_ports[@]}"; do
+        if [[ -z "${miner_pids[$index]:-}" ]]; then
+            echo "[engy] engine on port ${engine_ports[$index]} never became ready — leaving it to the supervisor" >&2
+        fi
+    done
+}
+
+# One name per miner. The worker ID is deliberately NOT pinned to it — see ARCHITECTURE.md,
+# "Why worker ids are random again".
+#
+# The name is the only handle on a worker in the engy dashboard, in the probe filenames and in the
+# `engy_worker` metric label, so it has to say which CARD went quiet. One engine per card keeps the
+# plain `-g<card>` every existing worker is already known by; engines sharing a card add the slot,
+# because `-g<engine>` alone would leave the card unknowable from any metric.
+miner_worker_name() {
+    local index="$1" prefix="${ENGY_WORKER_NAME:-$(hostname)}"
+    if (( ENGINES_PER_GPU == 1 )); then
+        echo "${prefix}-g${index}"
+    else
+        echo "${prefix}-g${engine_gpus[$index]}e$(( index % ENGINES_PER_GPU ))"
+    fi
+}
+
+# The hardware summary a miner sends the gateway comes from `nvidia-smi`, which lists the whole node
+# and ignores CUDA_VISIBLE_DEVICES. Every miner here fronts ONE engine, so without this all eight of
+# ours announce the node's eight cards each. HW_GPUS is upstream's own override for it. Engines
+# sharing a card each still say "1x", because there is no fractional form and the gateway sizes a
+# worker by the capacity probe it runs, not by this string.
+one_gpu_name() {
+    local name
+    name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^ *//;s/ *$//')"
+    echo "${name:-GPU}"
+}
+
+# Read once at startup rather than per miner: the value is a constant, and every read is an
+# nvidia-smi driver round trip issued while N engines are loading 35GB apiece.
+read_gpu_name_once() {
+    GPU_NAME="$(one_gpu_name)"
+}
+
+# How many legs every miner must open, resolved ONCE for the whole container.
+#
+# The gateway admits a worker only if it dials every one of the gateway's workers — "Qualification
+# and sampling only target workers with all 8 legs live". The stock miner asks GW/meta for that
+# count itself, with a 5s timeout and `except: return 1`, so a single blip makes it open ONE leg and
+# the prober refuses it: "offered 1 distinct clean legs, below the required 8", after which the
+# worker earns nothing until someone re-onboards it. Seen live on 2026-08-06, on the second miner of
+# a split card while the first was fine — and with N miners per container the blip gets N chances.
+# So: ask once, retry, and hand every miner the answer through upstream's own ENGY_GW_WORKERS
+# override. The fallback is the gateway's known count, never upstream's 1, which cannot onboard.
+resolve_gateway_worker_count() {
+    local meta_url count attempt
+    meta_url="${GW/#wss:/https:}"
+    meta_url="${meta_url/#ws:/http:}/meta"
+    for attempt in 1 2 3; do
+        # `|| true` again: an unreachable gateway makes curl exit non-zero, pipefail hands that to
+        # the assignment, and `set -e` would kill the container on the very failure this retry loop
+        # exists to survive.
+        count="$( { curl -sf -m 10 "${meta_url}" 2>/dev/null |
+            sed -n 's/.*"workers"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1; } || true)"
+        if [[ "${count}" =~ ^[0-9]+$ ]] && (( count >= 1 )); then
+            GATEWAY_WORKERS="${count}"
+            echo "[engy] ${meta_url} reports ${GATEWAY_WORKERS} gateway worker(s); every miner dials that many legs"
+            return 0
+        fi
+        interruptible_sleep 2
+    done
+    GATEWAY_WORKERS="${ASSUMED_GATEWAY_WORKERS}"
+    echo "[engy] could not read ${meta_url} in 3 tries; assuming ${GATEWAY_WORKERS} gateway worker(s)" \
+         "— the stock miner would have assumed 1 and been refused onboarding" >&2
+}
+
+# Per-leg capacity is what was measured, so the total is derived from the LIVE leg count rather
+# than configured: pin the total instead and the day engy runs 12 legs every worker silently drops
+# to 2 per leg, which is the configuration the A/B lost two cards out of eight on.
+size_declaration_and_engine_to_the_gateway() {
+    DECLARED_INFLIGHT=$(( REQUESTS_PER_GATEWAY_LEG * GATEWAY_WORKERS ))
+    ENGINE_SLOTS=$(( DECLARED_INFLIGHT + ENGINE_SLOTS_FOR_OUR_OWN_PROBES ))
+}
+
+start_miner() {
+    local index="$1" port="${engine_ports[$1]}" name
+    name="$(miner_worker_name "${index}")"
+    miner_names[index]="${name}"
+    GW="${GW}" MINER_KEY="${MINER_KEY}" MODEL="${MODEL}" \
+    MAX_INFLIGHT="${DECLARED_INFLIGHT}" \
+    ENGY_GW_WORKERS="${GATEWAY_WORKERS}" \
+    HW_GPUS="1x ${GPU_NAME}" \
+    ENGY_WORKER_NAME="${name}" \
+    ENGY_PROBE_DIR="${PROBE_DIR}" \
+        python3 "${ENGY_MINER_DIR}/engy_launch.py" \
+        --checkpoint "${CKPT_DIR}" \
+        --serve-url "http://127.0.0.1:${port}" &
+    miner_pids[index]=$!
+}
+
+# Pull the newest upstream miner before anything starts. The vendored copy in the image is a
+# byte-identical fallback, never a patch target: Lium's modifications live in engy_launch.py, which
+# applies them from outside, so a refresh cannot silently drop them.
+#
+# Deliberately fail-soft. A miner that runs a week-old upstream still earns; a miner that refuses to
+# boot because GitHub was unreachable earns nothing. Anything that fails validation is discarded and
+# the baked-in copy stays.
+# The hooks engy_launch.py assigns after import. Kept next to the validator on purpose: adding a
+# modification there means adding its hook here, or a refresh can hand us an upstream we cannot
+# modify and every miner runs with no per-worker lock and no probe — seven of eight cards unmined.
+REQUIRED_MINER_HOOKS=("^def _worker_name" "^WORKER_NAME" "^async def _serve_all" "^def main" "^_JOBS" "^HW")
+
+# Empty when the staged file is usable; otherwise the reason it is not.
+why_staged_miner_is_unusable() {
+    local staged="$1" hook
+    for hook in "${REQUIRED_MINER_HOOKS[@]}"; do
+        if ! grep -qE "${hook}" "${staged}" 2>/dev/null; then
+            echo "it is missing '${hook}', so Lium's modifications would not apply"
+            return 0
+        fi
+    done
+    # PYTHONPATH is cleared and stdout dropped: by this point PYTHONPATH points at our own dir, and
+    # importing sitecustomize.py prints an "armed" banner on stdout that this function's caller reads
+    # as a rejection reason. That silently discarded EVERY valid refresh in the image.
+    if ! PYTHONPATH= python3 -m py_compile "${staged}" >/dev/null 2>&1; then
+        echo "it does not compile"
+    fi
+}
+
+refresh_vendored_miner() {
+    if [[ "${ENGY_MINER_AUTO_UPDATE:-1}" != "1" ]]; then
+        echo "[engy] miner auto-update disabled; using the copy baked into the image"
+        return 0
+    fi
+    local staged="${ENGY_MINER_DIR}/engy_miner.py.new" reason
+    if ! curl -sfL -m 60 "${ENGY_MINER_SOURCE_URL}" -o "${staged}"; then
+        echo "[engy] could not fetch the upstream miner; keeping the image's copy" >&2
+        rm -f "${staged}"
+        return 0
+    fi
+    reason="$(why_staged_miner_is_unusable "${staged}")"
+    if [[ -n "${reason}" ]]; then
+        echo "[engy] discarding the fetched miner: ${reason}; keeping the image's copy" >&2
+        rm -f "${staged}"
+        return 0
+    fi
+    mv -f "${staged}" "${ENGY_MINER_DIR}/engy_miner.py"
+    echo "[engy] miner refreshed from ${ENGY_MINER_SOURCE_URL} ($(wc -l < "${ENGY_MINER_DIR}/engy_miner.py") lines)"
+}
+
+# Token counters for the platform scraper, and the log. Started BEFORE the readiness wait: a cold
+# start is a 35GB download plus warmup, and that whole window is when someone wants to see why the
+# node is quiet. /metrics degrades to 503 meanwhile, which the sidecar already handles. Restarted
+# with backoff like templates/dolphin, since a dead sidecar costs us the only remote read of this
+# container. TERM kills the subshell and orphans its python; container teardown reaps it, because
+# this script is PID 1.
+start_metrics_sidecar() {
+    [[ -n "${METRICS_TOKEN:-}" ]] || return 0
+    local targets=""
+    local port
+    for port in "${engine_ports[@]}"; do
+        targets+="${targets:+,}http://127.0.0.1:${port}"
+    done
+    export ENGY_METRICS_TARGETS="${targets}" ENGY_LOG_FILE="${LOG_FILE}" ENGY_PROBE_DIR="${PROBE_DIR}"
+    start_supervised_loop run_metrics_sidecar_forever
+    sidecar_pid="${started_loop_pid}"
+}
+
+run_metrics_sidecar_forever() {
+    while true; do
+        python3 "${ENGY_MINER_DIR}/metrics_sidecar.py" || true
+        sleep 5
+    done
+}
+
+# Head-trim the log in place rather than rotating it: `cat >` keeps the inode, so the tee holding the
+# file open keeps writing to the same one. A rename would leave tee appending to an unlinked file.
+trim_log_forever() {
+    while true; do
+        interruptible_sleep 300
+        local size
+        # wc -c, not stat -c: stat's flags differ between GNU and BSD, and a silent failure here
+        # would mean the trim never runs.
+        size="$(wc -c < "${LOG_FILE}" 2>/dev/null || echo 0)"
+        if [[ "${size}" -gt "${LOG_MAX_BYTES}" ]]; then
+            # `|| true` because set -e would otherwise end this background loop for good on a single
+            # failed trim, and the log would then grow unbounded with nothing saying why.
+            { tail -c "$((LOG_MAX_BYTES / 2))" "${LOG_FILE}" > "${LOG_FILE}.trim" &&
+                cat "${LOG_FILE}.trim" > "${LOG_FILE}" && rm -f "${LOG_FILE}.trim"; } || true
+        fi
+    done
+}
+
+# "<running> <tokens>", or empty when the engine did not answer. One scrape per pass, not one per
+# counter: an sglang exposition is 65 metric families, and an 8-card node was pulling 16 of them a
+# minute to read two numbers.
+engine_running_and_tokens() {
+    local port="$1"
+    curl -sf -m 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null | awk '
+        /^sglang:num_running_reqs/ { running = $2 }
+        /^sglang:generation_tokens_total/ { tokens = $2 }
+        END { if (running != "" && tokens != "") print running, tokens }'
+}
+
+# A wedged engine is the one failure nothing else notices: requests sit in flight, the process is
+# alive, /health answers, and the token counter simply stops. Dolphin measured twelve of these on
+# vLLM (1.6-23.5h each, invisible to every other check) and cures them the same way — kill the
+# engine, not the container, because recreating the container costs a 35GB cold start for a fault a
+# restart fixes in minutes.
+#
+# Deliberately NOT a fault here, both borrowed from templates/dolphin/watchdog.py: an engine that
+# never came up (a cold start legitimately produces nothing for tens of minutes) and an idle queue
+# (no demand is not a wedge, and arming the clock while idle would spend the budget before the first
+# request even arrives).
+engine_is_wedged() {
+    local index="$1" port="${engine_ports[$1]}" counters running tokens now
+    now="${SECONDS}"
+    # Inside the grace after its own restart this engine is reloading, not wedged.
+    if (( now < ${engine_kill_allowed_at[$index]:-0} )); then
+        engine_stall_since[index]=0
+        return 1
+    fi
+    counters="$(engine_running_and_tokens "${port}")"
+    read -r running tokens <<<"${counters}"
+    if [[ -z "${running}" || -z "${tokens}" ]]; then
+        engine_stall_since[index]=0
+        return 1
+    fi
+    if [[ "${running%%.*}" -eq 0 || "${tokens}" != "${engine_last_tokens[$index]:-}" ]]; then
+        engine_last_tokens[index]="${tokens}"
+        engine_stall_since[index]=0
+        return 1
+    fi
+    if [[ "${engine_stall_since[$index]:-0}" -eq 0 ]]; then
+        engine_stall_since[index]="${now}"
+        return 1
+    fi
+    (( now - engine_stall_since[index] >= ENGINE_STALL_SECONDS ))
+}
+
+# SIGKILL, not SIGTERM: a process stuck inside a CUDA kernel ignores TERM (measured by dolphin in 12
+# of 12 cases). The miner on this engine goes with it — it holds websockets advertising capacity the
+# engine cannot serve, and the supervisor respawns both on the next pass.
+# The only way an engine is restarted, whether it wedged or exited on its own. Both used to have
+# their own copy and they drifted: the exited path forgot to reset the stall state, so the new
+# engine inherited the dead one's clock.
+restart_engine() {
+    local index="$1" reason="$2"
+    echo "[engy] engine on port ${engine_ports[$index]} ${reason} — restarting it" >&2
+    [[ -n "${miner_pids[$index]:-}" ]] && kill -TERM "${miner_pids[$index]}" 2>/dev/null || true
+    kill -KILL "${engine_pids[$index]}" 2>/dev/null || true
+    wait "${engine_pids[$index]}" 2>/dev/null || true
+    miner_pids[index]=""
+    engine_stall_since[index]=0
+    engine_last_tokens[index]=""
+    engine_restarts[index]=$(( ${engine_restarts[$index]:-0} + 1 ))
+    start_engine "${index}"
+}
+
+# Publish what the supervisor has done, through the same file the miners' probes use — the sidecar
+# already merges everything in PROBE_DIR into /metrics. Without this a container that quietly
+# restarts one engine every hour is indistinguishable from a healthy one: the log says so, but on a
+# miner's host nobody reads the log until something has already gone wrong. Shape borrowed from
+# templates/dolphin, whose watchdog publishes dolphin_watchdog_restarts_total the same way.
+write_supervisor_metrics() {
+    local index staged="${PROBE_DIR}/supervisor.prom.tmp"
+    # Atomic, and never fatal: metrics must not be able to stop the supervisor.
+    {
+        echo "# HELP engy_supervisor_heartbeat_timestamp_seconds When the supervisor last completed a pass."
+        echo "# TYPE engy_supervisor_heartbeat_timestamp_seconds gauge"
+        echo "engy_supervisor_heartbeat_timestamp_seconds $(date +%s)"
+        echo "# HELP engy_supervisor_pass_interval_seconds How often a pass is expected, so staleness is judgeable."
+        echo "# TYPE engy_supervisor_pass_interval_seconds gauge"
+        echo "engy_supervisor_pass_interval_seconds ${LIVENESS_INTERVAL_SECONDS}"
+        echo "# HELP engy_supervisor_engine_restarts_total Engines restarted in place since this container started."
+        echo "# TYPE engy_supervisor_engine_restarts_total counter"
+        for index in "${!engine_ports[@]}"; do
+            echo "engy_supervisor_engine_restarts_total{engy_engine=\"${engine_ports[$index]}\"} ${engine_restarts[$index]:-0}"
+        done
+        echo "# HELP engy_supervisor_miner_restarts_total Miners respawned since this container started."
+        echo "# TYPE engy_supervisor_miner_restarts_total counter"
+        for index in "${!engine_ports[@]}"; do
+            echo "engy_supervisor_miner_restarts_total{engy_engine=\"${engine_ports[$index]}\"} ${miner_restarts[$index]:-0}"
+        done
+        echo "# HELP engy_supervisor_miner_running Whether this engine currently has its miner attached."
+        echo "# TYPE engy_supervisor_miner_running gauge"
+        for index in "${!engine_ports[@]}"; do
+            echo "engy_supervisor_miner_running{engy_engine=\"${engine_ports[$index]}\"} $([[ -n "${miner_pids[$index]:-}" ]] && echo 1 || echo 0)"
+        done
+    } > "${staged}" 2>/dev/null && mv -f "${staged}" "${PROBE_DIR}/supervisor.prom" 2>/dev/null || true
+}
+
+# One dead engine costs one card, not the node: it is restarted in place and its miner comes back
+# with it. The old shape exited the whole container, which threw away every other card's warm engine
+# and, with derived worker ids now in play, is no longer the cheaper cure.
+supervise_forever() {
+    local index
+    while true; do
+        interruptible_sleep "${LIVENESS_INTERVAL_SECONDS}"
+        for index in "${!engine_ports[@]}"; do
+            if ! kill -0 "${engine_pids[$index]}" 2>/dev/null; then
+                restart_engine "${index}" "exited"
+                continue
+            fi
+            if engine_is_wedged "${index}"; then
+                restart_engine "${index}" \
+                    "produced no tokens for ${ENGINE_STALL_SECONDS}s with requests in flight"
+                continue
+            fi
+            if [[ -z "${miner_pids[$index]:-}" ]]; then
+                if (( SECONDS < ${miner_restart_allowed_at[$index]:-0} )); then
+                    continue                     # still inside this miner's respawn backoff
+                fi
+                if engine_is_generating "${engine_ports[$index]}"; then
+                    echo "[engy] engine on port ${engine_ports[$index]} is generating again — starting its miner" >&2
+                    start_miner "${index}"
+                elif (( SECONDS - ${engine_started_at[$index]:-0} >= ENGINE_READY_TIMEOUT_SECONDS )); then
+                    # An engine that is alive but has never served is not "wedged" by the token test
+                    # (it has no requests, so the stall clock never arms) and would otherwise sit
+                    # here forever — one card silently idle for the life of the container.
+                    restart_engine "${index}" \
+                        "never became ready in ${ENGINE_READY_TIMEOUT_SECONDS}s"
+                fi
+                continue
+            fi
+            if ! kill -0 "${miner_pids[$index]}" 2>/dev/null; then
+                wait "${miner_pids[$index]}" 2>/dev/null || true
+                echo "[engy] miner ${miner_names[$index]} exited — respawning in ${MINER_RESTART_BACKOFF_SECONDS}s" >&2
+                miner_pids[index]=""
+                # Deadline, not a sleep: sleeping here stalls the whole pass, so one crash-looping
+                # miner would delay wedge detection on every other card and freeze the heartbeat
+                # the ETL charts.
+                miner_restart_allowed_at[index]=$(( SECONDS + MINER_RESTART_BACKOFF_SECONDS ))
+                miner_restarts[index]=$(( ${miner_restarts[$index]:-0} + 1 ))
+            fi
+        done
+        write_supervisor_metrics
+    done
+}
+
+main() {
+    start_capturing_output
+
+    if [[ -z "${MINER_KEY}" ]]; then
+        refuse_to_start "MINER_KEY is required (gateway key from provider.engy.ai)."
+    fi
+
+    # `|| true` is load-bearing: grep -c exits 1 on empty input, and under set -e that would kill
+    # the script at this assignment — before refuse_to_start could put the reason on disk. A node
+    # with no GPUs would then die with a completely empty log, which is the one outcome the whole
+    # log-capture machinery exists to prevent. (wc -l never failed, but padded its output.)
+    gpu_count="$(nvidia-smi --query-gpu=index --format=csv,noheader | grep -c . || true)"
+    if [[ "${gpu_count}" -lt 1 ]]; then
+        refuse_to_start "no GPUs visible to the container."
+    fi
+    size_engines_to_the_card
+    assign_engines_to_ports_and_cards
+    read_gpu_name_once
+    # Before the engines, unlike the miner refresh below: an engine's slot count is fixed at launch,
+    # and it can only be sized once the declaration is settled against the gateway's real count.
+    # This used to ride the free window while the engines loaded; sizing them costs that overlap,
+    # which is up to ~36s of retries against an unreachable gateway — against a 10-20 minute JIT,
+    # and against a gateway there would be nothing to onboard to anyway.
+    resolve_gateway_worker_count
+    size_declaration_and_engine_to_the_gateway
+    echo "[engy] ${gpu_count} GPU(s) x ${ENGINES_PER_GPU} -> ${#engine_ports[@]} engine(s) x" \
+         "${ENGINE_SLOTS} slots at $(awk -v engines="${ENGINES_PER_GPU}" 'BEGIN { printf "%.4g", 0.85 / engines }')" \
+         "of a card each, one miner per engine declaring ${DECLARED_INFLIGHT}"
+
+    export PYTHONPATH="${ENGY_MINER_DIR}"   # loads sitecustomize.py, which trims returned hidden states
+    export HF_HOME="${ENGY_HOME}/hf"
+
+    mkdir -p "${CKPT_DIR}" "${HF_HOME}" "${PROBE_DIR}"
+    # The probe dir sits on the shared cache volume, so a container that comes back with fewer cards
+    # would keep publishing frozen lag series for GPUs it no longer has.
+    rm -f "${PROBE_DIR}"/*.prom "${PROBE_DIR}"/*.prom.tmp
+    if [[ ! -f "${CKPT_DIR}/config.json" ]]; then
+        local free_gb
+        free_gb="$(free_gb_on_checkpoint_volume)"
+        if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
+            refuse_to_start "only ${free_gb} GB free; the ~35GB checkpoint pull would fill the host disk."
+        fi
+        echo "[engy] pulling ${CKPT_REPO}@${CKPT_REVISION} (~35GB) into the shared cache volume"
+        HF_HUB_ENABLE_HF_TRANSFER=1 hf download "${CKPT_REPO}" --revision "${CKPT_REVISION}" --local-dir "${CKPT_DIR}"
+    fi
+
+    trap shutdown TERM INT
+
+    local index
+    start_engines_seeding_the_kernel_cache_first
+
+    start_metrics_sidecar
+    # After the engines are spawned, not before: the miner is not needed until they are ready, and a
+    # slow GitHub would otherwise add a minute of dead time to every cold start.
+    refresh_vendored_miner
+
+    # One card that never comes up costs one card. This used to end the container, which was right
+    # when a single miner fronted every engine — losing one engine lost the worker anyway. With a
+    # miner per engine the healthy cards keep earning, and the supervisor retries the sick one for as
+    # long as the container lives. Only a node where NOTHING came up is worth refusing.
+    start_miners_as_engines_become_ready
+    if (( mining_engines == 0 )); then
+        refuse_to_start "no engine became ready on any of the ${gpu_count} GPU(s)."
+    fi
+    echo "[engy] ${mining_engines} of ${#engine_ports[@]} engine(s) mining"
+
+    start_supervised_loop trim_log_forever
+    trim_log_pid="${started_loop_pid}"
+
+    supervise_forever
+}
+
+declare -a engine_stall_since=()
+declare -a engine_started_at=()
+declare -a miner_restart_allowed_at=()
+declare -a engine_restarts=()
+declare -a miner_restarts=()
+declare -a engine_kill_allowed_at=()
+declare -a engine_last_tokens=()
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
