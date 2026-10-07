@@ -18,9 +18,11 @@ on:
         description: "space-separated template names to build (default: those changed)"
         default: ""
 
-# The smoke boots PR-built DinD images --privileged, which owns the runner: that job gets no token scopes, no secrets
-# and no stored git credentials. Only the comment job, on its own runner that boots nothing the PR built, can write to
-# the PR; it takes the smoke's artifact as text to post, so at worst a poisoned image chooses the comment's words.
+# The smoke boots PR-built DinD images --privileged, which owns the runner: that job's GITHUB_TOKEN reads metadata only,
+# and it gets no secrets and no stored git credentials. Only the comment job, on its own runner that boots nothing the
+# PR built, can write to the PR. It checks out nothing and restores no smoke artifact: the smoke hands it summary.md as
+# a base64 job output, which its script decodes from an env var and posts as text. In the comment job a poisoned image
+# can still choose the comment's words or stop it from being posted, nothing more.
 permissions: {}
 
 jobs:
@@ -29,16 +31,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
-      artifact: ${{ steps.artifact.outputs.name }}   # kept when only the comment job is re-run, on a later run_attempt
+      summary: ${{ steps.summary.outputs.base64 }}   # kept when only the comment job is re-run, on a later run_attempt
     concurrency:
       group: build-smoke-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # a superseded PR push cancels the old run; master runs finish
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           driver: docker   # the engine's own builder: --load is free (the docker-container driver re-imports the image as a tarball)
       - name: room for a CUDA image
@@ -67,7 +69,10 @@ jobs:
       - id: artifact
         if: always()
         run: echo "name=build-smoke-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - id: summary
+        if: always()   # base64 keeps it one line (summary.md cannot add output lines); a PR comment holds 65536 characters
+        run: echo "base64=$( [ -f artifacts/summary.md ] && head -c 60000 artifacts/summary.md | base64 -w0 )" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: ${{ steps.artifact.outputs.name }}
@@ -80,25 +85,20 @@ jobs:
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write
+      pull-requests: write   # post or update the result comment; the only scope in this workflow
     steps:
-      - uses: actions/download-artifact@v4
-        continue-on-error: true   # no artifact when build-smoke died early: the comment says so
-        with:
-          name: ${{ needs.build-smoke.outputs.artifact }}
-          path: artifacts
       - name: result on the PR
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           OUTCOME: ${{ needs.build-smoke.result }}
+          SUMMARY_B64: ${{ needs.build-smoke.outputs.summary }}   # untrusted: read as data, never put into the script
         with:
           script: |
-            const fs = require('fs');
             const marker = '<!-- build-smoke -->';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const summary = fs.existsSync('artifacts/summary.md') ? fs.readFileSync('artifacts/summary.md', 'utf8')
-              : `**image smoke: FAIL** — no summary written (outcome ${process.env.OUTCOME}); see the run log.`;
+            const summary = Buffer.from(process.env.SUMMARY_B64 || '', 'base64').toString('utf8')
+              || `**image smoke: FAIL** — no summary written (outcome ${process.env.OUTCOME}); see the run log.`;
             const body = [marker, `### image smoke · ${context.payload.pull_request.head.sha.slice(0, 8)} · [run](${runUrl})`, '', summary.trim(), '',
               '<sub>bake --print of every template; build + boot of the templates this PR touches (scripts/build-smoke.sh). GPU check: `E2E_GPU=1 scripts/build-smoke.sh <template>` on a GPU host.</sub>'].join('\n');
             const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: context.issue.number, per_page: 100 });
