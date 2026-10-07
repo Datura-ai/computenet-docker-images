@@ -2,7 +2,7 @@
 # Run by scripts/build-smoke.sh inside the booted container. A DinD image is booted there with --privileged, so its
 # nested dockerd must answer: pytorch-entrypoint.sh starts it beside /start.sh rather than before it.
 set -e
-# start.sh starts Jupyter because smoke.env sets JUPYTER_PASSWORD; /api answers without the token.
+# start.sh starts Jupyter because smoke.env sets JUPYTER_PASSWORD; /api answers without the token, /api/kernels needs it.
 jupyter_answers() { python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8888/api", timeout=1)' 2>/dev/null; }
 for _ in $(seq 1 60); do jupyter_answers && break; sleep 0.5; done
 jupyter_answers || { echo "Jupyter does not answer on port 8888"; exit 1; }
@@ -13,6 +13,17 @@ for leftover in /root/.cache /root/.launchpadlib /root/.wget-hsts /root/.local/s
 done
 echo "/root holds no build leftovers"
 [ "$ENABLE_DIND" = true ] || exit 0
+# The validator mounts the pod's volume over /root after `docker run`, when Jupyter may already be up; a kernel
+# must still start. tmpfs stands in for the volume (mounting needs the --privileged a DinD image is booted with).
+mount -t tmpfs smoke-root /root
+python3 -c '
+import json, os, urllib.request as u
+auth = {"Authorization": "token " + os.environ["JUPYTER_PASSWORD"]}
+kernel = json.load(u.urlopen(u.Request("http://127.0.0.1:8888/api/kernels", data=b"{}", headers=auth), timeout=30))
+u.urlopen(u.Request("http://127.0.0.1:8888/api/kernels/" + kernel["id"], headers=auth, method="DELETE"), timeout=30)
+' || { echo "Jupyter cannot start a kernel once a volume is mounted over /root"; exit 1; }
+umount /root
+echo "Jupyter starts kernels with a volume mounted over /root"
 for _ in $(seq 1 60); do
     if docker info >/dev/null 2>&1; then
         echo "nested dockerd answers"
