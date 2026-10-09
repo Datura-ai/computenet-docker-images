@@ -28,11 +28,20 @@ make_stubs() {
     cat > "${stub_dir}/peakminer" <<STUB
 #!/usr/bin/env bash
 echo launched >> "${stub_dir}/launches"
+echo miner >> "${stub_dir}/events"
 sleep ${run_seconds}
 exit ${miner_exit_code}
 STUB
     printf '#!/usr/bin/env bash\necho "GPU 0: NVIDIA L4"\n' > "${stub_dir}/nvidia-smi"
-    chmod +x "${stub_dir}/peakminer" "${stub_dir}/nvidia-smi"
+    # sshd and ssh-keygen are stubbed too: a host test must never start or write a real sshd. The
+    # sshd stub records whether the lock was held at its start and the exit code the test asked for.
+    cat > "${stub_dir}/sshd" <<STUB
+#!/usr/bin/env bash
+echo "sshd lock=\$(test -d "${stub_dir}/run/lium-ssh-setup.lock" && echo held)" >> "${stub_dir}/events"
+exit \${SSHD_STUB_EXIT:-0}
+STUB
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${stub_dir}/ssh-keygen"
+    chmod +x "${stub_dir}/peakminer" "${stub_dir}/nvidia-smi" "${stub_dir}/sshd" "${stub_dir}/ssh-keygen"
 }
 
 run_entrypoint() {
@@ -43,6 +52,7 @@ run_entrypoint() {
     PEARL_POOL_WALLET=prl1test \
     PEARL_POOL_WORKER=test-worker \
     PEARL_LOG_DIR="${stub_dir}/logs" \
+    LIUM_RUN_DIR="${stub_dir}/run" \
     PEARL_MINER_RESTART_DELAY_SECONDS=0 \
     PEARL_MINER_MAX_RESTARTS="${max_restarts}" \
     PEARL_MINER_RESTART_WINDOW_SECONDS=600 \
@@ -92,7 +102,7 @@ test_missing_wallet_fails_fast() {
     stub_dir="$(mktemp -d)"
     make_stubs "${stub_dir}" 0 0
     PATH="${stub_dir}:${PATH}" PEARL_POOL_HOST=prl.kryptex.network PEARL_POOL_PORT=7048 \
-        PEARL_LOG_DIR="${stub_dir}/logs" bash "${ENTRYPOINT}" > "${stub_dir}/out" 2>&1
+        PEARL_LOG_DIR="${stub_dir}/logs" LIUM_RUN_DIR="${stub_dir}/run" bash "${ENTRYPOINT}" > "${stub_dir}/out" 2>&1
     local status=$?
 
     check "$([[ "${status}" != "0" ]] && echo pass)" "no wallet is a hard failure, not a crash loop"
@@ -100,6 +110,33 @@ test_missing_wallet_fails_fast() {
     rm -rf "${stub_dir}"
 }
 
+test_sshd_starts_under_the_lock_before_the_miner() {
+    echo "sshd before the miner"
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    make_stubs "${stub_dir}" 3 0
+    run_entrypoint "${stub_dir}" 0 > /dev/null
+
+    check "$([[ "$(head -n 1 "${stub_dir}/events")" == "sshd lock=held" ]] && echo pass)" "sshd starts first, under the lock the validator bootstrap shares"
+    check "$([[ ! -d "${stub_dir}/run/lium-ssh-setup.lock" ]] && echo pass)" "the lock is released once sshd is up"
+    rm -rf "${stub_dir}"
+}
+
+test_a_failed_sshd_never_stops_the_miner() {
+    echo "sshd fails"
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    make_stubs "${stub_dir}" 3 0
+    SSHD_STUB_EXIT=1 run_entrypoint "${stub_dir}" 0 > /dev/null
+
+    check "$(grep -q "sshd did not start" "${stub_dir}/out" && echo pass)" "the failed start is logged"
+    check "$(grep -qx miner "${stub_dir}/events" && echo pass)" "the miner launches anyway"
+    check "$([[ ! -d "${stub_dir}/run/lium-ssh-setup.lock" ]] && echo pass)" "the lock is released after a failed start"
+    rm -rf "${stub_dir}"
+}
+
+test_sshd_starts_under_the_lock_before_the_miner
+test_a_failed_sshd_never_stops_the_miner
 test_crash_loop_gives_up_non_zero
 test_single_crash_is_restarted
 test_missing_wallet_fails_fast

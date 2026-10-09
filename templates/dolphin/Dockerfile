@@ -28,14 +28,24 @@ ARG DEBIAN_FRONTEND=noninteractive
 # "Failed to find C compiler" right after the model loads into VRAM. Verified on H100/CUDA 13.
 # python3 (FULL package, not python3-minimal): the metrics sidecar needs http.server, which
 # the -minimal stdlib split may not ship.
+# openssh-server: the validator's SSH bootstrap installs it at every filler start (~25 s) unless an
+# sshd is already running; entrypoint.sh starts this one. The package's postinst generates host keys,
+# so they are deleted in the same RUN — no layer may carry them, every container makes its own.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
     jq \
+    openssh-server \
     python3 \
+    && rm -f /etc/ssh/ssh_host_* \
     && rm -rf /var/lib/apt/lists/*
+
+# The same hardening the validator's SSH bootstrap applies (it skips a config that already carries
+# the `# lium-hardened` marker), baked so there is no window where sshd runs with password login on.
+RUN sed -i -E 's/^[[:space:]]*(PasswordAuthentication|ChallengeResponseAuthentication|KbdInteractiveAuthentication)[[:space:]]+.*/# lium-disabled &/I' /etc/ssh/sshd_config \
+    && printf '\n# lium-hardened\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\n' >> /etc/ssh/sshd_config
 
 # Expose all host GPUs to the worker (auto-scales when worker.json gpu_ids is null).
 ENV NVIDIA_VISIBLE_DEVICES=all

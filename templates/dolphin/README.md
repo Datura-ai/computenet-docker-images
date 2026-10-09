@@ -14,6 +14,9 @@ a `worker.json` config, so this image runs the worker **directly in the pod**: n
 
 `entrypoint.sh`:
 
+0. Starts `sshd` (images built from this revision ship `openssh-server`, with password login off
+   and no host keys baked in: each container generates its own), so the validator's SSH bootstrap
+   adopts it instead of installing the package at every start. A failed start is logged and never stops the worker.
 1. Plans how many worker instances the node should run (see **Worker split** below).
 2. Renders one `worker.json` per instance from environment variables.
 3. Ensures the `dolphinpod-worker` binary is present (downloads it if missing).

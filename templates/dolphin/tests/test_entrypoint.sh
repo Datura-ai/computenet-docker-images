@@ -55,6 +55,11 @@ make_sandbox() {
     # A roomy disk by default: the download floor reads df, and a laptop under the floor would
     # otherwise fail every test that spawns a worker.
     mock_df_free_gb 900
+    # The entrypoint starts sshd before anything else; a host test must never start or write a real
+    # one, so sshd and ssh-keygen are no-ops here and the lock lives in the sandbox.
+    printf '#!/usr/bin/env bash\nexit 0\n' | tee "${SANDBOX}/bin/sshd" >"${SANDBOX}/bin/ssh-keygen"
+    chmod +x "${SANDBOX}/bin/sshd" "${SANDBOX}/bin/ssh-keygen"
+    export LIUM_RUN_DIR="${SANDBOX}/run"
     export HOME="${SANDBOX}/home"
     export DOLPHIN_WATCHDOG_STATE_DIR="${SANDBOX}/state"
     mkdir -p "${HOME}" "${DOLPHIN_WATCHDOG_STATE_DIR}"
@@ -1683,7 +1688,51 @@ test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete() {
         "$(download_floor_blocks_spawn && echo yes || echo no)"
 }
 
+# sshd comes up before the workload, under the lock the validator's SSH bootstrap shares, and a
+# failed start is reported to the caller instead of stopping anything.
+test_start_sshd_takes_the_shared_lock_and_survives_a_failed_start() {
+    make_sandbox
+    load_entrypoint
+    cat >"${SANDBOX}/bin/sshd" <<EOF
+#!/usr/bin/env bash
+echo "sshd lock=\$(test -d "${SANDBOX}/run/lium-ssh-setup.lock" && echo held)" >>"${SANDBOX}/events"
+exit \${SSHD_STUB_EXIT:-0}
+EOF
+
+    start_sshd
+    assert_eq "sshd is started with the shared lock held" "sshd lock=held" "$(head -n 1 "${SANDBOX}/events")"
+    assert_eq "the lock is released after the start" "no" \
+        "$([[ -d "${SANDBOX}/run/lium-ssh-setup.lock" ]] && echo yes || echo no)"
+
+    SSHD_STUB_EXIT=1 assert_fails "a failed sshd start is reported to the caller" start_sshd
+    assert_eq "the lock is released after a failed start" "no" \
+        "$([[ -d "${SANDBOX}/run/lium-ssh-setup.lock" ]] && echo yes || echo no)"
+}
+
+# main starts sshd before it prepares the workload, and a failed start does not stop it.
+test_main_starts_sshd_first_and_goes_on_when_it_fails() {
+    make_sandbox
+    load_entrypoint
+    printf '#!/usr/bin/env bash\necho sshd >>"%s/events"\nexit 1\n' "${SANDBOX}" >"${SANDBOX}/bin/sshd"
+    local step
+    for step in ensure_worker_binary prune_stale_worker_logs plan_worker_instances start_metrics_sidecar \
+        start_engine_watchdogs run_worker_supervisor_loop; do
+        eval "${step}() { echo ${step} >>\"${SANDBOX}/events\"; }"
+    done
+
+    main 2>"${SANDBOX}/main.err"
+
+    assert_eq "sshd runs first, then the workload steps" \
+        "sshd ensure_worker_binary prune_stale_worker_logs plan_worker_instances start_metrics_sidecar start_engine_watchdogs run_worker_supervisor_loop" \
+        "$(paste -sd' ' "${SANDBOX}/events")"
+    assert_eq "a failed sshd start is logged" "yes" \
+        "$(grep -q "sshd did not start" "${SANDBOX}/main.err" && echo yes || echo no)"
+}
+
+
 test_plan
+test_main_starts_sshd_first_and_goes_on_when_it_fails
+test_start_sshd_takes_the_shared_lock_and_survives_a_failed_start
 test_render
 test_prepare_instance_home
 test_wait_for_cache_seed
