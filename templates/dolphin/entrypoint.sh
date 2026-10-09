@@ -1247,6 +1247,32 @@ terminate_workers() {
     done
 }
 
+# Start sshd before the workload. The validator's SSH bootstrap then finds it running and adopts it
+# instead of installing openssh-server (~25 s) or waiting out its grace period. Same mkdir lock as
+# the bootstrap and the lium /start.sh setup_ssh, so a bootstrap that falls back cannot generate
+# host keys beside us. Host keys are generated here, never baked into the image. Not fatal: if this
+# fails the bootstrap still brings sshd up itself. LIUM_RUN_DIR is the bootstrap's own test knob.
+start_sshd() {
+    local run_dir="${LIUM_RUN_DIR:-/run}" sshd_bin lock_dir lock_held=0 waited=0 status=0
+    lock_dir="${run_dir}/lium-ssh-setup.lock"
+    sshd_bin="$(command -v sshd)" || return 1
+    mkdir -p "${run_dir}/sshd" || return 1
+    while (( waited < 20 )); do
+        if mkdir "${lock_dir}" 2>/dev/null; then
+            lock_held=1
+            break
+        fi
+        sleep 0.5
+        waited=$(( waited + 1 ))
+    done
+    ssh-keygen -A >/dev/null || echo "ssh-keygen -A failed" >&2
+    "${sshd_bin}" || status=$?
+    if (( lock_held )); then
+        rmdir "${lock_dir}" 2>/dev/null || true
+    fi
+    return "${status}"
+}
+
 on_term() {
     if [[ -n "${SIDECAR_PID}" ]]; then
         kill -TERM "${SIDECAR_PID}" 2>/dev/null || true
@@ -1417,6 +1443,7 @@ main() {
         echo "[dolphin] DOLPHIN_API_KEY is required (dp-... key from v2.dphn.ai)." >&2
         exit 1
     fi
+    start_sshd || echo "[dolphin] sshd did not start; the validator's SSH bootstrap will start it" >&2
     export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${SHARED_CACHE}}"
     export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
 
