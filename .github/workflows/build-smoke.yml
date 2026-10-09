@@ -8,6 +8,8 @@ name: build-smoke
 # Each build pulls its base images first (3 tries, each capped at T_PULL=8m and leftover T_PULL_TOTAL / tries left —
 # a stalled first connection cannot spend the whole 25 minutes, DAH-3409)
 # and writes its full log to artifacts/build-<template>.log, kept by the upload below even when the step times out.
+# A GPU-only template (templates/<name>/smoke.gpu — pearl-miner's entrypoint exits 1 without a wallet and without a card) is built here but booted only
+# under E2E_GPU=1; on this CPU runner its boot row is SKIP, so the job no longer goes red on every PR that touches it.
 on:
   pull_request:
   push:
@@ -52,6 +54,12 @@ jobs:
           bases=$(scripts/build-smoke.sh --bases better-a1111) || { echo "--bases failed"; exit 1; }
           [ "$(wc -l <<<"$bases")" -eq 1 ] || { printf 'stage aliases leaked into the pull list:\n%s\n' "$bases"; exit 1; }
           grep -Eq '^[a-z0-9./-]+:[A-Za-z0-9._-]+$' <<<"$bases" || { echo "not an image reference: $bases"; exit 1; }
+          # the GPU-only marker (templates/pearl-miner/smoke.gpu): without E2E_GPU the boot row is SKIP and the run passes; with E2E_GPU=1
+          # the boot runs — and fails on this CPU runner (`--gpus all` finds no driver), so the marker can never hide a GPU host's boot
+          out=$(scripts/build-smoke.sh pearl-miner 2>&1) || { echo "$out"; echo "a GPU-only template failed on the CPU runner"; exit 1; }
+          grep -q "smoke: boot-pearl-miner SKIP(" <<<"$out" || { echo "$out"; echo "no SKIP row for the GPU-only boot"; exit 1; }
+          out=$(E2E_GPU=1 scripts/build-smoke.sh pearl-miner 2>&1) && { echo "$out"; echo "E2E_GPU=1 skipped a GPU-only boot"; exit 1; }
+          grep -q "smoke: boot-pearl-miner FAIL(" <<<"$out" || { echo "$out"; echo "E2E_GPU=1 did not reach the boot step"; exit 1; }
           rm -rf artifacts
       - name: bake --print every template; build + boot the changed ones
         id: smoke
