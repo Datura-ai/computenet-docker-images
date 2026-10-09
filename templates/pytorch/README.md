@@ -30,7 +30,7 @@ Build one target:
 docker buildx bake 2120-py312-cuda132-devel-ubuntu2404-dind --set 2120-py312-cuda132-devel-ubuntu2404-dind.platform=linux/amd64
 ```
 
-The DinD-enabled image is published only with the explicit `-dind` tag. It uses the Datura DinD base image, installs Python/PyTorch/Jupyter, and keeps common developer tools such as `tmux`, `vim`, `nano`, `htop`, `jq`, `rsync`, `lsof`, `net-tools`, `iproute2`, `tree`, `zip`, and `unzip`. It then starts `dockerd` before the standard Computenet startup script. Running nested Docker requires Sysbox on the host:
+The DinD-enabled image is published only with the explicit `-dind` tag. It uses the Datura DinD base image, installs Python/PyTorch/Jupyter, and keeps common developer tools such as `tmux`, `vim`, `nano`, `htop`, `jq`, `rsync`, `lsof`, `net-tools`, `iproute2`, `tree`, `zip`, and `unzip`. Images built from this revision start `containerd` and `dockerd` in the background and run the standard Computenet startup script without waiting for them, so SSH does not wait for them and `docker` inside the pod answers once `dockerd` is ready (`Docker daemon is ready.` in the container log). A command that replaces the default CMD runs only once `dockerd` answers. If `dockerd` or the NVIDIA device setup fails, or `dockerd` does not answer within 30 s, the container exits non-zero and the log shows why. Images published before this revision start `dockerd` first and run the startup script only once it answers, so SSH waits for `dockerd` too. Running nested Docker requires Sysbox on the host:
 
 ```bash
 docker run -d --rm --runtime=sysbox-runc --name pytorch-dind-test \
@@ -42,6 +42,8 @@ docker exec pytorch-dind-test docker run --rm hello-world
 Security note: treat any shell, SSH, or Jupyter access to this image as access to the nested Docker daemon. This image is intended for trusted single-tenant workloads. Do not expose it to untrusted users or multi-tenant notebook workloads.
 
 The nested daemon registers the NVIDIA runtime, but does not make it the default runtime for every child container. Use Docker's GPU flags or the explicit NVIDIA runtime for child containers that need GPU access.
+
+In images built from this revision (earlier ones leave `containerd` to `dockerd`), if `containerd` exits, the entrypoint starts it again after a second, as `dockerd` does for a `containerd` it runs itself; nested containers keep running meanwhile. `dockerd` is not restarted: if it exits after the pod is up, `docker` inside the pod stops answering until the pod restarts.
 
 ## `-lium1` variants (group `lium`)
 
