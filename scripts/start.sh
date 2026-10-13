@@ -29,9 +29,9 @@ execute_script() {
 # into the container right after `docker run`, so everything here can race a
 # concurrent writer of /etc/ssh and the sshd daemon (DAH-2341):
 #   - a shared mkdir lock serializes the two writers when both take it
-#   - `ssh-keygen -A` never prompts and skips key types that already exist
-#     (the per-type `ssh-keygen -t -f` it replaces blocked PID 1 on an
-#     "Overwrite (y/n)?" prompt when the other side created the key first)
+#   - a host key is generated only when missing, with stdin from /dev/null:
+#     when the other side creates it first, the "Overwrite (y/n)?" prompt
+#     that once blocked PID 1 gets EOF and ssh-keygen gives up at once
 #   - an sshd that is already running counts as success, not an error
 # None of this may kill PID 1 (`set -e` is active): if SSH setup fails, the
 # container must stay alive so the validator bootstrap can still repair it.
@@ -73,15 +73,23 @@ setup_ssh() {
 
     acquire_ssh_setup_lock
 
-    ssh-keygen -A || echo "WARNING: ssh-keygen -A failed" >&2
+    # ED25519 and ECDSA before sshd starts; RSA takes 0.4-1.5 s to generate,
+    # so add_rsa_host_key makes it after sshd answers.
+    local key_type key_file
+    for key_type in ed25519 ecdsa; do
+        key_file="/etc/ssh/ssh_host_${key_type}_key"
+        [ -f "$key_file" ] || { ssh-keygen -q -t "$key_type" -N "" -f "$key_file" < /dev/null \
+            || echo "WARNING: ssh-keygen -t $key_type failed" >&2; } &
+    done
+    wait
     mkdir -p /run/sshd
 
     if is_sshd_running; then
         echo "sshd is already running; skipping service start"
-    elif ! service ssh start; then
+    elif ! /usr/sbin/sshd; then
         # Lost a start race (port already bound by the validator bootstrap's
-        # sshd) or an init-script hiccup — only a real failure if sshd is
-        # genuinely not up afterwards.
+        # sshd) — only a real failure if sshd is genuinely not up afterwards.
+        # sshd is started directly: `service ssh start` costs 30 ms more.
         if is_sshd_running; then
             echo "sshd was started concurrently; continuing"
         else
@@ -90,6 +98,7 @@ setup_ssh() {
     fi
 
     release_ssh_setup_lock
+    add_rsa_host_key &
 
     echo "SSH host keys:"
     for key in /etc/ssh/*.pub; do
@@ -99,13 +108,31 @@ setup_ssh() {
     done
 }
 
+# For clients that know neither ED25519 nor ECDSA.
+add_rsa_host_key() {
+    local key_file=/etc/ssh/ssh_host_rsa_key
+    acquire_ssh_setup_lock
+    [ -f "$key_file" ] || ssh-keygen -q -t rsa -N "" -f "$key_file" < /dev/null \
+        || echo "WARNING: ssh-keygen -t rsa failed" >&2
+    release_ssh_setup_lock
+    [ -f "$key_file" ] || return 0
+    # sshd before OpenSSH 9.8 reads its host keys on every connection and offers the
+    # new key at once; 9.8+ needs a reload, which refuses connections for a few ms.
+    if ! ssh-keyscan -t rsa 127.0.0.1 2>/dev/null | grep -q ssh-rsa && [ -f /run/sshd.pid ]; then
+        echo "Reloading sshd to offer the RSA host key"
+        kill -HUP "$(cat /run/sshd.pid)" || true
+    fi
+}
+
 # Start jupyter lab
 start_jupyter() {
     if [[ $JUPYTER_PASSWORD ]]; then
         echo "Starting Jupyter Lab..."
+        # The pod's volume (encrypted or not) may be mounted over /root after Jupyter starts and would hide
+        # its runtime dir under /root: every kernel start would then fail.
         mkdir -p /workspace && \
         cd / && \
-        nohup jupyter lab --allow-root --no-browser --port=8888 --ip=* --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings='{"shell_command":["/bin/bash"]}' --ServerApp.token=$JUPYTER_PASSWORD --ServerApp.allow_origin=* --ServerApp.preferred_dir=/workspace &> /jupyter.log &
+        JUPYTER_RUNTIME_DIR=/run/jupyter nohup jupyter lab --allow-root --no-browser --port=8888 --ip=* --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings='{"shell_command":["/bin/bash"]}' --ServerApp.token=$JUPYTER_PASSWORD --ServerApp.allow_origin=* --ServerApp.preferred_dir=/workspace &> /jupyter.log &
         echo "Jupyter Lab started"
     fi
 }
