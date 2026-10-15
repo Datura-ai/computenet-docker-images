@@ -16,9 +16,18 @@ ARG PEAKMINER_SHA256=24f415716f456554a0c39ad09a6fc4c2fe52ec61ee1e346449dad6ea39d
 # python3: only for the metrics sidecar, which is stdlib-only on purpose — the miner binary itself
 # needs nothing but glibc. NOT python3-minimal: it ships a cut-down stdlib without hmac or
 # http.server, and the sidecar dies at import with ModuleNotFoundError (verified on the box).
+# openssh-server: the validator's SSH bootstrap installs it at every filler start (~25 s) unless an
+# sshd is already running; entrypoint.sh starts this one. The package's postinst generates host keys,
+# so they are deleted in the same RUN — no layer may carry them, every container makes its own.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl tini python3 \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini python3 openssh-server \
+    && rm -f /etc/ssh/ssh_host_* \
     && rm -rf /var/lib/apt/lists/*
+
+# The same hardening the validator's SSH bootstrap applies (it skips a config that already carries
+# the `# lium-hardened` marker), baked so there is no window where sshd runs with password login on.
+RUN sed -i -E 's/^[[:space:]]*(PasswordAuthentication|ChallengeResponseAuthentication|KbdInteractiveAuthentication)[[:space:]]+.*/# lium-disabled &/I' /etc/ssh/sshd_config \
+    && printf '\n# lium-hardened\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\n' >> /etc/ssh/sshd_config
 
 RUN curl -fsSL "${PEAKMINER_URL}" -o /usr/local/bin/peakminer \
     && echo "${PEAKMINER_SHA256}  /usr/local/bin/peakminer" | sha256sum -c - \
