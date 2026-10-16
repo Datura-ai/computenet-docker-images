@@ -11,8 +11,10 @@
 # the template's `smoke` group when it defines one, else the first target of `default` — and the image is booted
 # with its own CMD (its base images are pulled first, 3 tries, each try capped at T_PULL and leftover/tries-left,
 # so a stalled registry dies and later tries still have budget): pod templates (they ship /start.sh) must answer python3; the `pytorch` template must `import torch`; on a GPU host
-# nvidia-smi must list the GPU in every image and torch.cuda must be available where torch imports; templates/<name>/smoke.sh runs inside the container when present. Every step under `timeout`;
-# artifacts/ gets timings.txt and summary.md (the CI job posts it). Exit 0 only when every step passed.
+# nvidia-smi must list the GPU in every image and torch.cuda must be available where torch imports; templates/<name>/smoke.sh runs inside the container when present.
+# A template whose entrypoint exits without a GPU (pearl-miner: exit 1 at its wallet guard, then at "no NVIDIA GPUs visible") declares it in
+# templates/<name>/smoke.gpu: it is still built everywhere, but booted only under E2E_GPU=1 — on a CPU host its boot row reads SKIP, not FAIL. Every step under `timeout`;
+# artifacts/ gets timings.txt and summary.md (the CI job posts it). Exit 0 only when every step passed or was skipped this way.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BASE=${BASE:-origin/master}
@@ -26,6 +28,10 @@ step() {  # step <name> <timeout> <function-or-cmd...>  (functions below are exp
   case $rc in 0) status=pass ;; 124|137) status="TIMEOUT(>$t)" ;; *) status="FAIL(rc=$rc)" ;; esac
   printf '%s\t%ds\t%s\n' "$name" "$((SECONDS - t0))" "$status" >> "$A/timings.txt"
   echo "smoke: $name $status in $((SECONDS - t0))s"; [ $rc -eq 0 ] || FAILED="${FAILED:+$FAILED }$name"; return $rc
+}
+
+skip() {  # skip <name> <reason>: a step this host cannot run gets its own row — neither a pass nor a failure
+  printf '%s\t0s\tSKIP(%s)\n' "$1" "$2" >> "$A/timings.txt"; echo "smoke: $1 SKIP($2)"
 }
 
 changed_templates() {
@@ -169,18 +175,14 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
   # the dolphin filler refuses to run without its API key, and refusing is correct behaviour.
   local env_flag=""
   [ -f "templates/$t/smoke.env" ] && env_flag="--env-file templates/$t/smoke.env"
+  # A DinD pod image ends the pod when its nested dockerd cannot start; rentals run it under sysbox, and
+  # --privileged with /var/lib/docker off the overlay is the runner's stand-in, so the nested daemon really starts.
+  local dind_flags=""
+  grep -qx ENABLE_DIND=true <<< "$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$img")" \
+    && dind_flags="--privileged -v /var/lib/docker"
   # no --rm: a container that dies inside the 5 s wait must still have its logs; the main loop removes `smoke-<template>`
-  # A template whose entrypoint refuses to start without a GPU (the pearl miner exits on "no NVIDIA GPUs
-  # visible", which is correct) ships templates/<t>/smoke.needs-gpu: without E2E_GPU its image is started
-  # on a sleep instead, and its smoke.sh checks what can be checked without a card.
-  local entry_flags=()
-  [ -z "${E2E_GPU:-}" ] && [ -f "templates/$t/smoke.needs-gpu" ] && entry_flags=(--entrypoint sleep)
   docker rm -f "smoke-$t" >/dev/null 2>&1 || true
-  if [ ${#entry_flags[@]} -gt 0 ]; then
-    cid=$(docker run -d $gpu_flags $env_flag "${entry_flags[@]}" --name "smoke-$t" "$img" infinity) || return 1
-  else
-    cid=$(docker run -d $gpu_flags $env_flag --name "smoke-$t" "$img") || return 1
-  fi
+  cid=$(docker run -d $gpu_flags $env_flag $dind_flags --name "smoke-$t" "$img") || return 1
   sleep 5
   docker ps -q --no-trunc | grep -q "$cid" || { echo "container exited within 5 s:"; docker logs "$cid" 2>&1 | tail -20; return 1; }
   local rc=0
@@ -189,6 +191,11 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
   if docker exec "$cid" sh -c 'test -e /start.sh'; then
     docker exec "$cid" sh -c 'command -v python3 >/dev/null && python3 --version' || { echo "pod template without python3"; rc=1; }
     docker exec "$cid" sh -c 'test -d /workspace' || echo "note: no /workspace in the image (start.sh creates it only for Jupyter; the docs point renters at /workspace)"
+    # start.sh adds the RSA host key after sshd is up, for clients that know no other key type. Only templates whose
+    # sshd is up at boot are held to it: better-* run /pre_start.sh's app before SSH setup, vscode ships no sshd.
+    case $t in pytorch|ubuntu)
+      docker exec "$cid" sh -c 'ssh-keyscan -t rsa 127.0.0.1 2>/dev/null | grep -q ssh-rsa' || { echo "sshd offers no RSA host key"; rc=1; } ;;
+    esac
   else
     echo "infrastructure image (no /start.sh): boot check only"
   fi
@@ -198,6 +205,8 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
     docker exec "$cid" python3 -c 'import torch; print("torch", torch.__version__, "cuda build", torch.version.cuda)' || rc=1
     [ -n "${E2E_GPU:-}" ] && { docker exec "$cid" python3 -c 'import torch, sys; ok = torch.cuda.is_available(); print("cuda available", ok, torch.cuda.get_device_name(0) if ok else ""); sys.exit(0 if ok else 1)' || rc=1; }
   elif [ "$t" = pytorch ]; then echo "pytorch image without importable torch"; rc=1; fi
+  # a renter's startup command replaces CMD and may call docker at once: it must find the nested daemon up
+  if [ -n "$dind_flags" ]; then docker run --rm $dind_flags "$img" docker info >/dev/null || { echo "docker info as the container command failed"; rc=1; }; fi
   if [ -f "templates/$t/smoke.sh" ]; then docker cp "templates/$t/smoke.sh" "$cid:/tmp/smoke.sh" && docker exec "$cid" sh /tmp/smoke.sh || { echo "templates/$t/smoke.sh failed"; rc=1; }; fi
   docker stop -t 5 "$cid" >/dev/null 2>&1 || true
   return $rc
@@ -205,7 +214,10 @@ boot_one() {  # <template>: start the image with its own CMD, then look inside
 
 summary() {
   { echo "**image smoke: $([ -z "$FAILED" ] && echo PASS || echo "FAIL ($FAILED)")**"; echo; echo "| step | result | time |"; echo "|---|---|---|"
-    while IFS=$'\t' read -r n s st; do echo "| $n | $([ "$st" = pass ] && echo ✅ || echo ❌) $st | $s |"; done < "$A/timings.txt"; } > "$A/summary.md"
+    while IFS=$'\t' read -r n s st; do
+      case $st in pass) icon=✅ ;; SKIP*) icon=⏭️ ;; *) icon=❌ ;; esac
+      echo "| $n | $icon $st | $s |"
+    done < "$A/timings.txt"; } > "$A/summary.md"
   cat "$A/summary.md"
 }
 
@@ -225,7 +237,14 @@ for t in $TEMPLATES; do
     if [ $# -gt 0 ]; then echo "templates/$t has no docker-bake.hcl"; FAILED="${FAILED:+$FAILED }build-$t"; printf '%s\t0s\tFAIL(no bake file)\n' "build-$t" >> "$A/timings.txt"; else echo "templates/$t has no docker-bake.hcl — skipped"; fi
     continue
   fi
-  step "build-$t" "$T_BUILD" build_one "$t" && step "boot-$t" "$T_BOOT" boot_one "$t"
+  if step "build-$t" "$T_BUILD" build_one "$t"; then
+    if [ -f "templates/$t/smoke.gpu" ] && [ -z "${E2E_GPU:-}" ]; then
+      # GPU-only template on a CPU host: the build is the check; the boot would only prove the entrypoint's guards fire
+      skip "boot-$t" "GPU-only template, boots under E2E_GPU=1"
+    else
+      step "boot-$t" "$T_BOOT" boot_one "$t"
+    fi
+  fi
   docker rm -f "smoke-$t" >/dev/null 2>&1 || true                    # also after a boot timeout, when boot_one never reached docker stop
   docker image rm -f "lium-smoke/$t:latest" >/dev/null 2>&1 || true   # runners have ~14 GB free; one image at a time
 done

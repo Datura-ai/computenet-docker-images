@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs inside the image without a GPU: the baked miner runs, the scripts parse, the sidecar imports.
+# Runs inside the image without a GPU: the baked miner runs, the scripts parse, the sidecar parses.
 set -e
 peakminer --version | grep -q "peakminer ${PEARL_MINER_BAKED_VERSION}"
 bash -n /usr/local/bin/entrypoint.sh

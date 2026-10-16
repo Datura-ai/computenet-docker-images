@@ -1,0 +1,4 @@
+GPU-only: entrypoint.sh exits 1 without a wallet ("PEARL_POOL_WALLET is required") and, with one, without a card
+("no NVIDIA GPUs visible"), so the CPU runner cannot boot this image. scripts/build-smoke.sh builds it everywhere and
+boots it only under E2E_GPU=1 (a GPU host), with smoke.env supplying the wallet. The file's content is not read; its
+presence is the flag.

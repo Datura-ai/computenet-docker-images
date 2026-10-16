@@ -1,1 +1,0 @@
-The entrypoint exits with "no NVIDIA GPUs visible" on a runner without a GPU; build-smoke boots this image on a sleep there and runs smoke.sh.
