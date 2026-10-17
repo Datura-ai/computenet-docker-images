@@ -10,7 +10,7 @@
 #
 # The baked build is the floor every filler starts on: the updater's release lookup is an anonymous
 # GitHub API call, limited per public IP, so a farm behind one address can stay on the baked build.
-# 2.16.4 added Pearl on B300; 2.17.0 is a Pearl hashrate release for every
+# 2.16.4 made Pearl faster on B300; 2.17.0 is a Pearl hashrate release for every
 # card; 2.17.1 makes the CMP HX unlock opt-in (--cmp-unlock), which this image does not pass.
 FROM ubuntu:24.04
 
