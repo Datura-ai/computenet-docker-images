@@ -1,9 +1,9 @@
 variable "VERSION" {
-    default = "0.0.8"
+    default = "0.0.9"
 }
 
 variable "BASE_IMAGE" {
-    default = "daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind"
+    default = "daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind"
 }
 
 target "default" {
