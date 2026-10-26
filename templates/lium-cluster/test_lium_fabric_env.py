@@ -25,6 +25,18 @@ SOFT_ROCE = """hca_id:\trxe0
 \t\t\tGID[  1]:\t\t::ffff:10.0.0.40, RoCE v2
 """
 
+# Measured inside a prod 8x RTX PRO 6000 cluster pod (Intel E810, fw 1.69); GIDs trimmed to the routable one.
+IRDMA_ROCE = """hca_id:\tirdma0
+\t\tport:\t1
+\t\t\tstate:\t\t\tPORT_ACTIVE (4)
+\t\t\tlink_layer:\t\tEthernet
+\t\t\tGID[  1]:\t\t::ffff:154.59.159.72, RoCE v2
+hca_id:\tirdma1
+\t\tport:\t1
+\t\t\tstate:\t\t\tPORT_DOWN (1)
+\t\t\tlink_layer:\t\tEthernet
+"""
+
 MLX5_ROCE = """hca_id:\tmlx5_0
 \t\tport:\t1
 \t\t\tstate:\t\t\tPORT_ACTIVE (4)
@@ -98,6 +110,17 @@ def test_the_gid_index_is_read_not_assumed(devinfo) -> None:
     devinfo(MLX5_ROCE)
 
     assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {"NCCL_IB_HCA": "=mlx5_0:1", "NCCL_IB_GID_INDEX": "3"}
+
+
+def test_an_irdma_fabric_runs_nccl_over_sockets(devinfo) -> None:
+    """irdma completes NCCL's write-with-immediate as a plain receive; NCCL then fails every collective."""
+    devinfo(IRDMA_ROCE)
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {
+        "NCCL_IB_HCA": "=irdma0:1",
+        "NCCL_IB_GID_INDEX": "1",
+        "NCCL_IB_DISABLE": "1",
+    }
 
 
 def test_a_down_port_is_ignored(devinfo) -> None:

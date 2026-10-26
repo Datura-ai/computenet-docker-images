@@ -108,7 +108,7 @@ publish_cluster_env() {
     # that no longer pins a GID index would keep serving the old NCCL_IB_GID_INDEX to SSH sessions.
     local managed=(
         NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_SOCKET_NTHREADS NCCL_NSOCKS_PERTHREAD
-        NCCL_IB_HCA NCCL_IB_GID_INDEX
+        NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_IB_DISABLE
     )
     for name in "${managed[@]}"; do
         sed -i "/^${name}=/d" /etc/environment 2>/dev/null || true
