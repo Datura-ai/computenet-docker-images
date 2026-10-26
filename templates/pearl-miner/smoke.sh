@@ -4,5 +4,7 @@ set -e
 peakminer --version | grep -q "peakminer ${PEARL_MINER_BAKED_VERSION}"
 bash -n /usr/local/bin/entrypoint.sh
 bash -n /usr/local/bin/update_miner.sh
+bash -n /usr/local/bin/prefetch_engy.sh
+hf download --help >/dev/null
 python3 -c "import ast; ast.parse(open('/usr/local/bin/metrics_sidecar.py').read())"
 echo "pearl-miner smoke: peakminer ${PEARL_MINER_BAKED_VERSION}, scripts parse"

@@ -38,10 +38,21 @@ RUN curl -fsSL "${PEAKMINER_URL}" -o /usr/local/bin/peakminer \
     && echo "${PEAKMINER_SHA256}  /usr/local/bin/peakminer" | sha256sum -c - \
     && chmod +x /usr/local/bin/peakminer
 
+# DAH-4300: the Hugging Face CLI for prefetch_engy.sh, in its own venv (Ubuntu's Python is externally managed).
+ARG HUGGINGFACE_HUB_VERSION=0.35.3
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/hf \
+    && /opt/hf/bin/pip install --no-cache-dir "huggingface_hub==${HUGGINGFACE_HUB_VERSION}" \
+    && ln -s /opt/hf/bin/hf /usr/local/bin/hf \
+    && hf download --help >/dev/null
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY update_miner.sh /usr/local/bin/update_miner.sh
 COPY metrics_sidecar.py /usr/local/bin/metrics_sidecar.py
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/update_miner.sh
+COPY prefetch_engy.sh /usr/local/bin/prefetch_engy.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/update_miner.sh /usr/local/bin/prefetch_engy.sh
 
 # The baked-in version is what the entrypoint's updater compares against at start.
 ENV PEARL_MINER_BAKED_VERSION=${PEAKMINER_VERSION} \

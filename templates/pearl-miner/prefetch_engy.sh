@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# DAH-4300: download the Engy checkpoint into the node's Engy cache volume while PEARL mines, so the node can switch
+# to Engy without the download wait. The backend sets both variables only on a node Engy could serve:
+#   PEARL_PREFETCH_HF_REPO  Hugging Face repo of the checkpoint, e.g. moonshotai/Kimi-K3
+#   PEARL_PREFETCH_DIR      where the golden image reads it, /root/models/<model> on the engy_cache_* volume
+# Never fails the container: the miner runs whatever happens here. `hf download` resumes per file, so a run
+# stopped mid-download (a rental, the switch to Engy) continues on the next PEARL start.
+set -uo pipefail
+
+if [[ -z "${PEARL_PREFETCH_HF_REPO:-}" || -z "${PEARL_PREFETCH_DIR:-}" ]]; then
+    exit 0
+fi
+
+# A few download threads: the miner is GPU-bound, this only competes for CPU (and is niced off it).
+max_workers="${PEARL_PREFETCH_MAX_WORKERS:-4}"
+attempts="${PEARL_PREFETCH_ATTEMPTS:-5}"
+retry_delay="${PEARL_PREFETCH_RETRY_DELAY_SECONDS:-60}"
+
+for (( attempt = 1; attempt <= attempts; attempt++ )); do
+    echo "[prefetch] ${PEARL_PREFETCH_HF_REPO} -> ${PEARL_PREFETCH_DIR} (attempt ${attempt}/${attempts})"
+    if nice -n 19 hf download "${PEARL_PREFETCH_HF_REPO}" \
+        --local-dir "${PEARL_PREFETCH_DIR}" --max-workers "${max_workers}"; then
+        echo "[prefetch] done"
+        exit 0
+    fi
+    (( attempt < attempts )) && sleep "${retry_delay}"
+done
+echo "[prefetch] gave up after ${attempts} attempts; the miner keeps running" >&2
+exit 0

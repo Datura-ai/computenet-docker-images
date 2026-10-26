@@ -7,6 +7,7 @@
 #   PEARL_POOL_WALLET    PRL payout address (required)
 #   PEARL_POOL_WORKER    worker name shown in the pool (default: container hostname)
 #   PEARL_POOL_FAILOVER  optional "host:port,host:port" tried in order when the primary is down
+#   PEARL_PREFETCH_HF_REPO, PEARL_PREFETCH_DIR  optional: the Engy checkpoint to download meanwhile (prefetch_engy.sh)
 set -euo pipefail
 
 # Start sshd before the workload. The validator's SSH bootstrap then finds it running and adopts it
@@ -71,6 +72,10 @@ export PATH="${PEARL_MINER_DIR:-/var/lib/pearl/bin}:${PATH}"
 
 LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
 mkdir -p "${LOG_DIR}"
+
+# DAH-4300: download the Engy checkpoint beside the miner when the backend asks for it (PEARL_PREFETCH_*). In the
+# background and never fatal; the final wait is on the miner's PID only.
+"$(dirname "${BASH_SOURCE[0]}")/prefetch_engy.sh" >> "${LOG_DIR}/prefetch.log" 2>&1 &
 
 # One process for every GPU: PeakMiner drives them all itself and reports each card separately in
 # its stats API, so there is nothing left for per-GPU processes to buy. The flip side is that one
