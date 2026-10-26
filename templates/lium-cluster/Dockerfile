@@ -12,7 +12,7 @@
 # daturaai/pytorch is the fleet's recommended image: PyTorch (so torchrun is present), CUDA,
 # nvidia-smi and an inner Docker daemon. The renter runs their own torchrun on top.
 # The CUDA 13.0.2 tag, not cuda12.8: that tag installs cu126 wheels with no kernel past sm_90, so torch
-# fails "no kernel image is available" on B200/B300 (DAH-5141). cu130 carries sm_100 and sm_120.
+# fails "no kernel image is available" on B200/B300. cu130 carries sm_100 and sm_120.
 ARG BASE_IMAGE=daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind
 FROM ${BASE_IMAGE}
 

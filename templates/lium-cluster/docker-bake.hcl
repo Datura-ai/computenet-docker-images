@@ -1,5 +1,5 @@
 variable "VERSION" {
-    default = "0.0.9"
+    default = "0.0.9-cuda13.0"
 }
 
 variable "BASE_IMAGE" {

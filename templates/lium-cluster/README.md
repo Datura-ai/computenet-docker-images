@@ -93,13 +93,13 @@ API on 2026-08-11:
 | `ib_write_bw` pod to pod | 363.68 Gb/sec (host to host baseline: 364.83) |
 | `ib_write_bw` from a nested container with no flags | 366.86 Gb/sec |
 | inner daemon | 27.3.1, `default-runtime=lium-rdma` |
-| 2x B300 (sm_103), torch 2.12.0+cu130 (DAH-5141, 25 Oct 2026) | `world 16` all-reduce, `NET/IB/GDRDMA`; torch +cu126 failed "no kernel image is available" |
+| 2x B300 (sm_103), torch 2.12.0+cu130 (25 Oct 2026) | `world 16` all-reduce, `NET/IB/GDRDMA`; torch +cu126 failed "no kernel image is available" |
 
 ## Build
 
 ```bash
 cd templates/lium-cluster
-VERSION=0.0.9 docker buildx bake --push
+VERSION=0.0.9-cuda13.0 docker buildx bake --push
 ```
 
 `docker-bake.hcl` pins amd64 and the base tag. Bump `VERSION` and the tag in the backend's
