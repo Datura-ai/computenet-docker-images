@@ -163,12 +163,6 @@ def fabric_environment(ports: list[FabricPort]) -> dict[str, str]:
     # index breaks every rail, while NCCL's own v2 detection is at least right on most of them.
     if len(gid_indexes) == 1:
         environment["NCCL_IB_GID_INDEX"] = str(gid_indexes.pop())
-    # Intel irdma reports NCCL's RDMA-write-with-immediate as a plain IBV_WC_RECV (imm_data set), so
-    # NCCL 2.29 fails every collective with "Unknown completion" and a rank can keep a wrong result.
-    # Measured on prod 8x RTX PRO 6000 irdma0 (25G) pairs, 26 Oct 2026: sockets over the overlay
-    # pass. shortcut: sockets for all-irdma rails; re-test RDMA when the image's NCCL or rdma-core moves.
-    if all(rail.startswith("irdma") for rail in rails):
-        environment["NCCL_IB_DISABLE"] = "1"
     return environment
 
 

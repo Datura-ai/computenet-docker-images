@@ -14,6 +14,24 @@
 # The CUDA 13.0.2 tag, not cuda12.8: that tag installs cu126 wheels with no kernel past sm_90, so torch
 # fails "no kernel image is available" on B200/B300. cu130 carries sm_100 and sm_120.
 ARG BASE_IMAGE=daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind
+
+# Ubuntu 24.04 ships rdma-core 50, whose libirdma reports an RDMA write with immediate as a plain
+# receive; NCCL then fails every collective on Intel irdma. The fix landed in rdma-core 52.
+FROM ubuntu:24.04 AS rdma-core
+ARG RDMA_CORE_VERSION=65.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl cmake ninja-build pkg-config gcc libc6-dev \
+        libnl-3-dev libnl-route-3-dev libudev-dev python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://github.com/linux-rdma/rdma-core/releases/download/v${RDMA_CORE_VERSION}/rdma-core-${RDMA_CORE_VERSION}.tar.gz" \
+        | tar -xz -C /tmp \
+    && cmake -S "/tmp/rdma-core-${RDMA_CORE_VERSION}" -B /tmp/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu -DCMAKE_INSTALL_SYSCONFDIR=/etc \
+        -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 -DENABLE_STATIC=0 \
+    && ninja -C /tmp/build \
+    && DESTDIR=/out ninja -C /tmp/build install
+
 FROM ${BASE_IMAGE}
 
 # wireguard-tools brings wg + wg-quick, iproute2 the `ip` this entrypoint needs.
@@ -32,6 +50,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ibverbs-utils \
         perftest \
     && rm -rf /var/lib/apt/lists/*
+
+# Overlays the apt rdma-core above: libibverbs loads only providers built with it, so every one comes along.
+COPY --from=rdma-core /out/usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
+COPY --from=rdma-core /out/usr/bin/ /usr/bin/
+COPY --from=rdma-core /out/etc/libibverbs.d/ /etc/libibverbs.d/
+RUN ldconfig
 
 COPY entrypoint.sh /usr/local/bin/lium-cluster-entrypoint
 COPY lium-rdma-runc.py /usr/local/bin/lium-rdma-runc

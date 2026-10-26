@@ -112,14 +112,13 @@ def test_the_gid_index_is_read_not_assumed(devinfo) -> None:
     assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {"NCCL_IB_HCA": "=mlx5_0:1", "NCCL_IB_GID_INDEX": "3"}
 
 
-def test_an_irdma_fabric_runs_nccl_over_sockets(devinfo) -> None:
-    """irdma completes NCCL's write-with-immediate as a plain receive; NCCL then fails every collective."""
+def test_an_irdma_fabric_keeps_nccl_on_rdma(devinfo) -> None:
+    """irdma runs NCCL over RDMA like mlx5; the image's rdma-core carries the irdma completion fix."""
     devinfo(IRDMA_ROCE)
 
     assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {
         "NCCL_IB_HCA": "=irdma0:1",
         "NCCL_IB_GID_INDEX": "1",
-        "NCCL_IB_DISABLE": "1",
     }
 
 

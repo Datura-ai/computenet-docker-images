@@ -75,9 +75,10 @@ runtime are the same; two things are not.
   InfiniBand host it prints nothing and the behaviour is unchanged: there is one fabric and NCCL
   finds it. Reading only this host is enough because the backend never sells a host whose live RoCE
   ports straddle two segments.
-- **Intel irdma runs NCCL over sockets.** irdma reports NCCL's RDMA-write-with-immediate as a plain
-  receive, so NCCL fails every collective on it. When every live rail is irdma, `lium-fabric-env`
-  also exports `NCCL_IB_DISABLE=1` and NCCL uses the overlay instead.
+- **Intel irdma needs rdma-core 52 or newer.** Older `libirdma` reports NCCL's RDMA write with
+  immediate as a plain receive, and NCCL fails every collective ("Unknown completion"). Ubuntu
+  24.04 ships rdma-core 50, so the image builds rdma-core from source. A renter's own image on an
+  irdma fabric needs rdma-core 52+ too.
 - **A pod without a usable fabric refuses to start.** `lium-fabric-env` is also the gate: it exits
   non-zero when no `PORT_ACTIVE` port answers verbs, and the entrypoint turns that into a refused
   pod. Sysfs alone is not evidence, since `/sys/class/infiniband` is mounted into every container
