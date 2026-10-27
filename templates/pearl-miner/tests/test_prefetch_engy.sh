@@ -24,6 +24,7 @@ make_hf_stub() {
     cat > "${stub_dir}/hf" <<STUB
 #!/usr/bin/env bash
 echo "\$*" >> "${stub_dir}/hf_calls"
+echo "\${HF_XET_HIGH_PERFORMANCE:-}" >> "${stub_dir}/hf_env"
 exit \${HF_STUB_EXIT:-0}
 STUB
     chmod +x "${stub_dir}/hf"
@@ -45,8 +46,9 @@ test_downloads_the_checkpoint_into_the_engy_cache_dir() {
     status="$(run_prefetch "${stub_dir}" PEARL_PREFETCH_HF_REPO=moonshotai/Kimi-K3 PEARL_PREFETCH_DIR=/root/models/kimi-k3)"
 
     check "$([[ "${status}" == "0" ]] && echo pass)" "exits 0 (got ${status})"
-    check "$([[ "$(cat "${stub_dir}/hf_calls")" == "download moonshotai/Kimi-K3 --local-dir /root/models/kimi-k3 --max-workers 4" ]] && echo pass)" \
-        "one hf download of the repo into the dir, 4 workers (got: $(cat "${stub_dir}/hf_calls" 2>/dev/null))"
+    check "$([[ "$(cat "${stub_dir}/hf_calls")" == "download moonshotai/Kimi-K3 --local-dir /root/models/kimi-k3 --max-workers 32" ]] && echo pass)" \
+        "one hf download of the repo into the dir, 32 workers (got: $(cat "${stub_dir}/hf_calls" 2>/dev/null))"
+    check "$([[ "$(cat "${stub_dir}/hf_env")" == "1" ]] && echo pass)" "Xet high-performance mode on"
     rm -rf "${stub_dir}"
 }
 

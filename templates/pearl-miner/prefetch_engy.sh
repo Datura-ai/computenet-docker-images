@@ -11,14 +11,16 @@ if [[ -z "${PEARL_PREFETCH_HF_REPO:-}" || -z "${PEARL_PREFETCH_DIR:-}" ]]; then
     exit 0
 fi
 
-# A few download threads: the miner is GPU-bound, this only competes for CPU (and is niced off it).
-max_workers="${PEARL_PREFETCH_MAX_WORKERS:-4}"
+# As fast as the host allows: the checkpoint is Xet-backed, so hf_xet's high-performance mode plus many files in
+# parallel; no nice, the miner is GPU-bound. On the bb host this was ~2.2x the old 4 workers at nice 19 (cdi#87).
+max_workers="${PEARL_PREFETCH_MAX_WORKERS:-32}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 attempts="${PEARL_PREFETCH_ATTEMPTS:-5}"
 retry_delay="${PEARL_PREFETCH_RETRY_DELAY_SECONDS:-60}"
 
 for (( attempt = 1; attempt <= attempts; attempt++ )); do
     echo "[prefetch] ${PEARL_PREFETCH_HF_REPO} -> ${PEARL_PREFETCH_DIR} (attempt ${attempt}/${attempts})"
-    if nice -n 19 hf download "${PEARL_PREFETCH_HF_REPO}" \
+    if hf download "${PEARL_PREFETCH_HF_REPO}" \
         --local-dir "${PEARL_PREFETCH_DIR}" --max-workers "${max_workers}"; then
         echo "[prefetch] done"
         exit 0
