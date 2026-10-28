@@ -11,6 +11,13 @@ if [[ -z "${PEARL_PREFETCH_HF_REPO:-}" || -z "${PEARL_PREFETCH_DIR:-}" ]]; then
     exit 0
 fi
 
+# The validator may refuse the Engy cache volume; then the parent dir is not mounted and the download would fill
+# the container's small run volume instead.
+if ! mountpoint -q "${PEARL_PREFETCH_DIR%/*}"; then
+    echo "[prefetch] ${PEARL_PREFETCH_DIR%/*} is not mounted; skipping the download"
+    exit 0
+fi
+
 # As fast as the host allows: the checkpoint is Xet-backed, so hf_xet's high-performance mode plus many files in
 # parallel; no nice, the miner is GPU-bound. On the bb host this was ~2.2x the old 4 workers at nice 19 (cdi#87).
 max_workers="${PEARL_PREFETCH_MAX_WORKERS:-32}"

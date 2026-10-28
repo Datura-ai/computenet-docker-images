@@ -18,7 +18,8 @@ check() {
     fi
 }
 
-# A stub `hf` that records its arguments and exits with HF_STUB_EXIT.
+# A stub `hf` that records its arguments and exits with HF_STUB_EXIT, and a stub `mountpoint` that exits with
+# MOUNTPOINT_STUB_EXIT (0 = the Engy cache is mounted).
 make_hf_stub() {
     local stub_dir="$1"
     cat > "${stub_dir}/hf" <<STUB
@@ -27,7 +28,10 @@ echo "\$*" >> "${stub_dir}/hf_calls"
 echo "\${HF_XET_HIGH_PERFORMANCE:-}" >> "${stub_dir}/hf_env"
 exit \${HF_STUB_EXIT:-0}
 STUB
-    chmod +x "${stub_dir}/hf"
+    # shellcheck disable=SC2016  # expanded by the stub, not here
+    printf '#!/usr/bin/env bash\necho "$*" >> "%s/mountpoint_calls"\nexit ${MOUNTPOINT_STUB_EXIT:-0}\n' "${stub_dir}" \
+        > "${stub_dir}/mountpoint"
+    chmod +x "${stub_dir}/hf" "${stub_dir}/mountpoint"
 }
 
 run_prefetch() {
@@ -61,6 +65,21 @@ test_does_nothing_without_a_request() {
 
     check "$([[ "${status}" == "0" ]] && echo pass)" "exits 0 (got ${status})"
     check "$([[ ! -f "${stub_dir}/hf_calls" ]] && echo pass)" "hf is never called without a repo"
+    rm -rf "${stub_dir}"
+}
+
+test_skips_the_download_when_the_cache_is_not_mounted() {
+    echo "Engy cache refused by the validator"
+    local stub_dir status
+    stub_dir="$(mktemp -d)"
+    make_hf_stub "${stub_dir}"
+    status="$(run_prefetch "${stub_dir}" MOUNTPOINT_STUB_EXIT=1 \
+        PEARL_PREFETCH_HF_REPO=moonshotai/Kimi-K3 PEARL_PREFETCH_DIR=/root/models/kimi-k3)"
+
+    check "$([[ "${status}" == "0" ]] && echo pass)" "exits 0 (got ${status})"
+    check "$([[ "$(cat "${stub_dir}/mountpoint_calls")" == "-q /root/models" ]] && echo pass)" "checks /root/models is a mount"
+    check "$([[ ! -f "${stub_dir}/hf_calls" ]] && echo pass)" "hf is never called without the mount"
+    check "$(grep -q "not mounted" "${stub_dir}/out" && echo pass)" "the skip is logged"
     rm -rf "${stub_dir}"
 }
 
@@ -112,6 +131,7 @@ test_the_entrypoint_prefetches_beside_the_miner() {
 
 test_downloads_the_checkpoint_into_the_engy_cache_dir
 test_does_nothing_without_a_request
+test_skips_the_download_when_the_cache_is_not_mounted
 test_a_failing_download_is_retried_then_given_up_without_failing
 test_the_entrypoint_prefetches_beside_the_miner
 
