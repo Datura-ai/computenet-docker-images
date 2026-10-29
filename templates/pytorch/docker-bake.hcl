@@ -236,7 +236,7 @@ target "_lium-base-2120-cu126" {
         scripts = "../../scripts"
     }
     args = {
-        BASE_IMAGE = "daturaai/dind:0.0.2"
+        BASE_IMAGE = "daturaai/dind:0.0.3"  # iptables-nft (DAH-2856): the inner dockerd starts on nftables-only hosts
         PYTHON_VERSION = "3.12"
         ENABLE_DIND = "true"
         DOCKER_VERSION = "27.3.1"
@@ -760,7 +760,7 @@ target "2120-py312-cuda126-devel-ubuntu2404-dind" {
         scripts = "../../scripts"
     }
     args = {
-        BASE_IMAGE = "daturaai/dind:0.0.2"
+        BASE_IMAGE = "daturaai/dind:0.0.3"  # iptables-nft (DAH-2856): the inner dockerd starts on nftables-only hosts
         PYTHON_VERSION = "3.12"
         ENABLE_DIND = "true"
         DOCKER_VERSION = "27.3.1"
