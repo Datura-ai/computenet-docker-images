@@ -167,6 +167,7 @@ group "lium" {
     targets = [
         "2120-py312-cuda1302-devel-ubuntu2404-dind-lium1",
         "2110-py312-cuda128-devel-ubuntu2404-dind-lium1",
+        "2120-py312-cuda126-devel-ubuntu2404-dind-lium1",
     ]
 }
 
@@ -226,6 +227,36 @@ target "2110-py312-cuda128-devel-ubuntu2404-dind-lium1" {
     args = {
         CUDA_TOOLKIT_VERSION = "12-8"
         LIUM_IMAGE_TAG = "2.11.0-py3.12-cuda12.8-devel-ubuntu24.04-dind-lium1"
+    }
+}
+
+target "_lium-base-2120-cu126" {
+    dockerfile = "Dockerfile"
+    contexts = {
+        scripts = "../../scripts"
+    }
+    args = {
+        BASE_IMAGE = "daturaai/dind:0.0.3"  # iptables-nft (DAH-2856): the inner dockerd starts on nftables-only hosts
+        PYTHON_VERSION = "3.12"
+        ENABLE_DIND = "true"
+        DOCKER_VERSION = "27.3.1"
+        TORCH = "torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu126"
+    }
+}
+
+# Volta/Pascal/Maxwell image (Tesla V100 sm_70, P100/P40, M40). cu128 and cu130 wheels start at
+# sm_75, so torch on the two images above fails every kernel on a V100 ("no kernel image is
+# available"). cu126 is the only wheel index that still ships sm_50/sm_60/sm_70 (pytorch
+# .ci/manywheel/build_cuda.sh); nvcc 12.6 matches the wheels.
+target "2120-py312-cuda126-devel-ubuntu2404-dind-lium1" {
+    dockerfile = "Dockerfile.lium"
+    tags = ["${PUBLISHER}/pytorch:2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind-lium1"]
+    contexts = {
+        base = "target:_lium-base-2120-cu126"
+    }
+    args = {
+        CUDA_TOOLKIT_VERSION = "12-6"
+        LIUM_IMAGE_TAG = "2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind-lium1"
     }
 }
 
@@ -729,7 +760,7 @@ target "2120-py312-cuda126-devel-ubuntu2404-dind" {
         scripts = "../../scripts"
     }
     args = {
-        BASE_IMAGE = "daturaai/dind:0.0.2"
+        BASE_IMAGE = "daturaai/dind:0.0.3"  # iptables-nft (DAH-2856): the inner dockerd starts on nftables-only hosts
         PYTHON_VERSION = "3.12"
         ENABLE_DIND = "true"
         DOCKER_VERSION = "27.3.1"
