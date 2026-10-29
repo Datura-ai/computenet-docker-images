@@ -104,7 +104,12 @@ API on 2026-08-11:
 ```bash
 cd templates/lium-cluster
 VERSION=0.0.10-cuda13.0 docker buildx bake --push
+# V100 (sm_70) fabrics, after daturaai/pytorch:2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind-lium1 is pushed
+docker buildx bake --push cuda126
 ```
+
+The backend runs the first official cluster tag that every member's GPU and driver can run: cuda13.0 first,
+cuda12.6 where torch cu130 has no kernels (V100) or the driver predates CUDA 13.0.
 
 `docker-bake.hcl` pins amd64 and the base tag. Bump `VERSION` and the tag in the backend's
 `official_templates` (`apps/server/src/core/constants.py`) together — the template row is what
