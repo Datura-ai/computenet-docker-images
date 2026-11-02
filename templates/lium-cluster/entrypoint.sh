@@ -281,6 +281,21 @@ with open(CONFIG_PATH, "w") as handle:
 PY
 }
 
+# dind:0.0.2 pins iptables-legacy, and a kernel without ip_tables (Debian 12+ hosts, the 7.0 CI runner) has no legacy
+# nat table, so the inner dockerd died at `iptables -t nat -N DOCKER`. Take whichever backend can open nat (DAH-2856).
+select_iptables_backend() {
+    local backend
+    for backend in nft legacy; do
+        if iptables-$backend -t nat -L -n >/dev/null 2>&1; then
+            update-alternatives --set iptables /usr/sbin/iptables-$backend >/dev/null 2>&1 || true
+            update-alternatives --set ip6tables /usr/sbin/ip6tables-$backend >/dev/null 2>&1 || true
+            return 0
+        fi
+    done
+}
+
+# also here: a base image published before its /pytorch-entrypoint.sh did this still pins legacy
+select_iptables_backend
 raise_cluster_overlay
 install_cluster_ssh_identity
 check_cluster_ssh_peers

@@ -3,6 +3,19 @@ set -e
 
 CONTAINERD_SOCKET=/var/run/docker/containerd/containerd.sock
 
+# dind:0.0.2 pins iptables-legacy, and a kernel without ip_tables (Debian 12+ hosts, the 7.0 CI runner) has no legacy
+# nat table, so the inner dockerd died at `iptables -t nat -N DOCKER`. Take whichever backend can open nat (DAH-2856).
+select_iptables_backend() {
+    local backend
+    for backend in nft legacy; do
+        if iptables-$backend -t nat -L -n >/dev/null 2>&1; then
+            update-alternatives --set iptables /usr/sbin/iptables-$backend >/dev/null 2>&1 || true
+            update-alternatives --set ip6tables /usr/sbin/ip6tables-$backend >/dev/null 2>&1 || true
+            return 0
+        fi
+    done
+}
+
 # Starts the nested containerd and dockerd and waits until dockerd answers.
 # Returns non-zero when the NVIDIA setup fails or dockerd never answers.
 start_docker() {
@@ -14,6 +27,7 @@ start_docker() {
     # (DAH-2341). A stale containerd socket refuses dockerd's first dial, and
     # gRPC then waits out its 1 s backoff before the next one.
     rm -f /var/run/docker.pid "$CONTAINERD_SOCKET"
+    select_iptables_backend
     echo "Starting Docker daemon..."
     # containerd is started here rather than by dockerd: dockerd dials the
     # containerd it starts itself before its socket exists and retries after

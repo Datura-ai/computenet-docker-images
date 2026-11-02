@@ -51,8 +51,9 @@ In images built from this revision (earlier ones leave `containerd` to `dockerd`
 | --- | --- | --- | --- |
 | `2120-py312-cuda1302-devel-ubuntu2404-dind-lium1` | `daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind-lium1` | 2.12.0+cu130 | 13.0 |
 | `2110-py312-cuda128-devel-ubuntu2404-dind-lium1` | `daturaai/pytorch:2.11.0-py3.12-cuda12.8-devel-ubuntu24.04-dind-lium1` | 2.11.0+cu128 | 12.8 |
+| `2120-py312-cuda126-devel-ubuntu2404-dind-lium1` | `daturaai/pytorch:2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind-lium1` | 2.12.0+cu126 | 12.6 |
 
-These are the DinD images above plus what a rental is missing on day one. Each is built in two stages: an untagged intermediate from the regular `Dockerfile` (the same arguments as the matching `-dind` target; the 12.8 slot switches to the cu128 wheel index because cu126 wheels have no `sm_100`/`sm_120` kernels and there is no 2.12.x cu128 wheel), then `Dockerfile.lium`, which runs `lium/install.sh` once on top:
+These are the DinD images above plus what a rental is missing on day one. Each is built in two stages: an untagged intermediate from the regular `Dockerfile` (the same arguments as the matching `-dind` target; the 12.8 slot switches to the cu128 wheel index because cu126 wheels have no `sm_100`/`sm_120` kernels and there is no 2.12.x cu128 wheel; the 12.6 slot is for Volta, Pascal and Maxwell, because cu126 is the only wheel index with `sm_70`/`sm_60`/`sm_50` kernels), then `Dockerfile.lium`, which runs `lium/install.sh` once on top:
 
 - a CUDA toolkit matching the wheels (`nvcc`, runtime/driver/NVRTC headers, cuBLAS/cuSPARSE/cuSOLVER/cuRAND/cuFFT dev packages, NVTX, profiler API) from NVIDIA's apt repo, `/usr/local/cuda`, `CUDA_HOME`; static archives other than cudart's are removed;
 - `ffmpeg`, `tesseract-ocr`, `git-lfs`, `cmake`, `ninja-build`, `nvtop`, the headless-render libraries Blender needs; `uv`, `huggingface_hub[cli]`, `hf_transfer`;
