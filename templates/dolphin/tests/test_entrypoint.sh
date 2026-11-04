@@ -173,6 +173,15 @@ test_plan() {
     mock_nvidia_smi "0:97887" "1:97887" "2:97887"
     assert_eq "3x96GB gives each card its own worker" "0|1|2" "$(plan_as_line)"
 
+    # DAH-5697: DeepSeek V4.1 Flash is one worker on the whole node, with its own disk floor
+    mock_nvidia_smi "0:184320" "1:184320" "2:184320" "3:184320" "4:184320" "5:184320" "6:184320" "7:184320"
+    read -r MODEL_ONE_WORKER MODEL_DOWNLOAD_FLOOR_GB < <(model_floors "deepseek-ai/DeepSeek-V4.1-Flash")
+    assert_eq "8xB200 on DeepSeek V4.1 Flash keeps one all-GPUs worker" "all" "$(plan_as_line)"
+    assert_eq "DeepSeek V4.1 Flash disk floor" "600" "${MODEL_DOWNLOAD_FLOOR_GB}"
+    read -r MODEL_ONE_WORKER MODEL_DOWNLOAD_FLOOR_GB < <(model_floors "auto")
+    assert_eq "auto keeps the split" "0|1|2|3|4|5|6|7" "$(plan_as_line)"
+    assert_eq "auto keeps the 60 GB disk floor" "60" "${MODEL_DOWNLOAD_FLOOR_GB}"
+
     DOLPHIN_GPU_IDS="0,1"
     mock_nvidia_smi "0:97887" "1:97887" "2:97887"
     assert_eq "explicit DOLPHIN_GPU_IDS wins over split" "0,1" "$(plan_as_line)"

@@ -135,7 +135,17 @@ WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.jso
 # EXECUTORS_FILTER_MIN_GB, which is 50 in prod and 15 on staging — so DPHN is admitted at 130 GB free
 # in prod and 95 GB on staging, NOT the 180 the code default suggests. 60 clears the ~40 GB the pull
 # needs and still stops a node that genuinely cannot take it.
-DOWNLOAD_FLOOR_GB="${DOLPHIN_DOWNLOAD_FLOOR_GB:-60}"
+# DAH-5697: the floors follow the model. DeepSeek V4.1 Flash (~510 GB weights, ~600 GB VRAM) runs as
+# ONE worker on the whole node, as Dolphin asks; a split bundle cannot hold it and would crash-loop.
+# Prints "<one_worker 0|1> <download floor GB>". "auto" (Dolphin picks) keeps the split defaults.
+model_floors() {
+    case "${1,,}" in
+        *deepseek-v4.1-flash*) echo "1 600" ;;
+        *) echo "0 60" ;;
+    esac
+}
+read -r MODEL_ONE_WORKER MODEL_DOWNLOAD_FLOOR_GB < <(model_floors "${MODEL}")
+DOWNLOAD_FLOOR_GB="${DOLPHIN_DOWNLOAD_FLOOR_GB:-${MODEL_DOWNLOAD_FLOOR_GB}}"
 DOWNLOAD_FLOOR_RECHECK_SECONDS=300
 
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
@@ -207,7 +217,7 @@ plan_worker_gpu_sets() {
     fi
     local worker_per_gpu="${DOLPHIN_WORKER_PER_GPU:-1}"
     local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-71680}"
-    if [[ "${worker_per_gpu}" != "1" ]]; then
+    if [[ "${worker_per_gpu}" != "1" || "${MODEL_ONE_WORKER}" == "1" ]]; then
         echo "all"
         return
     fi
