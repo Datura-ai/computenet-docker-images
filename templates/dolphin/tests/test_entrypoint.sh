@@ -175,12 +175,12 @@ test_plan() {
 
     # DAH-5697: DeepSeek V4.1 Flash is one worker on the whole node, with its own disk floor
     mock_nvidia_smi "0:184320" "1:184320" "2:184320" "3:184320" "4:184320" "5:184320" "6:184320" "7:184320"
-    read -r MODEL_ONE_WORKER MODEL_DOWNLOAD_FLOOR_GB < <(model_floors "deepseek-ai/DeepSeek-V4.1-Flash")
+    read -r MODEL_RUNS_ONE_WORKER_PER_NODE MODEL_WEIGHTS_GB < <(model_floors "deepseek-ai/DeepSeek-V4.1-Flash")
     assert_eq "8xB200 on DeepSeek V4.1 Flash keeps one all-GPUs worker" "all" "$(plan_as_line)"
-    assert_eq "DeepSeek V4.1 Flash disk floor" "600" "${MODEL_DOWNLOAD_FLOOR_GB}"
-    read -r MODEL_ONE_WORKER MODEL_DOWNLOAD_FLOOR_GB < <(model_floors "auto")
+    assert_eq "DeepSeek V4.1 Flash weights size" "510" "${MODEL_WEIGHTS_GB}"
+    read -r MODEL_RUNS_ONE_WORKER_PER_NODE MODEL_WEIGHTS_GB < <(model_floors "auto")
     assert_eq "auto keeps the split" "0|1|2|3|4|5|6|7" "$(plan_as_line)"
-    assert_eq "auto keeps the 60 GB disk floor" "60" "${MODEL_DOWNLOAD_FLOOR_GB}"
+    assert_eq "auto has no known weights size" "0" "${MODEL_WEIGHTS_GB}"
 
     DOLPHIN_GPU_IDS="0,1"
     mock_nvidia_smi "0:97887" "1:97887" "2:97887"
@@ -1697,6 +1697,31 @@ test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete() {
         "$(download_floor_blocks_spawn && echo yes || echo no)"
 }
 
+# DAH-5697: a model of known size needs only the bytes still missing plus the margin, so a half-landed
+# copy is finished instead of parked behind a floor above what is left to fetch.
+test_download_floor_is_the_missing_bytes_plus_a_margin() {
+    make_sandbox
+    load_entrypoint
+    assert_eq "an unknown size keeps the flat floor" "60" "$(download_floor_gb)"
+
+    MODEL_WEIGHTS_GB=510
+    assert_eq "nothing cached needs the whole model plus the margin" "570" "$(download_floor_gb)"
+    mkdir -p "${SHARED_CACHE}/dolphinpod-worker/cache/hub/$(hf_cache_dir_name "${MODEL}")"
+    printf '#!/usr/bin/env bash\necho "%s\t$2"\n' "$(( 400 * 1048576 ))" >"${SANDBOX}/bin/du"
+    chmod +x "${SANDBOX}/bin/du"
+    assert_eq "400 GB landed needs the 110 GB left plus the margin" "170" "$(download_floor_gb)"
+    mock_df_free_gb 200
+    assert_eq "a half-landed copy with room for the rest is not parked" "no" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+    mock_df_free_gb 100
+    assert_eq "a half-landed copy without room for the rest is parked" "yes" \
+        "$(download_floor_blocks_spawn && echo yes || echo no)"
+
+    DOLPHIN_DOWNLOAD_FLOOR_GB=42
+    assert_eq "the env override wins" "42" "$(download_floor_gb)"
+    unset DOLPHIN_DOWNLOAD_FLOOR_GB
+}
+
 # sshd comes up before the workload, under the lock the validator's SSH bootstrap shares, and a
 # failed start is reported to the caller instead of stopping anything.
 test_start_sshd_takes_the_shared_lock_and_survives_a_failed_start() {
@@ -1776,6 +1801,7 @@ test_backoff_counts_a_long_dead_download_as_failed
 test_respawns_are_staggered
 test_worker_logs_are_per_container_and_pruned
 test_download_floor_blocks_a_spawn_only_when_the_cache_is_incomplete
+test_download_floor_is_the_missing_bytes_plus_a_margin
 test_binary_download_asks_curl_to_retry_within_time_bounds
 
 if [[ ${FAILURES} -gt 0 ]]; then

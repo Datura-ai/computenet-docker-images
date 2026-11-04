@@ -46,7 +46,7 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
 | `DOLPHIN_WORKER_PER_GPU` | no    | `1`                              | `0` forces the single all-GPUs worker — the exact pre-split behavior. |
 | `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                        | VRAM floor one worker's bundle must clear (the full model needs ~70 GB). Each worker gets the smallest card group above it. |
-| `DOLPHIN_DOWNLOAD_FLOOR_GB` | no | from the model (`60`; `600` for DeepSeek V4.1 Flash) | Free disk below which no worker starts while the model cache is incomplete. |
+| `DOLPHIN_DOWNLOAD_FLOOR_GB` | no | `60`, or for DeepSeek V4.1 Flash the GB still missing + `60` | Free disk below which no worker starts while the model cache is incomplete. |
 | `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                      | Delay between initial worker spawns, once the shared cache is seeded. |
 | `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. `0` = no wait, plain stagger. |
 | `DOLPHIN_WEIGHTS_FETCH_ENABLED` | no | `1`                        | `0` turns off the entrypoint's own background fetch of the weights (below); the engine is then the only downloader. |
