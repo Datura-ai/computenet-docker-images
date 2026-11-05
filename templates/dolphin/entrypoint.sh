@@ -135,7 +135,40 @@ WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.jso
 # EXECUTORS_FILTER_MIN_GB, which is 50 in prod and 15 on staging — so DPHN is admitted at 130 GB free
 # in prod and 95 GB on staging, NOT the 180 the code default suggests. 60 clears the ~40 GB the pull
 # needs and still stops a node that genuinely cannot take it.
-DOWNLOAD_FLOOR_GB="${DOLPHIN_DOWNLOAD_FLOOR_GB:-60}"
+# DAH-5697: the floors follow the model. DeepSeek V4.1 Flash (~510 GB weights, ~600 GB VRAM) runs as
+# ONE worker on the whole node, as Dolphin asks; a split bundle cannot hold it and would crash-loop.
+# Prints "<one worker per node 0|1> <weights GB, 0 = unknown>". "auto" (Dolphin picks) keeps the split.
+model_floors() {
+    case "${1,,}" in
+        *deepseek-v4.1-flash*) echo "1 510" ;;
+        *) echo "0 0" ;;
+    esac
+}
+read -r MODEL_RUNS_ONE_WORKER_PER_NODE MODEL_WEIGHTS_GB < <(model_floors "${MODEL}")
+DOWNLOAD_FLOOR_MARGIN_GB=60
+
+# The free disk a download still needs. For a model of known size that is the bytes not yet on disk
+# plus the margin, so a half-landed 510 GB copy is finished instead of parked behind a flat floor
+# above what is left to fetch. Otherwise the flat 60 GB.
+download_floor_gb() {
+    local cached_kb=0 kb repo_dir missing_gb
+    if [[ -n "${DOLPHIN_DOWNLOAD_FLOOR_GB:-}" ]]; then
+        echo "${DOLPHIN_DOWNLOAD_FLOOR_GB}"
+        return
+    fi
+    if (( MODEL_WEIGHTS_GB == 0 )); then
+        echo "${DOWNLOAD_FLOOR_MARGIN_GB}"
+        return
+    fi
+    # The largest copy is the one the download continues; blobs hold partial files too.
+    while read -r repo_dir; do
+        kb="$(du -sk "${repo_dir}" 2>/dev/null | awk '{ print $1 }')"
+        (( ${kb:-0} > cached_kb )) && cached_kb="${kb}"
+    done < <(model_cache_repo_dirs)
+    missing_gb=$(( MODEL_WEIGHTS_GB - cached_kb / 1048576 ))
+    (( missing_gb < 0 )) && missing_gb=0
+    echo $(( missing_gb + DOWNLOAD_FLOOR_MARGIN_GB ))
+}
 DOWNLOAD_FLOOR_RECHECK_SECONDS=300
 
 # DAH-2475: DOLPHIN_HOME is a cache volume shared by every filler container on the node AND by
@@ -207,7 +240,7 @@ plan_worker_gpu_sets() {
     fi
     local worker_per_gpu="${DOLPHIN_WORKER_PER_GPU:-1}"
     local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-71680}"
-    if [[ "${worker_per_gpu}" != "1" ]]; then
+    if [[ "${worker_per_gpu}" != "1" || "${MODEL_RUNS_ONE_WORKER_PER_NODE}" == "1" ]]; then
         echo "all"
         return
     fi
@@ -855,7 +888,7 @@ hf_cache_is_engine_ready() {
             # fetch kilobytes, but "should" is what fills a disk, and a full shared volume takes
             # every filler container on the node down with it.
             free_gb="$(free_gb_on_shared_cache)"
-            if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
+            if [[ -n "${free_gb}" ]] && (( free_gb < $(download_floor_gb) )); then
                 echo "[dolphin] only ${free_gb} GB free; not fetching what the HF library misses, so offline mode stays off" >&2
                 ready=0
                 continue
@@ -1168,7 +1201,7 @@ ensure_weights_fetch() {
             # DAH-2805: a download that fills the shared volume takes every filler on the node down.
             # Said once per retry time, not once per cycle.
             free_gb="$(free_gb_on_shared_cache)"
-            if [[ -n "${free_gb}" ]] && (( free_gb < DOWNLOAD_FLOOR_GB )); then
+            if [[ -n "${free_gb}" ]] && (( free_gb < $(download_floor_gb) )); then
                 echo "[dolphin] only ${free_gb} GB free; not fetching ${model}@${revision:0:12} for ${WEIGHTS_FETCH_RETRY_SECONDS}s" >&2
                 defer_weights_fetch "${model}" "${revision}"
                 continue
@@ -1195,7 +1228,7 @@ download_floor_blocks_spawn() {
     local free_gb
     free_gb="$(free_gb_on_shared_cache)"
     [[ -n "${free_gb}" ]] || return 1
-    (( free_gb >= DOWNLOAD_FLOOR_GB )) && return 1
+    (( free_gb >= $(download_floor_gb) )) && return 1
     ! model_cache_has_a_complete_copy
 }
 
@@ -1304,7 +1337,7 @@ spawn_all_instances() {
     # node whose garbage is collected starts on its own, with no human and no container restart.
     while download_floor_blocks_spawn; do
         echo "[dolphin] only $(free_gb_on_shared_cache) GB free and the model cache is incomplete;" \
-            "not starting a worker until there is ${DOWNLOAD_FLOOR_GB} GB" >&2
+            "not starting a worker until there is $(download_floor_gb) GB" >&2
         interruptible_sleep "${DOWNLOAD_FLOOR_RECHECK_SECONDS}"
     done
     for i in "${!GPU_SETS[@]}"; do
