@@ -16,12 +16,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ibverbs-providers \
         ibverbs-utils \
         perftest \
+        libfabric1 \
+        libfabric-bin \
     && rm -rf /var/lib/apt/lists/*
 
 # The build context is the templates directory, so this image takes the cluster image's OWN copy
 # of the fabric reader instead of a second one that could drift from it.
 COPY lium-cluster/lium-fabric-env.py /usr/local/bin/lium-fabric-env
 COPY lium-rdma-probe/lium-roce-probe.sh /usr/local/bin/lium-roce-probe
-RUN chmod +x /usr/local/bin/lium-fabric-env /usr/local/bin/lium-roce-probe
+# DAH-5932: the AWS EFA counterpart. Ubuntu's libfabric carries the efa provider (it links libefa).
+COPY lium-rdma-probe/lium-efa-probe.sh /usr/local/bin/lium-efa-probe
+RUN chmod +x /usr/local/bin/lium-fabric-env /usr/local/bin/lium-roce-probe /usr/local/bin/lium-efa-probe
 
 ENTRYPOINT ["/usr/local/bin/lium-roce-probe"]

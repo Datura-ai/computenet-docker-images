@@ -12,11 +12,11 @@ The validator runs it on both hosts of a candidate pair while both are free:
 ```bash
 # on the host that listens
 docker run --rm --network host --device /dev/infiniband \
-    --cap-add IPC_LOCK --ulimit memlock=-1:-1 daturaai/lium-rdma-probe:0.0.1 \
+    --cap-add IPC_LOCK --ulimit memlock=-1:-1 daturaai/lium-rdma-probe:0.0.2 \
     server 18515 1000
 # on the other host
 docker run --rm --network host --device /dev/infiniband \
-    --cap-add IPC_LOCK --ulimit memlock=-1:-1 daturaai/lium-rdma-probe:0.0.1 \
+    --cap-add IPC_LOCK --ulimit memlock=-1:-1 daturaai/lium-rdma-probe:0.0.2 \
     client 18515 1000 172.16.5.6
 ```
 
@@ -31,6 +31,24 @@ all, in well under a second, because a validator cycle has seconds for it. The c
 The rail and GID come from `lium-fabric-env`, the cluster image's own script, taken from
 `../lium-cluster` at build time. So the probe measures the exact wire a rental would use, and the
 two can never drift apart.
+
+## AWS EFA
+
+EFA has no subnet manager and no IP segment, so nothing but a transfer says which hosts share one.
+`lium-efa-probe` runs `fi_pingpong` over the libfabric `efa` provider (reliable datagrams, the
+path NCCL takes over EFA). The handshake uses the host's own IPv4, which `address` prints:
+
+```bash
+docker run --rm --network host --device /dev/infiniband \
+    --cap-add IPC_LOCK --ulimit memlock=-1:-1 --entrypoint lium-efa-probe \
+    daturaai/lium-rdma-probe:0.0.2 address
+docker run --rm --network host --device /dev/infiniband \
+    --cap-add IPC_LOCK --ulimit memlock=-1:-1 --entrypoint lium-efa-probe \
+    daturaai/lium-rdma-probe:0.0.2 server 18515 1000
+docker run --rm --network host --device /dev/infiniband \
+    --cap-add IPC_LOCK --ulimit memlock=-1:-1 --entrypoint lium-efa-probe \
+    daturaai/lium-rdma-probe:0.0.2 client 18515 1000 10.0.1.12
+```
 
 Build:
 
