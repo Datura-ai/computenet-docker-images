@@ -45,7 +45,7 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
 | `DOLPHIN_WORKER_PER_GPU` | no    | `1`                              | `0` forces the single all-GPUs worker — the exact pre-split behavior. |
-| `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `71680`                        | VRAM floor one worker's bundle must clear (the full model needs ~70 GB). Each worker gets the smallest card group above it. |
+| `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `40960`                        | VRAM floor one worker's bundle must clear (40 GB; Gemma-4 fits one 48 GB card). Each worker gets the smallest card group above it. |
 | `DOLPHIN_DOWNLOAD_FLOOR_GB` | no | `60`, or for DeepSeek V4.1 Flash the GB still missing + `60` | Free disk below which no worker starts while the model cache is incomplete. |
 | `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                      | Delay between initial worker spawns, once the shared cache is seeded. |
 | `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. `0` = no wait, plain stagger. |
@@ -87,14 +87,14 @@ Dolphin pays for) scale with KV cache. Measured on prod: an 8x RTX PRO 6000 sing
 reports 317 slots at ~13% VRAM per GPU, while a 1x worker on the same card reports 72 slots at
 ~70%. More workers recover the lost concurrency.
 
-The plan gives each worker the smallest card group that clears the 70 GB floor:
+The plan gives each worker the smallest card group that clears the 40 GB floor:
 
 | node | bundles | workers |
 |---|---|---|
 | 8x 96 GB (RTX PRO 6000) | one card each | 8 |
-| 8x 48 GB (L40S) | pairs | 4 |
-| 8x 32 GB (RTX 5090) | quads | 2 |
-| 2x 48 GB | one bundle = whole node | 1 (all-GPUs worker) |
+| 8x 48 GB (L40S) | one card each | 8 |
+| 8x 32 GB (RTX 5090) | pairs | 4 |
+| 2x 32 GB | one bundle = whole node | 1 (all-GPUs worker) |
 | 1 GPU, mixed VRAM below the floor, or `nvidia-smi` failure | — | 1 (all-GPUs worker) |
 
 Escape hatches: `DOLPHIN_GPU_IDS` (explicit pinning) and `DOLPHIN_WORKER_PER_GPU=0` both force
@@ -120,8 +120,7 @@ Within a bundle the worker auto-scales to the cards it was given; with a single 
 every GPU on the node (`gpu_ids: null`). On a Lium executor the filler already gets all the
 node's free GPUs.
 
-**Which nodes are eligible** — the 70 GB VRAM floor (summed across the node's GPUs; Dolphin's stated
-requirement, dphn.ai docs) and the A100 exclusion (Ampere, can't boot NVFP4) — is decided by
+**Which nodes are eligible** — the 40 GB VRAM floor (summed across the node's GPUs) and the A100 exclusion (Ampere, can't boot NVFP4) — is decided by
 the **scheduler**, not this image: see the DPHN strategy gate in the platform backend.
 
 ## Payouts
