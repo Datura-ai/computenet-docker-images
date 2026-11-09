@@ -8,7 +8,8 @@ importing the functions. The payload below is a real /summary response captured 
 
 Covered: auth, per-GPU hashrate and share counts, a card reported at zero counting as not mining,
 the accepted-share age that makes rejected work visible, a miner whose API is gone answering 503,
-and the /logs tail.
+and the /logs tail. DAH-6084: per-GPU power from a stub nvidia-smi (a card reporting [N/A] is left out), and the
+WildRig benchmark build reading WildRig's stats document.
 """
 
 import http.server
@@ -63,6 +64,25 @@ def summary_payload() -> dict:
     }
 
 
+def wildrig_payload() -> dict:
+    """WildRig's stats document, in the fields its own HiveOS h-stats.sh reads: two cards, one hashing."""
+    return {
+        "version": "0.51.9",
+        "algo": "pearlhash",
+        "uptime": 600,
+        "hashrate": {"total": [70.0e12, 69.0e12, 68.0e12], "threads": [[70.0e12, 69.0e12], [0.0, 0.0]]},
+        "results": {"shares_good": 9, "shares_total": 11},
+        "connection": {"pool": "prl.kryptex.network:7048", "uptime": 590},
+    }
+
+
+# GPU 0 under our 210 W cap, GPU 1 a card that reports no draw (left out, never read as 0 W).
+NVIDIA_SMI_STUB: str = """#!/bin/sh
+echo "0, 205.50, 210.00"
+echo "1, [N/A], [N/A]"
+"""
+
+
 class MinerApiHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -70,7 +90,7 @@ class MinerApiHandler(http.server.BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:  # noqa: N802
-        body: bytes = json.dumps(summary_payload()).encode()
+        body: bytes = json.dumps(wildrig_payload() if self.path == "/" else summary_payload()).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -95,14 +115,20 @@ def sample(body: str, name: str) -> float | None:
     return None
 
 
-def start_sidecar(log_dir: str, gpu_count: str) -> subprocess.Popen:
+def start_sidecar(log_dir: str, gpu_count: str, miner: str = "peakminer") -> subprocess.Popen:
+    stub_dir: str = tempfile.mkdtemp()
+    stub: pathlib.Path = pathlib.Path(stub_dir) / "nvidia-smi"
+    stub.write_text(NVIDIA_SMI_STUB)
+    stub.chmod(0o755)
     environment: dict[str, str] = {
         **os.environ,
+        "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+        "PEARL_MINER": miner,
         "METRICS_TOKEN": TOKEN,
         "METRICS_PORT": str(PORT),
         "PEARL_LOG_DIR": log_dir,
         "PEARL_GPU_COUNT": gpu_count,
-        "PEAK_API_URL": MINER_API_URL,
+        "PEAK_API_URL": MINER_API_URL if miner == "peakminer" else f"http://127.0.0.1:{MINER_API_PORT}/",
     }
     process = subprocess.Popen([sys.executable, SIDECAR_PATH], env=environment)
     for _ in range(50):
@@ -173,6 +199,40 @@ def check_hashrate_and_share_series() -> None:
     )
 
 
+def check_power_series() -> None:
+    print("power")
+    _, body = get("/metrics")
+    check(sample(body, 'pearl_sidecar_gpu_power_draw_watts{gpu="0"}') == 205.5, "per-GPU power draw is exposed")
+    check(sample(body, 'pearl_sidecar_gpu_power_limit_watts{gpu="0"}') == 210, "per-GPU power limit is exposed")
+    check(sample(body, 'pearl_sidecar_gpu_power_draw_watts{gpu="1"}') is None, "a card reporting [N/A] is left out")
+    check(sample(body, "pearl_sidecar_power_draw_watts_total") == 205.5, "node power draw is the sum of the cards")
+    check(sample(body, "pearl_sidecar_power_limit_watts_total") == 210, "node power limit is the sum of the cards")
+
+
+def check_wildrig_build() -> None:
+    with tempfile.TemporaryDirectory() as log_dir:
+        (pathlib.Path(log_dir) / "wildrig.log").write_text("wildrig pearlhash new job\n")
+        process = start_sidecar(log_dir, gpu_count="2", miner="wildrig")
+        try:
+            print("wildrig")
+            status, body = get("/metrics")
+            check(status == 200, "a hashing WildRig answers 200")
+            check(sample(body, 'pearl_sidecar_gpu_hashrate_hs{gpu="0"}') == 70.0e12, "per-GPU rate is the current one")
+            check(sample(body, 'pearl_sidecar_gpu_hashrate_hs{gpu="1"}') == 0, "an idle card stays in the series")
+            check(sample(body, "pearl_sidecar_hashrate_total_hs") == 70.0e12, "node total is WildRig's current total")
+            check(sample(body, "pearl_sidecar_gpus_reporting") == 1, "only the hashing card is reporting")
+            check(sample(body, "pearl_sidecar_accepted_shares") == 9, "node accepted shares are WildRig's good shares")
+            check(sample(body, "pearl_sidecar_invalid_shares") == 2, "invalid shares are total minus good")
+            check(sample(body, "pearl_sidecar_pool_connected") == 1, "a pool connection with uptime is connected")
+            check("pearl_sidecar_gpu_accepted_shares{" not in body, "no per-GPU share series WildRig does not report")
+            check(sample(body, "pearl_sidecar_power_draw_watts_total") == 205.5, "power is exported for WildRig too")
+            status, body = get("/logs?tail=256")
+            check(status == 200 and "new job" in body, "the log tail serves wildrig.log")
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
+
 def check_log_tail_serves_miner_lines() -> None:
     print("logs")
     status, body = get("/logs?tail=256")
@@ -187,6 +247,7 @@ def check_live_miner() -> None:
         try:
             check_bearer_token_is_required()
             check_hashrate_and_share_series()
+            check_power_series()
             check_log_tail_serves_miner_lines()
         finally:
             process.terminate()
@@ -214,6 +275,7 @@ def main() -> None:
     threading.Thread(target=miner_api.serve_forever, daemon=True).start()
     try:
         check_live_miner()
+        check_wildrig_build()
         check_miner_api_down(miner_api)
     finally:
         miner_api.server_close()

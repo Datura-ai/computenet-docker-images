@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch PeakMiner across every visible GPU.
+# Launch the Pearl miner across every visible GPU: PeakMiner, or WildRig Multi in the benchmark build (DAH-6084).
 #
 # Env contract (pool-independent, injected by the Lium backend at filler launch):
 #   PEARL_POOL_HOST      pool hostname (default prl.kryptex.network)
@@ -7,6 +7,7 @@
 #   PEARL_POOL_WALLET    PRL payout address (required)
 #   PEARL_POOL_WORKER    worker name shown in the pool (default: container hostname)
 #   PEARL_POOL_FAILOVER  optional "host:port,host:port" tried in order when the primary is down
+#   PEARL_MINER          peakminer (default) or wildrig; baked by the image build, not set by the platform
 set -euo pipefail
 
 # Start sshd before the workload. The validator's SSH bootstrap then finds it running and adopts it
@@ -63,14 +64,31 @@ if [[ -n "${PEARL_POOL_FAILOVER:-}" ]]; then
     done
 fi
 
-# Take a newer miner build when the pinned major has one. The updater never fails the container: on
-# any problem it installs nothing and the baked-in binary, still on PATH behind the install dir,
-# runs instead.
-"$(dirname "${BASH_SOURCE[0]}")/update_miner.sh" || true
-export PATH="${PEARL_MINER_DIR:-/var/lib/pearl/bin}:${PATH}"
-
 LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
 mkdir -p "${LOG_DIR}"
+
+MINER="${PEARL_MINER:-peakminer}"
+case "${MINER}" in
+    peakminer)
+        # Take a newer miner build when the pinned major has one. The updater never fails the container: on
+        # any problem it installs nothing and the baked-in binary, still on PATH behind the install dir,
+        # runs instead.
+        "$(dirname "${BASH_SOURCE[0]}")/update_miner.sh" || true
+        export PATH="${PEARL_MINER_DIR:-/var/lib/pearl/bin}:${PATH}"
+        miner_cmd=(peakminer --coin pearl "${pool_args[@]}" --user "${PEARL_POOL_WALLET}.${WORKER}"
+            --log-file "${LOG_DIR}/peakminer.log" --log-append)
+        ;;
+    wildrig)
+        # The benchmark build runs the one pinned binary: no updater, so the measurement is of that exact build.
+        # Stats API on 4068 like PeakMiner's; the container publishes only the sidecar port, never this one.
+        miner_cmd=(wildrig-multi --algo pearlhash "${pool_args[@]}" --user "${PEARL_POOL_WALLET}.${WORKER}"
+            --api-port "${PEARL_MINER_API_PORT:-4068}" --log-file "${LOG_DIR}/wildrig.log" --no-color)
+        ;;
+    *)
+        echo "unknown PEARL_MINER '${MINER}' (peakminer or wildrig)" >&2
+        exit 1
+        ;;
+esac
 
 # One process for every GPU: PeakMiner drives them all itself and reports each card separately in
 # its stats API, so there is nothing left for per-GPU processes to buy. The flip side is that one
@@ -95,10 +113,7 @@ supervise_miner() {
     local exit_code=0 now=0 window_started_at=0 restarts=0
     while true; do
         set +e
-        peakminer \
-            --coin pearl "${pool_args[@]}" \
-            --user "${PEARL_POOL_WALLET}.${WORKER}" \
-            --log-file "${LOG_DIR}/peakminer.log" --log-append
+        "${miner_cmd[@]}"
         exit_code=$?
         set -e
 
@@ -113,12 +128,12 @@ supervise_miner() {
         restarts=$(( restarts + 1 ))
 
         if (( restarts > MAX_RESTARTS )); then
-            echo "peakminer exited with code ${exit_code}; ${restarts} restarts in ${RESTART_WINDOW_SECONDS}s — giving up" >&2
+            echo "${MINER} exited with code ${exit_code}; ${restarts} restarts in ${RESTART_WINDOW_SECONDS}s — giving up" >&2
             # Non-zero even when the miner exited 0: a perpetual miner that stops is a failure, and a
             # zero here would read to the platform as a filler that finished its work.
             return "$(( exit_code == 0 ? 1 : exit_code ))"
         fi
-        echo "peakminer exited with code ${exit_code}, restarting in ${RESTART_DELAY_SECONDS}s" >&2
+        echo "${MINER} exited with code ${exit_code}, restarting in ${RESTART_DELAY_SECONDS}s" >&2
         sleep "${RESTART_DELAY_SECONDS}"
     done
 }
@@ -145,5 +160,5 @@ fi
 # a bare `wait -n` would return the moment anything else finished.
 exit_code=0
 wait "${miner_pid}" || exit_code=$?
-echo "peakminer supervisor gave up (code ${exit_code}), shutting down" >&2
+echo "${MINER} supervisor gave up (code ${exit_code}), shutting down" >&2
 exit "$(( exit_code == 0 ? 1 : exit_code ))"

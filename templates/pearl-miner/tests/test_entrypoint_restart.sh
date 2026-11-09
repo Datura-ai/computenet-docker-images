@@ -32,6 +32,14 @@ echo miner >> "${stub_dir}/events"
 sleep ${run_seconds}
 exit ${miner_exit_code}
 STUB
+    # The benchmark build's miner (DAH-6084): records its arguments, then behaves like the PeakMiner stub.
+    cat > "${stub_dir}/wildrig-multi" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "${stub_dir}/wildrig-args"
+echo launched >> "${stub_dir}/launches"
+sleep ${run_seconds}
+exit ${miner_exit_code}
+STUB
     printf '#!/usr/bin/env bash\necho "GPU 0: NVIDIA L4"\n' > "${stub_dir}/nvidia-smi"
     # sshd and ssh-keygen are stubbed too: a host test must never start or write a real sshd. The
     # sshd stub records whether the lock was held at its start and the exit code the test asked for.
@@ -41,7 +49,7 @@ echo "sshd lock=\$(test -d "${stub_dir}/run/lium-ssh-setup.lock" && echo held)" 
 exit \${SSHD_STUB_EXIT:-0}
 STUB
     printf '#!/usr/bin/env bash\nexit 0\n' > "${stub_dir}/ssh-keygen"
-    chmod +x "${stub_dir}/peakminer" "${stub_dir}/nvidia-smi" "${stub_dir}/sshd" "${stub_dir}/ssh-keygen"
+    chmod +x "${stub_dir}/peakminer" "${stub_dir}/wildrig-multi" "${stub_dir}/nvidia-smi" "${stub_dir}/sshd" "${stub_dir}/ssh-keygen"
 }
 
 run_entrypoint() {
@@ -135,6 +143,38 @@ test_a_failed_sshd_never_stops_the_miner() {
     rm -rf "${stub_dir}"
 }
 
+test_wildrig_build_runs_wildrig_without_the_updater() {
+    echo "wildrig build"
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    make_stubs "${stub_dir}" 3 0
+    local status
+    status="$(PEARL_MINER=wildrig run_entrypoint "${stub_dir}" 0)"
+    local args
+    args="$(head -n 1 "${stub_dir}/wildrig-args" 2>/dev/null)"
+
+    check "$([[ ! -f "${stub_dir}/events" ]] || ! grep -qx miner "${stub_dir}/events" && echo pass)" "PeakMiner never launches in the WildRig build"
+    check "$([[ "${args}" == *"--algo pearlhash"* && "${args}" == *"--url prl.kryptex.network:7048"* ]] && echo pass)" "WildRig mines pearlhash on the configured pool (got: ${args})"
+    check "$([[ "${args}" == *"--user prl1test.test-worker"* && "${args}" == *"--api-port 4068"* ]] && echo pass)" "same wallet.worker as PeakMiner, stats API on 4068"
+    check "$(! grep -q "pearl-update" "${stub_dir}/out" && echo pass)" "the PeakMiner updater does not run"
+    check "$([[ "${status}" != "0" ]] && echo pass)" "the same crash-loop ceiling applies"
+    rm -rf "${stub_dir}"
+}
+
+test_unknown_miner_fails() {
+    echo "unknown miner"
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    make_stubs "${stub_dir}" 0 0
+    local status
+    status="$(PEARL_MINER=nosuch run_entrypoint "${stub_dir}" 0)"
+
+    check "$([[ "${status}" != "0" && ! -f "${stub_dir}/launches" ]] && echo pass)" "an unknown PEARL_MINER fails without launching anything"
+    rm -rf "${stub_dir}"
+}
+
+test_wildrig_build_runs_wildrig_without_the_updater
+test_unknown_miner_fails
 test_sshd_starts_under_the_lock_before_the_miner
 test_a_failed_sshd_never_stops_the_miner
 test_crash_loop_gives_up_non_zero

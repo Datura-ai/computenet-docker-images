@@ -18,6 +18,10 @@ Two routes, both behind the same bearer token:
   /logs?tail=N    the tail of the miner log, because on a miner's host the container's stdout goes
                   to a docker pipe we cannot reach
 
+The WildRig benchmark build (PEARL_MINER=wildrig, DAH-6084) reads WildRig's own stats JSON instead (GET
+http://127.0.0.1:4068/), which reports shares for the node only, so its per-GPU share series are absent. Both builds
+export per-GPU power draw and power limit from nvidia-smi: the benchmark compares hashrate per watt under our cap.
+
 Without METRICS_TOKEN it refuses to start: an unauthenticated port on a miner's host would publish
 our fleet's hashrate to whoever scans it. PeakMiner's own API has no auth at all, which is why it
 stays on the container's loopback and this port is the only way out.
@@ -28,6 +32,7 @@ import http.server
 import json
 import os
 import sys
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -38,9 +43,13 @@ from dataclasses import dataclass
 PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN: str = os.environ.get("METRICS_TOKEN", "")
 LOG_DIR: str = os.environ.get("PEARL_LOG_DIR", "/var/log/pearl")
-MINER_LOG_NAME: str = "peakminer.log"
-# PeakMiner's stats API. Its default binding is the container's own loopback and it is left there.
-MINER_API_URL: str = os.environ.get("PEAK_API_URL", "http://127.0.0.1:4068/summary")
+MINER: str = os.environ.get("PEARL_MINER", "peakminer")
+MINER_LOG_NAME: str = f"{MINER}.log"
+# The miner's stats API, on the container's own loopback: PeakMiner's /summary, or WildRig's root document.
+MINER_API_URL: str = os.environ.get(
+    "PEAK_API_URL", "http://127.0.0.1:4068/" if MINER == "wildrig" else "http://127.0.0.1:4068/summary"
+)
+NVIDIA_SMI_TIMEOUT_SECONDS: float = 5.0
 MINER_API_TIMEOUT_SECONDS: float = 3.0
 # How many GPUs the entrypoint counted at launch. Kept as its own series rather than inferred from
 # what the miner reports: "2 of 8 GPUs reporting" is the alert, while a bare count of 2 reads as a
@@ -56,8 +65,18 @@ class GpuSample:
 
     index: int
     hashrate_hs: float
-    accepted_shares: int
-    invalid_shares: int
+    # None when the miner counts shares for the node only (WildRig)
+    accepted_shares: int | None
+    invalid_shares: int | None
+
+
+@dataclass(frozen=True)
+class GpuPower:
+    """One card's draw and enforced limit as nvidia-smi reads them, in watts."""
+
+    index: int
+    draw_watts: float
+    limit_watts: float | None
 
 
 @dataclass(frozen=True)
@@ -104,9 +123,34 @@ def fetch_summary() -> MinerSummary | None:
     try:
         with urllib.request.urlopen(MINER_API_URL, timeout=MINER_API_TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read())
-    except (OSError, urllib.error.HTTPError, ValueError) as error:
+        return wildrig_summary(payload) if MINER == "wildrig" else peakminer_summary(payload)
+    except (OSError, urllib.error.HTTPError, ValueError, KeyError, TypeError, IndexError) as error:
         _log(f"cannot read {MINER_API_URL}: {error!r}")
         return None
+
+
+def wildrig_summary(payload: dict) -> MinerSummary:
+    """WildRig's stats document: hashrate.threads holds one [current, ...] row per GPU in H/s, results the node's
+    shares. The same fields HiveOS reads in the h-stats.sh WildRig ships."""
+    # shortcut: pool_connected reads connection.uptime, a field not confirmed against a live WildRig; check the first
+    # benchmark scrape and fix the field if it always reads 0.
+    hashrate: dict = payload.get("hashrate") or {}
+    results: dict = payload.get("results") or {}
+    accepted: int = int(results.get("shares_good") or 0)
+    return MinerSummary(
+        pool_connected=bool((payload.get("connection") or {}).get("uptime")),
+        hashrate_hs=float((hashrate.get("total") or [0.0])[0] or 0.0),
+        accepted_shares=accepted,
+        invalid_shares=max(0, int(results.get("shares_total") or 0) - accepted),
+        last_share_at=None,
+        gpus=[
+            GpuSample(index=index, hashrate_hs=float(row[0] or 0.0), accepted_shares=None, invalid_shares=None)
+            for index, row in enumerate(hashrate.get("threads") or [])
+        ],
+    )
+
+
+def peakminer_summary(payload: dict) -> MinerSummary:
     gpus: list[GpuSample] = [
         GpuSample(
             index=int(gpu["id"]),
@@ -127,6 +171,36 @@ def fetch_summary() -> MinerSummary | None:
     )
 
 
+def read_gpu_power() -> list[GpuPower]:
+    """Per-GPU power draw and limit, or nothing when nvidia-smi is missing, hangs or reports N/A."""
+    try:
+        output: str = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,power.draw,power.limit", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=NVIDIA_SMI_TIMEOUT_SECONDS,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        _log(f"cannot read GPU power: {error!r}")
+        return []
+    cards: list[GpuPower] = []
+    for line in output.splitlines():
+        parts: list[str] = [part.strip() for part in line.split(",")]
+        if len(parts) != 3:
+            continue
+        try:
+            draw: float = float(parts[1])
+        except ValueError:
+            continue  # "[N/A]": a card that cannot report draw is left out rather than read as 0 W
+        try:
+            limit: float | None = float(parts[2])
+        except ValueError:
+            limit = None
+        cards.append(GpuPower(index=int(parts[0]), draw_watts=draw, limit_watts=limit))
+    return cards
+
+
 def collect() -> MetricsSnapshot:
     """Per-GPU and node-level series, and how many GPUs are actually hashing.
 
@@ -142,10 +216,18 @@ def collect() -> MetricsSnapshot:
         *(f'pearl_sidecar_gpu_hashrate_hs{{gpu="{gpu.index}"}} {gpu.hashrate_hs:.0f}' for gpu in gpus),
         "# HELP pearl_sidecar_gpu_accepted_shares Shares the pool accepted from this GPU since the miner started.",
         "# TYPE pearl_sidecar_gpu_accepted_shares counter",
-        *(f'pearl_sidecar_gpu_accepted_shares{{gpu="{gpu.index}"}} {gpu.accepted_shares}' for gpu in gpus),
+        *(
+            f'pearl_sidecar_gpu_accepted_shares{{gpu="{gpu.index}"}} {gpu.accepted_shares}'
+            for gpu in gpus
+            if gpu.accepted_shares is not None
+        ),
         "# HELP pearl_sidecar_gpu_invalid_shares Shares the pool rejected from this GPU since the miner started.",
         "# TYPE pearl_sidecar_gpu_invalid_shares counter",
-        *(f'pearl_sidecar_gpu_invalid_shares{{gpu="{gpu.index}"}} {gpu.invalid_shares}' for gpu in gpus),
+        *(
+            f'pearl_sidecar_gpu_invalid_shares{{gpu="{gpu.index}"}} {gpu.invalid_shares}'
+            for gpu in gpus
+            if gpu.invalid_shares is not None
+        ),
         "# HELP pearl_sidecar_hashrate_total_hs Node hashrate as the miner reports it.",
         "# TYPE pearl_sidecar_hashrate_total_hs gauge",
         f"pearl_sidecar_hashrate_total_hs {summary.hashrate_hs if summary else 0.0:.0f}",
@@ -165,6 +247,26 @@ def collect() -> MetricsSnapshot:
         "# TYPE pearl_sidecar_gpus_expected gauge",
         f"pearl_sidecar_gpus_expected {EXPECTED_GPUS}",
     ]
+    power: list[GpuPower] = read_gpu_power()
+    limits: list[GpuPower] = [card for card in power if card.limit_watts is not None]
+    if power:
+        lines += [
+            "# HELP pearl_sidecar_gpu_power_draw_watts Power this GPU draws now, as nvidia-smi reads it.",
+            "# TYPE pearl_sidecar_gpu_power_draw_watts gauge",
+            *(f'pearl_sidecar_gpu_power_draw_watts{{gpu="{card.index}"}} {card.draw_watts:.1f}' for card in power),
+            "# HELP pearl_sidecar_power_draw_watts_total Power all GPUs of this node draw now.",
+            "# TYPE pearl_sidecar_power_draw_watts_total gauge",
+            f"pearl_sidecar_power_draw_watts_total {sum(card.draw_watts for card in power):.1f}",
+        ]
+    if limits:
+        lines += [
+            "# HELP pearl_sidecar_gpu_power_limit_watts Power limit enforced on this GPU (our filler cap while it runs).",
+            "# TYPE pearl_sidecar_gpu_power_limit_watts gauge",
+            *(f'pearl_sidecar_gpu_power_limit_watts{{gpu="{card.index}"}} {card.limit_watts:.1f}' for card in limits),
+            "# HELP pearl_sidecar_power_limit_watts_total Sum of the enforced power limits of this node's GPUs.",
+            "# TYPE pearl_sidecar_power_limit_watts_total gauge",
+            f"pearl_sidecar_power_limit_watts_total {sum(card.limit_watts or 0.0 for card in limits):.1f}",
+        ]
     # Absent until the pool takes the first share, so "never accepted anything" cannot be read as a
     # fresh zero — a node whose work is being rejected wholesale has no last share to age.
     if summary is not None and summary.last_share_at is not None:
