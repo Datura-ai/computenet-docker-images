@@ -4,14 +4,14 @@
 # inside a `${var:?message}` opened a quote and bash died with "unexpected EOF".
 set -euo pipefail
 
-script="$(dirname "$0")/../lium-roce-probe.sh"
+for script in "$(dirname "$0")"/../lium-roce-probe.sh "$(dirname "$0")"/../lium-efa-probe.sh; do
+    bash -n "$script"
+    echo "PASS: $(basename "$script") parses"
 
-bash -n "$script"
-echo "PASS: the probe script parses"
-
-# A `${var:?...}` message is shell-parsed, so an apostrophe in it breaks the whole file.
-if grep -n "{[a-z_]*:?[^}]*'" "$script"; then
-    echo "FAIL: an apostrophe inside a \${var:?message} opens a quote" >&2
-    exit 1
-fi
-echo "PASS: no apostrophe inside a parameter-expansion message"
+    # A `${var:?...}` message is shell-parsed, so an apostrophe in it breaks the whole file.
+    if grep -n "{[a-z_]*:?[^}]*'" "$script"; then
+        echo "FAIL: an apostrophe inside a \${var:?message} opens a quote" >&2
+        exit 1
+    fi
+    echo "PASS: no apostrophe inside a parameter-expansion message"
+done
