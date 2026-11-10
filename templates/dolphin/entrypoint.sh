@@ -231,8 +231,8 @@ print_gpu_bundles_of_size() {
 # 40 GB, the same floor the backend gates DPHN nodes on. The served model (Gemma-4 26B NVFP4,
 # ~19 GB of weights) runs on one 48 GB card with KV cache to spare, measured on prod. The plan
 # gives each worker the smallest card group that clears the floor: 48 GB and larger cards ->
-# one worker per GPU, 32 GB -> one per pair; cards are spread evenly so none sits idle. Fewer
-# than 2 such groups -> the node keeps the single all-GPUs worker.
+# one worker per GPU, 32 GB -> one per pair. Cards left over after the last whole group stay
+# idle (3x32 GB runs one worker on 0,1 and idles card 2); one group covering every card is "all".
 plan_worker_gpu_sets() {
     if [[ -n "${DOLPHIN_GPU_IDS:-}" ]]; then
         echo "${DOLPHIN_GPU_IDS}"
