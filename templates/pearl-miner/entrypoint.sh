@@ -82,7 +82,7 @@ case "${MINER}" in
         # The benchmark build runs the one pinned binary: no updater, so the measurement is of that exact build.
         # Stats API on 4068 like PeakMiner's; the container publishes only the sidecar port, never this one.
         miner_cmd=(wildrig-multi --algo pearlhash "${pool_args[@]}" --user "${PEARL_POOL_WALLET}.${WORKER}"
-            --api-port "${PEARL_MINER_API_PORT:-4068}" --log-file "${LOG_DIR}/wildrig.log" --no-color)
+            --api-port 4068 --log-file "${LOG_DIR}/wildrig.log" --no-color)
         ;;
     *)
         echo "unknown PEARL_MINER '${MINER}' (peakminer or wildrig)" >&2

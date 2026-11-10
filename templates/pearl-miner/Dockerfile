@@ -70,7 +70,6 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/update_miner.sh
 # The baked-in version is what the entrypoint's updater compares against at start.
 ENV PEARL_MINER_BAKED_VERSION=${PEAKMINER_VERSION} \
     PEARL_MINER=${PEARL_MINER} \
-    PEARL_WILDRIG_VERSION=${WILDRIG_VERSION} \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     PEARL_POOL_HOST=prl.kryptex.network \
