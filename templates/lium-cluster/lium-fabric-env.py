@@ -30,6 +30,7 @@ here belongs to the fabric the cluster was rented on.
 import re
 import subprocess
 import sys
+from collections import defaultdict
 
 # The GID that can cross a router. RoCE v1 is L2-only, and NCCL addresses its peers by IP here.
 ROUTABLE_GID_TYPE = "roce v2"
@@ -163,11 +164,14 @@ def read_ports() -> list[FabricPort]:
 def fabric_environment(ports: list[FabricPort]) -> dict[str, str]:
     """What NCCL needs beyond the overlay, or nothing at all on an InfiniBand host."""
     live_ports = [port for port in ports if port.is_active]
-    own_lids = {port.lid for port in live_ports if port.lid}
+    own_lids_by_subnet: dict[str, set[str]] = defaultdict(set)
+    for port in live_ports:
+        if port.is_infiniband and port.lid:
+            own_lids_by_subnet[port.sm_lid].add(port.lid)
     # A host holding a live InfiniBand port was sold on that fabric — pinning its Ethernet leg
-    # would point the job at the wrong wire. A port whose SM sits on one of the host's own LIDs (the
-    # rent gate's rule) joins nothing and does not count; a real switch at LID 1 still does.
-    if any(port.is_infiniband and port.sm_lid not in own_lids for port in live_ports):
+    # would point the job at the wrong wire. A port whose SM sits on one of the host's own LIDs in the
+    # same subnet (the rent gate's rule; LIDs repeat across subnets) joins nothing and does not count.
+    if any(port.is_infiniband and port.sm_lid not in own_lids_by_subnet[port.sm_lid] for port in live_ports):
         return {}
     if any(port.is_efa for port in live_ports):
         return dict(EFA_ENVIRONMENT)

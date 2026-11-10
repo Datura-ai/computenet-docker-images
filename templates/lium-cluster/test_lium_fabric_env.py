@@ -283,6 +283,19 @@ def test_a_real_switch_whose_subnet_manager_holds_lid_1_still_wins_over_efa(devi
     assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
 
 
+def test_an_own_lid_from_another_subnet_does_not_make_a_shared_rail_self_managed(devinfo) -> None:
+    # LIDs repeat across subnets: rail A (LID 7) has its SM at 9, rail B (LID 9) has its SM at 7
+    rail_a = SELF_MANAGED_INFINIBAND.replace("sm_lid:\t\t\t1", "sm_lid:\t\t\t9").replace(
+        "port_lid:\t\t1", "port_lid:\t\t7"
+    )
+    rail_b = rail_a.replace("mlx5_0", "mlx5_1").replace("sm_lid:\t\t\t9", "sm_lid:\t\t\t7").replace(
+        "port_lid:\t\t7", "port_lid:\t\t9"
+    )
+    devinfo(rail_a + rail_b + EFA)
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
+
+
 def test_an_active_efa_port_passes_the_fabric_gate(devinfo) -> None:
     devinfo(EFA)
 
