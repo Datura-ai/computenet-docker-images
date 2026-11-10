@@ -39,6 +39,7 @@ import urllib.parse
 import urllib.request
 
 from dataclasses import dataclass
+from typing import TypedDict
 
 PORT: int = int(os.environ.get("METRICS_PORT", "9101"))
 TOKEN: str = os.environ.get("METRICS_TOKEN", "")
@@ -75,8 +76,30 @@ class GpuPower:
     """One card's draw and enforced limit as nvidia-smi reads them, in watts."""
 
     index: int
-    draw_watts: float
+    draw_watts: float | None
     limit_watts: float | None
+
+
+class WildrigHashrate(TypedDict, total=False):
+    total: list[float]  # [current, ...] for the node, in H/s
+    threads: list[list[float]]  # one [current, ...] row per GPU
+
+
+class WildrigResults(TypedDict, total=False):
+    shares_good: int
+    shares_total: int
+
+
+class WildrigConnection(TypedDict, total=False):
+    uptime: int
+
+
+class WildrigStats(TypedDict, total=False):
+    """The fields of WildRig's stats document this parser reads."""
+
+    hashrate: WildrigHashrate
+    results: WildrigResults
+    connection: WildrigConnection
 
 
 @dataclass(frozen=True)
@@ -129,13 +152,13 @@ def fetch_summary() -> MinerSummary | None:
         return None
 
 
-def wildrig_summary(payload: dict) -> MinerSummary:
+def wildrig_summary(payload: WildrigStats) -> MinerSummary:
     """WildRig's stats document: hashrate.threads holds one [current, ...] row per GPU in H/s, results the node's
     shares. The same fields HiveOS reads in the h-stats.sh WildRig ships."""
     # shortcut: pool_connected reads connection.uptime, a field not confirmed against a live WildRig; check the first
     # benchmark scrape and fix the field if it always reads 0.
-    hashrate: dict = payload.get("hashrate") or {}
-    results: dict = payload.get("results") or {}
+    hashrate: WildrigHashrate = payload.get("hashrate") or {}
+    results: WildrigResults = payload.get("results") or {}
     accepted: int = int(results.get("shares_good") or 0)
     return MinerSummary(
         pool_connected=bool((payload.get("connection") or {}).get("uptime")),
@@ -189,16 +212,50 @@ def read_gpu_power() -> list[GpuPower]:
         parts: list[str] = [part.strip() for part in line.split(",")]
         if len(parts) != 3:
             continue
-        try:
-            draw: float = float(parts[1])
-        except ValueError:
-            continue  # "[N/A]": a card that cannot report draw is left out rather than read as 0 W
-        try:
-            limit: float | None = float(parts[2])
-        except ValueError:
-            limit = None
-        cards.append(GpuPower(index=int(parts[0]), draw_watts=draw, limit_watts=limit))
+        cards.append(GpuPower(index=int(parts[0]), draw_watts=_watts(parts[1]), limit_watts=_watts(parts[2])))
     return cards
+
+
+def _watts(text: str) -> float | None:
+    """nvidia-smi's reading in watts; None for "[N/A]", never read as 0 W."""
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def gpu_power_series_lines(power: list[GpuPower]) -> list[str]:
+    """Per-GPU draw and limit for the cards that report them, and the node totals only when every card reports both.
+
+    A card reading [N/A] still hashes: a total without its watts would make hash per watt read high, so the totals
+    are left out instead.
+    """
+    draws: list[GpuPower] = [card for card in power if card.draw_watts is not None]
+    limits: list[GpuPower] = [card for card in power if card.limit_watts is not None]
+    complete: bool = bool(power) and len(draws) == len(limits) == len(power)
+    lines: list[str] = []
+    if draws:
+        lines += [
+            "# HELP pearl_sidecar_gpu_power_draw_watts Power this GPU draws now, as nvidia-smi reads it.",
+            "# TYPE pearl_sidecar_gpu_power_draw_watts gauge",
+            *(f'pearl_sidecar_gpu_power_draw_watts{{gpu="{card.index}"}} {card.draw_watts:.1f}' for card in draws),
+        ]
+    if limits:
+        lines += [
+            "# HELP pearl_sidecar_gpu_power_limit_watts Enforced power limit of this GPU (our cap while it runs).",
+            "# TYPE pearl_sidecar_gpu_power_limit_watts gauge",
+            *(f'pearl_sidecar_gpu_power_limit_watts{{gpu="{card.index}"}} {card.limit_watts:.1f}' for card in limits),
+        ]
+    if complete:
+        lines += [
+            "# HELP pearl_sidecar_power_draw_watts_total Power all GPUs of this node draw now.",
+            "# TYPE pearl_sidecar_power_draw_watts_total gauge",
+            f"pearl_sidecar_power_draw_watts_total {sum(card.draw_watts or 0.0 for card in power):.1f}",
+            "# HELP pearl_sidecar_power_limit_watts_total Sum of the enforced power limits of this node's GPUs.",
+            "# TYPE pearl_sidecar_power_limit_watts_total gauge",
+            f"pearl_sidecar_power_limit_watts_total {sum(card.limit_watts or 0.0 for card in power):.1f}",
+        ]
+    return lines
 
 
 def collect() -> MetricsSnapshot:
@@ -247,26 +304,7 @@ def collect() -> MetricsSnapshot:
         "# TYPE pearl_sidecar_gpus_expected gauge",
         f"pearl_sidecar_gpus_expected {EXPECTED_GPUS}",
     ]
-    power: list[GpuPower] = read_gpu_power()
-    limits: list[GpuPower] = [card for card in power if card.limit_watts is not None]
-    if power:
-        lines += [
-            "# HELP pearl_sidecar_gpu_power_draw_watts Power this GPU draws now, as nvidia-smi reads it.",
-            "# TYPE pearl_sidecar_gpu_power_draw_watts gauge",
-            *(f'pearl_sidecar_gpu_power_draw_watts{{gpu="{card.index}"}} {card.draw_watts:.1f}' for card in power),
-            "# HELP pearl_sidecar_power_draw_watts_total Power all GPUs of this node draw now.",
-            "# TYPE pearl_sidecar_power_draw_watts_total gauge",
-            f"pearl_sidecar_power_draw_watts_total {sum(card.draw_watts for card in power):.1f}",
-        ]
-    if limits:
-        lines += [
-            "# HELP pearl_sidecar_gpu_power_limit_watts Power limit enforced on this GPU (our filler cap while it runs).",
-            "# TYPE pearl_sidecar_gpu_power_limit_watts gauge",
-            *(f'pearl_sidecar_gpu_power_limit_watts{{gpu="{card.index}"}} {card.limit_watts:.1f}' for card in limits),
-            "# HELP pearl_sidecar_power_limit_watts_total Sum of the enforced power limits of this node's GPUs.",
-            "# TYPE pearl_sidecar_power_limit_watts_total gauge",
-            f"pearl_sidecar_power_limit_watts_total {sum(card.limit_watts or 0.0 for card in limits):.1f}",
-        ]
+    lines += gpu_power_series_lines(read_gpu_power())
     # Absent until the pool takes the first share, so "never accepted anything" cannot be read as a
     # fresh zero — a node whose work is being rejected wholesale has no last share to age.
     if summary is not None and summary.last_share_at is not None:
