@@ -138,19 +138,22 @@ test_plan() {
     assert_eq "single GPU keeps all-GPUs worker" "all" "$(plan_as_line)"
 
     mock_nvidia_smi "0:32607" "1:32607" "2:32607" "3:32607" "4:32607" "5:32607" "6:32607" "7:32607"
-    assert_eq "8x32GB (5090) bundles into 2 workers x4 GPUs" "0,1,2,3|4,5,6,7" "$(plan_as_line)"
+    assert_eq "8x32GB (5090) bundles into 4 workers x2 GPUs" "0,1|2,3|4,5|6,7" "$(plan_as_line)"
 
     mock_nvidia_smi "0:46068" "1:46068" "2:46068" "3:46068" "4:46068" "5:46068" "6:46068" "7:46068"
-    assert_eq "8x48GB (L40S) bundles into 4 workers x2 GPUs" "0,1|2,3|4,5|6,7" "$(plan_as_line)"
+    assert_eq "8x48GB (L40S) splits per GPU" "0|1|2|3|4|5|6|7" "$(plan_as_line)"
 
     mock_nvidia_smi "0:46068" "1:46068" "2:46068" "3:46068"
-    assert_eq "4x48GB bundles into 2 workers x2 GPUs" "0,1|2,3" "$(plan_as_line)"
+    assert_eq "4x48GB splits per GPU" "0|1|2|3" "$(plan_as_line)"
 
     mock_nvidia_smi "0:46068" "1:46068"
-    assert_eq "2x48GB (one bundle = whole node) keeps all-GPUs worker" "all" "$(plan_as_line)"
+    assert_eq "2x48GB splits per GPU" "0|1" "$(plan_as_line)"
+
+    mock_nvidia_smi "0:32607" "1:32607"
+    assert_eq "2x32GB (one bundle = whole node) keeps all-GPUs worker" "all" "$(plan_as_line)"
 
     mock_nvidia_smi "0:32607" "1:32607" "2:32607"
-    assert_eq "3x32GB (one bundle = whole node) keeps all-GPUs worker" "all" "$(plan_as_line)"
+    assert_eq "3x32GB runs one pair and idles the odd card" "0,1" "$(plan_as_line)"
 
     mock_nvidia_smi "0:81559" "1:81559"
     assert_eq "2xH100 splits per GPU" "0|1" "$(plan_as_line)"
@@ -162,12 +165,12 @@ test_plan() {
     # 16 attention heads. The backend used to guarantee that by planning bundles itself; it now
     # hands the whole node over, so a plan that emits any other size crash-loops that engine before
     # it downloads a byte. Both ways of producing one are covered:
-    mock_nvidia_smi "0:32607" "1:32607" "2:32607" "3:32607" "4:32607" "5:32607"
-    assert_eq "6x32GB rounds the 3-card bundle up to 4 and leaves 2 cards idle" \
+    mock_nvidia_smi "0:16376" "1:16376" "2:16376" "3:16376" "4:16376" "5:16376"
+    assert_eq "6x16GB rounds the 3-card bundle up to 4 and leaves 2 cards idle" \
         "0,1,2,3" "$(plan_as_line)"
 
-    mock_nvidia_smi "0:46068" "1:46068" "2:46068" "3:46068" "4:46068" "5:46068" "6:46068" "7:46068" "8:46068"
-    assert_eq "9x48GB cuts whole pairs and idles the odd card, never a bundle of 3" \
+    mock_nvidia_smi "0:32607" "1:32607" "2:32607" "3:32607" "4:32607" "5:32607" "6:32607" "7:32607" "8:32607"
+    assert_eq "9x32GB cuts whole pairs and idles the odd card, never a bundle of 3" \
         "0,1|2,3|4,5|6,7" "$(plan_as_line)"
 
     mock_nvidia_smi "0:97887" "1:97887" "2:97887"

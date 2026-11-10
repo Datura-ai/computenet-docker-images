@@ -227,19 +227,19 @@ print_gpu_bundles_of_size() {
 # Emit one line per worker to spawn: a comma-separated gpu_ids list, or the literal "all"
 # (worker.json gpu_ids: null -> the worker auto-scales to every GPU on the node).
 #
-# Every worker instance loads the full model, so it needs the VRAM floor ("Running the full
-# model requires 70 GB of VRAM", dphn.ai docs — the same figure the backend gates DPHN nodes
-# on) across ITS cards. The plan gives each worker the smallest card group that clears the
-# floor: 96 GB cards -> one worker per GPU, 48 GB cards -> one per pair, 32 GB -> one per
-# triple-or-more; cards are spread evenly so none sits idle. Fewer than 2 such groups -> the
-# node keeps the single all-GPUs worker.
+# Every worker instance loads the full model, so it needs the VRAM floor across ITS cards:
+# 40 GB, the same floor the backend gates DPHN nodes on. The served model (Gemma-4 26B NVFP4,
+# ~19 GB of weights) runs on one 48 GB card with KV cache to spare, measured on prod. The plan
+# gives each worker the smallest card group that clears the floor: 48 GB and larger cards ->
+# one worker per GPU, 32 GB -> one per pair. Cards left over after the last whole group stay
+# idle (3x32 GB runs one worker on 0,1 and idles card 2); one group covering every card is "all".
 plan_worker_gpu_sets() {
     if [[ -n "${DOLPHIN_GPU_IDS:-}" ]]; then
         echo "${DOLPHIN_GPU_IDS}"
         return
     fi
     local worker_per_gpu="${DOLPHIN_WORKER_PER_GPU:-1}"
-    local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-71680}"
+    local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-40960}"
     if [[ "${worker_per_gpu}" != "1" || "${MODEL_RUNS_ONE_WORKER_PER_NODE}" == "1" ]]; then
         echo "all"
         return
