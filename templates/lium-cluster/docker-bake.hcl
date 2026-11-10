@@ -1,5 +1,5 @@
 variable "VERSION" {
-    default = "0.0.10-cuda13.0"
+    default = "0.0.11-cuda13.0"
 }
 
 variable "BASE_IMAGE" {
@@ -20,7 +20,7 @@ target "default" {
 # The cu126 -lium1 PyTorch base is the only torch build with sm_70 kernels. Push that base first.
 target "cuda126" {
     inherits = ["default"]
-    tags = ["daturaai/lium-cluster:0.0.10-cuda12.6"]
+    tags = ["daturaai/lium-cluster:0.0.11-cuda12.6"]
     args = {
         BASE_IMAGE = "daturaai/pytorch:2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind-lium1"
     }

@@ -32,6 +32,22 @@ RUN curl -fsSL "https://github.com/linux-rdma/rdma-core/releases/download/v${RDM
     && ninja -C /tmp/build \
     && DESTDIR=/out ninja -C /tmp/build install
 
+# DAH-6113: AWS EFA. NCCL drives EFA only through the aws-ofi-nccl plugin over libfabric's efa
+# provider; over plain verbs it falls back to TCP on the overlay with no error. Both come from AWS's
+# own EFA installer, unpacked rather than installed: its rdma-core would replace the build above.
+FROM ubuntu:24.04 AS efa
+ARG EFA_INSTALLER_VERSION=1.50.0
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+# NCCL loads libnccl-net.so on every host; IB and RoCE pods must keep NCCL's own transport, so the
+# plugin is removed under that name and reachable only as NCCL_NET_PLUGIN=ofi, which lium-fabric-env sets on EFA.
+RUN curl -fsSL "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+        | tar -xz -C /tmp \
+    && cd /tmp/aws-efa-installer/DEBS/UBUNTU2404/x86_64 \
+    && for deb in libfabric1-aws_*.deb libfabric-aws-bin_*.deb libnccl-ofi_*.deb; do dpkg-deb -x "$deb" /out; done \
+    && rm /out/opt/amazon/ofi-nccl/lib/libnccl-net.so \
+    && echo /opt/amazon/efa/lib > /out/etc/ld.so.conf.d/090_efa.conf
+
 FROM ${BASE_IMAGE}
 
 # wireguard-tools brings wg + wg-quick, iproute2 the `ip` this entrypoint needs.
@@ -49,13 +65,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ibverbs-providers \
         ibverbs-utils \
         perftest \
+        libhwloc15 \
     && rm -rf /var/lib/apt/lists/*
 
 # Overlays the apt rdma-core above: libibverbs loads only providers built with it, so every one comes along.
 COPY --from=rdma-core /out/usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 COPY --from=rdma-core /out/usr/bin/ /usr/bin/
 COPY --from=rdma-core /out/etc/libibverbs.d/ /etc/libibverbs.d/
+COPY --from=efa /out/opt/amazon/ /opt/amazon/
+COPY --from=efa /out/etc/ld.so.conf.d/ /etc/ld.so.conf.d/
 RUN ldconfig
+# fi_info is the first thing to run when an EFA job is slow: it lists the efa provider or says why not.
+ENV PATH=/opt/amazon/efa/bin:${PATH}
 
 COPY entrypoint.sh /usr/local/bin/lium-cluster-entrypoint
 COPY lium-rdma-runc.py /usr/local/bin/lium-rdma-runc

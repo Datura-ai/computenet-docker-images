@@ -86,6 +86,23 @@ runtime are the same; two things are not.
   read back empty. Without this check NCCL falls back to TCP over the overlay and the renter pays
   for a cluster that quietly is not one.
 
+## AWS EFA clusters
+
+On an EFA host, NCCL needs AWS's aws-ofi-nccl plugin over libfabric's `efa` provider. Over plain verbs
+it falls back to TCP on the overlay with no error.
+
+- **The image carries both.** They come from AWS's EFA installer (`EFA_INSTALLER_VERSION` in the
+  Dockerfile): libfabric in `/opt/amazon/efa`, the plugin in `/opt/amazon/ofi-nccl`. The plugin is
+  not installed as `libnccl-net.so`, so InfiniBand and RoCE pods keep NCCL's own transport.
+- **`lium-fabric-env` turns it on.** An EFA device (Amazon vendor id `0x1d0f` in `ibv_devinfo`)
+  exports `NCCL_NET_PLUGIN=ofi` and `FI_PROVIDER=efa`. A live InfiniBand port whose subnet
+  manager sits on the host itself (SM LID 1 or one of its own LIDs) joins no fabric and does not
+  hide EFA. A switch-managed InfiniBand port still wins, as in the backend.
+- **The fabric gate is the same.** A `PORT_ACTIVE` EFA port passes it.
+- **Check it:** `fi_info -p efa` lists the provider, and `NCCL_DEBUG=INFO` shows `NET/OFI` lines.
+- **Your own image:** a job run in another image needs libfabric with the efa provider and
+  aws-ofi-nccl too. Otherwise NCCL ignores `NCCL_NET_PLUGIN` and runs over TCP.
+
 ## Verified on real hardware
 
 Two Nebius 8xH100 nodes on one fabric, 8x ConnectX at 400 Gb/sec 4X NDR, rented through the staging
@@ -103,8 +120,8 @@ API on 2026-08-11:
 
 ```bash
 cd templates/lium-cluster
-# 0.0.10-cuda13.0 is already published: a rebuild needs a new VERSION, or it overwrites the live tag
-VERSION=0.0.11-cuda13.0 docker buildx bake --push
+# 0.0.11-cuda13.0 (EFA) is the bake default: a later rebuild needs a new VERSION, or it overwrites the live tag
+docker buildx bake --push
 # V100 (sm_70) fabrics, after daturaai/pytorch:2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind-lium1 is pushed
 docker buildx bake --push cuda126
 ```
@@ -123,7 +140,8 @@ accompany each device, memory pinning, the overlay settings a nested container i
 no fabric, and running twice over one bundle.
 `test_lium_fabric_env.py` covers the fabric reader against real `ibv_devinfo -v` dumps: which GID
 index is picked per driver, the InfiniBand host it must stay silent on, rails that straddle two
-segments, and the exact-match `=` NCCL needs.
+segments, the exact-match `=` NCCL needs, and the EFA plugin switch (with a self-managed or a
+switch-managed InfiniBand port beside it).
 
 `tests/test_entrypoint.sh` runs the entrypoint itself in a throwaway container (wg-quick, ssh and
 the base entrypoint stubbed) and checks where the overlay settings and the cluster login end up,

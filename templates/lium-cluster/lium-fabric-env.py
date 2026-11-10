@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """DAH-2667: tell NCCL which card and which GID carry this pod's fabric, when it is RoCE.
 
+DAH-6113: on AWS EFA, point NCCL at the aws-ofi-nccl plugin and libfabric at its efa provider.
+NCCL cannot drive EFA through plain verbs, so without this it falls back to TCP on the overlay.
+
 On InfiniBand nothing has to be said. There is one fabric, addressing is by LID, and NCCL finds it
 by itself — which is what runs in prod today, so this stays silent on such a host.
 
@@ -31,9 +34,23 @@ import sys
 # The GID that can cross a router. RoCE v1 is L2-only, and NCCL addresses its peers by IP here.
 ROUTABLE_GID_TYPE = "roce v2"
 
+# Amazon's PCI vendor id. EFA has no Ethernet or InfiniBand link layer of its own (ibv_devinfo may
+# print either), so the vendor is the one fact that names it from inside the pod.
+EFA_VENDOR_ID = "0x1d0f"
+
+# The backend's rule (DAH-6099): an SM at LID 1, or on one of the host's own LIDs, manages only this
+# host. Such a port joins no fabric, so it must not hide the EFA one the cluster was rented on.
+SELF_MANAGED_SM_LID = "1"
+
+# What NCCL and libfabric need to run over EFA: the aws-ofi-nccl plugin and libfabric's efa provider.
+EFA_ENVIRONMENT = {"NCCL_NET_PLUGIN": "ofi", "FI_PROVIDER": "efa"}
+
 IBV_DEVINFO = ["ibv_devinfo", "-v"]
 
 _HCA = re.compile(r"^hca_id:\s*(\S+)")
+_VENDOR = re.compile(r"^\s*vendor_id:\s*(\S+)")
+_PORT_LID = re.compile(r"^\s*port_lid:\s*(\S+)")
+_SM_LID = re.compile(r"^\s*sm_lid:\s*(\S+)")
 _PORT = re.compile(r"^\s*port:\s*(\d+)")
 _STATE = re.compile(r"^\s*state:\s*(\S+)")
 _LINK_LAYER = re.compile(r"^\s*link_layer:\s*(\S+)")
@@ -44,11 +61,14 @@ _GID = re.compile(r"^\s*GID\[\s*(\d+)\]:\s*([^,\s]+)(?:,\s*(.*))?$")
 class FabricPort:
     """One RDMA port as libibverbs reports it."""
 
-    def __init__(self, device: str, port: str) -> None:
+    def __init__(self, device: str, port: str, vendor_id: str = "") -> None:
         self.device: str = device
         self.port: str = port
+        self.vendor_id: str = vendor_id
         self.state: str = ""
         self.link_layer: str = ""
+        self.lid: str = ""
+        self.sm_lid: str = ""
         # index -> (address, gid type)
         self.gids: dict[int, tuple[str, str]] = {}
 
@@ -58,12 +78,16 @@ class FabricPort:
         return self.state.upper() == "PORT_ACTIVE"
 
     @property
+    def is_efa(self) -> bool:
+        return self.vendor_id.lower() == EFA_VENDOR_ID
+
+    @property
     def is_roce(self) -> bool:
-        return self.link_layer.lower() == "ethernet"
+        return not self.is_efa and self.link_layer.lower() == "ethernet"
 
     @property
     def is_infiniband(self) -> bool:
-        return self.link_layer.lower() == "infiniband"
+        return not self.is_efa and self.link_layer.lower() == "infiniband"
 
     def segment_of_gid(self, index: int) -> str:
         """The /24 the port's IPv4-mapped GID sits on — what tells two rails apart."""
@@ -98,16 +122,22 @@ def read_ports() -> list[FabricPort]:
 
     ports: list[FabricPort] = []
     device: str = ""
+    vendor_id: str = ""
     current: FabricPort | None = None
     for line in output.splitlines():
         hca = _HCA.match(line)
         if hca:
             device = hca.group(1)
+            vendor_id = ""
             current = None
+            continue
+        vendor = _VENDOR.match(line)
+        if vendor and current is None:
+            vendor_id = vendor.group(1)
             continue
         port = _PORT.match(line)
         if port:
-            current = FabricPort(device, port.group(1))
+            current = FabricPort(device, port.group(1), vendor_id)
             ports.append(current)
             continue
         if current is None:
@@ -120,6 +150,14 @@ def read_ports() -> list[FabricPort]:
         if link_layer:
             current.link_layer = link_layer.group(1)
             continue
+        port_lid = _PORT_LID.match(line)
+        if port_lid:
+            current.lid = port_lid.group(1)
+            continue
+        sm_lid = _SM_LID.match(line)
+        if sm_lid:
+            current.sm_lid = sm_lid.group(1)
+            continue
         gid = _GID.match(line)
         if gid:
             current.gids[int(gid.group(1))] = (gid.group(2), (gid.group(3) or "").strip())
@@ -129,10 +167,17 @@ def read_ports() -> list[FabricPort]:
 def fabric_environment(ports: list[FabricPort]) -> dict[str, str]:
     """What NCCL needs beyond the overlay, or nothing at all on an InfiniBand host."""
     live_ports = [port for port in ports if port.is_active]
+    own_lids = {port.lid for port in live_ports if port.lid}
     # A host holding a live InfiniBand port was sold on that fabric — pinning its Ethernet leg
-    # would point the job at the wrong wire.
-    if any(port.is_infiniband for port in live_ports):
+    # would point the job at the wrong wire. A self-managed port joins nothing and does not count;
+    # one whose sm_lid was not read still does.
+    if any(
+        port.is_infiniband and not (port.sm_lid == SELF_MANAGED_SM_LID or port.sm_lid in own_lids)
+        for port in live_ports
+    ):
         return {}
+    if any(port.is_efa for port in live_ports):
+        return dict(EFA_ENVIRONMENT)
 
     rails: list[str] = []
     gid_indexes: set[int] = set()
