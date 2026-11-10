@@ -19,12 +19,15 @@ ARG BASE_IMAGE=daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind
 # receive; NCCL then fails every collective on Intel irdma. The fix landed in rdma-core 52.
 FROM ubuntu:24.04 AS rdma-core
 ARG RDMA_CORE_VERSION=65.0
+# sha256 of that release tarball (matches GitHub's published asset digest); bump both together
+ARG RDMA_CORE_SHA256=8eb93c14740146e04c28ac25874e106b61c7d3ab66a36d07099e938985ef0680
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl cmake ninja-build pkg-config gcc libc6-dev \
         libnl-3-dev libnl-route-3-dev libudev-dev python3 \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL "https://github.com/linux-rdma/rdma-core/releases/download/v${RDMA_CORE_VERSION}/rdma-core-${RDMA_CORE_VERSION}.tar.gz" \
-        | tar -xz -C /tmp \
+RUN curl -fsSL -o /tmp/rdma-core.tar.gz "https://github.com/linux-rdma/rdma-core/releases/download/v${RDMA_CORE_VERSION}/rdma-core-${RDMA_CORE_VERSION}.tar.gz" \
+    && echo "${RDMA_CORE_SHA256}  /tmp/rdma-core.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/rdma-core.tar.gz -C /tmp \
     && cmake -S "/tmp/rdma-core-${RDMA_CORE_VERSION}" -B /tmp/build -GNinja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu -DCMAKE_INSTALL_SYSCONFDIR=/etc \
