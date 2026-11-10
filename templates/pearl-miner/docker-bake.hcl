@@ -8,11 +8,11 @@ variable "RELEASE" {
 
 # DAH-6084: WildRig Multi build for the Pearl benchmark. Pin = official release tarball + its sha256 (Dockerfile verifies it).
 variable "WILDRIG_VERSION" {
-    default = "0.51.9"
+    default = "0.52.1"
 }
 
 variable "WILDRIG_SHA256" {
-    default = "7444c6c48b70006c2ec045bd69a37393c2fc293c7e47cdf561c9561408d5bb44"
+    default = "33587b9968b1d631b1574db8ea9c5cc50ef966e653fec4bcbb3001a6ad9dfdc0"
 }
 
 target "default" {

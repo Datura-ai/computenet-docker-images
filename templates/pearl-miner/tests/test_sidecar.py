@@ -67,7 +67,7 @@ def summary_payload() -> dict:
 def wildrig_payload() -> dict:
     """WildRig's stats document, in the fields its own HiveOS h-stats.sh reads: two cards, one hashing."""
     return {
-        "version": "0.51.9",
+        "version": "0.52.1",
         "algo": "pearlhash",
         "uptime": 600,
         "hashrate": {"total": [70.0e12, 69.0e12, 68.0e12], "threads": [[70.0e12, 69.0e12], [0.0, 0.0]]},

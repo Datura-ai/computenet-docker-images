@@ -21,8 +21,8 @@ ARG PEAKMINER_SHA256=abdc8f915c149e5ca265a40dbafa59b92159a1d40478ced199e4e384060
 # `wildrig`). WildRig is pinned by the sha256 of the official release tarball and never self-updates: a benchmark compares
 # one exact build. Bump both lines together, from https://github.com/andru-kun/wildrig-multi/releases.
 ARG PEARL_MINER=peakminer
-ARG WILDRIG_VERSION=0.51.9
-ARG WILDRIG_SHA256=7444c6c48b70006c2ec045bd69a37393c2fc293c7e47cdf561c9561408d5bb44
+ARG WILDRIG_VERSION=0.52.1
+ARG WILDRIG_SHA256=33587b9968b1d631b1574db8ea9c5cc50ef966e653fec4bcbb3001a6ad9dfdc0
 
 # python3: only for the metrics sidecar, which is stdlib-only on purpose — the miner binary itself
 # needs nothing but glibc. NOT python3-minimal: it ships a cut-down stdlib without hmac or
