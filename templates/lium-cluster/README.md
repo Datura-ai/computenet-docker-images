@@ -96,7 +96,7 @@ it falls back to TCP on the overlay with no error.
   not installed as `libnccl-net.so`, so InfiniBand and RoCE pods keep NCCL's own transport.
 - **`lium-fabric-env` turns it on.** An EFA device (Amazon vendor id `0x1d0f` in `ibv_devinfo`)
   exports `NCCL_NET_PLUGIN=ofi` and `FI_PROVIDER=efa`. A live InfiniBand port whose subnet
-  manager sits on the host itself (SM LID 1 or one of its own LIDs) joins no fabric and does not
+  manager sits on the host itself (its SM LID is one of the host's own LIDs on that subnet) joins no fabric and does not
   hide EFA. A switch-managed InfiniBand port still wins, as in the backend.
 - **The fabric gate is the same.** A `PORT_ACTIVE` EFA port passes it.
 - **Check it:** `fi_info -p efa` lists the provider, and `NCCL_DEBUG=INFO` shows `NET/OFI` lines.

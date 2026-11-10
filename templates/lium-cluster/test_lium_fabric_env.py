@@ -271,6 +271,13 @@ def test_a_self_managed_infiniband_port_does_not_hide_efa(devinfo) -> None:
     assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports())["NCCL_NET_PLUGIN"] == "ofi"
 
 
+def test_a_self_managed_infiniband_port_beside_roce_pins_nothing(devinfo) -> None:
+    # without EFA the self-managed exemption must not apply: master printed nothing for any live IB port
+    devinfo(SELF_MANAGED_INFINIBAND + MLX5_ROCE.replace("mlx5_0", "mlx5_4").replace("mlx5_1", "mlx5_5"))
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
+
+
 def test_a_switch_managed_infiniband_port_still_wins_over_efa(devinfo) -> None:
     devinfo(SWITCH_MANAGED_INFINIBAND + EFA)
 

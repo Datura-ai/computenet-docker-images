@@ -37,12 +37,15 @@ RUN curl -fsSL "https://github.com/linux-rdma/rdma-core/releases/download/v${RDM
 # own EFA installer, unpacked rather than installed: its rdma-core would replace the build above.
 FROM ubuntu:24.04 AS efa
 ARG EFA_INSTALLER_VERSION=1.50.0
+# sha256 of that archive; bump both together, the build refuses any other bytes
+ARG EFA_INSTALLER_SHA256=fa6dff8593d866866c13cb4640d9059835cd4efa427971f100ab40c97bef2841
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 # NCCL loads libnccl-net.so on every host; IB and RoCE pods must keep NCCL's own transport, so the
 # plugin is removed under that name and reachable only as NCCL_NET_PLUGIN=ofi, which lium-fabric-env sets on EFA.
-RUN curl -fsSL "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
-        | tar -xz -C /tmp \
+RUN curl -fsSL -o /tmp/efa.tar.gz "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+    && echo "${EFA_INSTALLER_SHA256}  /tmp/efa.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/efa.tar.gz -C /tmp \
     && cd /tmp/aws-efa-installer/DEBS/UBUNTU2404/x86_64 \
     && for deb in libfabric1-aws_*.deb libfabric-aws-bin_*.deb libnccl-ofi_*.deb; do dpkg-deb -x "$deb" /out; done \
     && rm /out/opt/amazon/ofi-nccl/lib/libnccl-net.so \

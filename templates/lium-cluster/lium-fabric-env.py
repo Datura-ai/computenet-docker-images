@@ -175,6 +175,9 @@ def fabric_environment(ports: list[FabricPort]) -> dict[str, str]:
         return {}
     if any(port.is_efa for port in live_ports):
         return dict(EFA_ENVIRONMENT)
+    # the self-managed exemption is for EFA only: without EFA any live InfiniBand port leaves NCCL alone, as before
+    if any(port.is_infiniband for port in live_ports):
+        return {}
 
     rails: list[str] = []
     gid_indexes: set[int] = set()
