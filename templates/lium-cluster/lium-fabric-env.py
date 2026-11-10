@@ -38,10 +38,6 @@ ROUTABLE_GID_TYPE = "roce v2"
 # print either), so the vendor is the one fact that names it from inside the pod.
 EFA_VENDOR_ID = "0x1d0f"
 
-# The backend's rule (DAH-6099): an SM at LID 1, or on one of the host's own LIDs, manages only this
-# host. Such a port joins no fabric, so it must not hide the EFA one the cluster was rented on.
-SELF_MANAGED_SM_LID = "1"
-
 # What NCCL and libfabric need to run over EFA: the aws-ofi-nccl plugin and libfabric's efa provider.
 EFA_ENVIRONMENT = {"NCCL_NET_PLUGIN": "ofi", "FI_PROVIDER": "efa"}
 
@@ -169,12 +165,9 @@ def fabric_environment(ports: list[FabricPort]) -> dict[str, str]:
     live_ports = [port for port in ports if port.is_active]
     own_lids = {port.lid for port in live_ports if port.lid}
     # A host holding a live InfiniBand port was sold on that fabric — pinning its Ethernet leg
-    # would point the job at the wrong wire. A self-managed port joins nothing and does not count;
-    # one whose sm_lid was not read still does.
-    if any(
-        port.is_infiniband and not (port.sm_lid == SELF_MANAGED_SM_LID or port.sm_lid in own_lids)
-        for port in live_ports
-    ):
+    # would point the job at the wrong wire. A port whose SM sits on one of the host's own LIDs (the
+    # rent gate's rule) joins nothing and does not count; a real switch at LID 1 still does.
+    if any(port.is_infiniband and port.sm_lid not in own_lids for port in live_ports):
         return {}
     if any(port.is_efa for port in live_ports):
         return dict(EFA_ENVIRONMENT)

@@ -277,6 +277,12 @@ def test_a_switch_managed_infiniband_port_still_wins_over_efa(devinfo) -> None:
     assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
 
 
+def test_a_real_switch_whose_subnet_manager_holds_lid_1_still_wins_over_efa(devinfo) -> None:
+    devinfo(SELF_MANAGED_INFINIBAND.replace("port_lid:\t\t1", "port_lid:\t\t9") + EFA)
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
+
+
 def test_an_active_efa_port_passes_the_fabric_gate(devinfo) -> None:
     devinfo(EFA)
 
