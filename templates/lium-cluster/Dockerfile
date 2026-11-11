@@ -80,7 +80,13 @@ COPY --from=rdma-core /out/usr/bin/ /usr/bin/
 COPY --from=rdma-core /out/etc/libibverbs.d/ /etc/libibverbs.d/
 COPY --from=efa /out/opt/amazon/ /opt/amazon/
 COPY --from=efa /out/etc/ld.so.conf.d/ /etc/ld.so.conf.d/
-RUN ldconfig
+# aws-ofi-nccl dlopens the unversioned libcudart.so; without it NCCL drops to sockets with no error (0.6 vs 14.7 Gbit/s on
+# EFA). The cu130 base has no CUDA toolkit, only torch's wheel (nvidia/cu13/lib/libcudart.so.13), so link whichever exists.
+RUN cudart=$(ls /usr/local/cuda/lib64/libcudart.so 2>/dev/null \
+        || python3 -c "import glob, nvidia; print(sorted(glob.glob(list(nvidia.__path__)[0] + '/*/lib/libcudart.so.[0-9]*'))[0])") \
+    && ln -sf "$(readlink -f "$cudart")" /usr/lib/x86_64-linux-gnu/libcudart.so \
+    && ldconfig \
+    && python3 -c "import ctypes; ctypes.CDLL('libcudart.so')"
 # fi_info is the first thing to run when an EFA job is slow: it lists the efa provider or says why not.
 ENV PATH=/opt/amazon/efa/bin:${PATH}
 

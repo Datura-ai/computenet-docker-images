@@ -120,7 +120,7 @@ API on 2026-08-11:
 
 ```bash
 cd templates/lium-cluster
-# 0.0.11-cuda13.0 (EFA) is the bake default: a later rebuild needs a new VERSION, or it overwrites the live tag
+# 0.0.12-cuda13.0 (EFA) is the bake default: a later rebuild needs a new VERSION, or it overwrites the live tag
 docker buildx bake --push
 # V100 (sm_70) fabrics, after daturaai/pytorch:2.12.0-py3.12-cuda12.6-devel-ubuntu24.04-dind-lium1 is pushed
 docker buildx bake --push cuda126
