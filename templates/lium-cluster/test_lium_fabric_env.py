@@ -224,7 +224,7 @@ def test_a_pod_with_no_active_port_is_refused() -> None:
     """The script is the gate: the entrypoint turns its non-zero exit into a refused pod."""
     down_only = SOFT_ROCE.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)")
 
-    assert not any(port.is_active for port in _ports_from(down_only))
+    assert lium_fabric_env.fabric_gate_error(_ports_from(down_only))
 
 
 # DAH-6113: an AWS p5en EFA device as ibv_devinfo prints it (Amazon vendor id, no Ethernet/IB layer).
@@ -306,4 +306,19 @@ def test_an_own_lid_from_another_subnet_does_not_make_a_shared_rail_self_managed
 def test_an_active_efa_port_passes_the_fabric_gate(devinfo) -> None:
     devinfo(EFA)
 
-    assert any(port.is_active for port in lium_fabric_env.read_ports())
+    assert lium_fabric_env.fabric_gate_error(lium_fabric_env.read_ports()) is None
+
+
+def test_a_down_efa_port_beside_a_self_managed_infiniband_port_is_refused(devinfo) -> None:
+    # cdi#93 review: the self-managed port joins no fabric, so the pod would start with no inter-node link
+    devinfo(SELF_MANAGED_INFINIBAND + EFA.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)"))
+
+    assert lium_fabric_env.fabric_gate_error(lium_fabric_env.read_ports()) == (
+        "lium-cluster: the EFA port is not ACTIVE in this pod"
+    )
+
+
+def test_a_down_efa_port_beside_a_switch_managed_infiniband_port_passes(devinfo) -> None:
+    devinfo(SWITCH_MANAGED_INFINIBAND + EFA.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)"))
+
+    assert lium_fabric_env.fabric_gate_error(lium_fabric_env.read_ports()) is None
