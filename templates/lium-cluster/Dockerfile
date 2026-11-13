@@ -19,18 +19,40 @@ ARG BASE_IMAGE=daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind
 # receive; NCCL then fails every collective on Intel irdma. The fix landed in rdma-core 52.
 FROM ubuntu:24.04 AS rdma-core
 ARG RDMA_CORE_VERSION=65.0
+# sha256 of that release tarball (matches GitHub's published asset digest); bump both together
+ARG RDMA_CORE_SHA256=8eb93c14740146e04c28ac25874e106b61c7d3ab66a36d07099e938985ef0680
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl cmake ninja-build pkg-config gcc libc6-dev \
         libnl-3-dev libnl-route-3-dev libudev-dev python3 \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL "https://github.com/linux-rdma/rdma-core/releases/download/v${RDMA_CORE_VERSION}/rdma-core-${RDMA_CORE_VERSION}.tar.gz" \
-        | tar -xz -C /tmp \
+RUN curl -fsSL -o /tmp/rdma-core.tar.gz "https://github.com/linux-rdma/rdma-core/releases/download/v${RDMA_CORE_VERSION}/rdma-core-${RDMA_CORE_VERSION}.tar.gz" \
+    && echo "${RDMA_CORE_SHA256}  /tmp/rdma-core.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/rdma-core.tar.gz -C /tmp \
     && cmake -S "/tmp/rdma-core-${RDMA_CORE_VERSION}" -B /tmp/build -GNinja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
         -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu -DCMAKE_INSTALL_SYSCONFDIR=/etc \
         -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 -DENABLE_STATIC=0 \
     && ninja -C /tmp/build \
     && DESTDIR=/out ninja -C /tmp/build install
+
+# DAH-6113: AWS EFA. NCCL drives EFA only through the aws-ofi-nccl plugin over libfabric's efa
+# provider; over plain verbs it falls back to TCP on the overlay with no error. Both come from AWS's
+# own EFA installer, unpacked rather than installed: its rdma-core would replace the build above.
+FROM ubuntu:24.04 AS efa
+ARG EFA_INSTALLER_VERSION=1.50.0
+# sha256 of that archive; bump both together, the build refuses any other bytes
+ARG EFA_INSTALLER_SHA256=fa6dff8593d866866c13cb4640d9059835cd4efa427971f100ab40c97bef2841
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+# NCCL loads libnccl-net.so on every host; IB and RoCE pods must keep NCCL's own transport, so the
+# plugin is removed under that name and reachable only as NCCL_NET_PLUGIN=ofi, which lium-fabric-env sets on EFA.
+RUN curl -fsSL -o /tmp/efa.tar.gz "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+    && echo "${EFA_INSTALLER_SHA256}  /tmp/efa.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/efa.tar.gz -C /tmp \
+    && cd /tmp/aws-efa-installer/DEBS/UBUNTU2404/x86_64 \
+    && for deb in libfabric1-aws_*.deb libfabric-aws-bin_*.deb libnccl-ofi_*.deb; do dpkg-deb -x "$deb" /out; done \
+    && rm /out/opt/amazon/ofi-nccl/lib/libnccl-net.so \
+    && echo /opt/amazon/efa/lib > /out/etc/ld.so.conf.d/090_efa.conf
 
 FROM ${BASE_IMAGE}
 
@@ -49,13 +71,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ibverbs-providers \
         ibverbs-utils \
         perftest \
+        libhwloc15 \
     && rm -rf /var/lib/apt/lists/*
 
 # Overlays the apt rdma-core above: libibverbs loads only providers built with it, so every one comes along.
 COPY --from=rdma-core /out/usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 COPY --from=rdma-core /out/usr/bin/ /usr/bin/
 COPY --from=rdma-core /out/etc/libibverbs.d/ /etc/libibverbs.d/
-RUN ldconfig
+COPY --from=efa /out/opt/amazon/ /opt/amazon/
+COPY --from=efa /out/etc/ld.so.conf.d/ /etc/ld.so.conf.d/
+# aws-ofi-nccl dlopens the unversioned libcudart.so; without it NCCL drops to sockets with no error (0.6 vs 14.7 Gbit/s on
+# EFA). The cu130 base has no CUDA toolkit, only torch's wheel (nvidia/cu13/lib/libcudart.so.13), so link whichever exists.
+RUN cudart=$(ls /usr/local/cuda/lib64/libcudart.so 2>/dev/null \
+        || python3 -c "import glob, nvidia; print(sorted(glob.glob(list(nvidia.__path__)[0] + '/*/lib/libcudart.so.[0-9]*'))[0])") \
+    && ln -sf "$(readlink -f "$cudart")" /usr/lib/x86_64-linux-gnu/libcudart.so \
+    && ldconfig \
+    && python3 -c "import ctypes; ctypes.CDLL('libcudart.so')"
+# fi_info is the first thing to run when an EFA job is slow: it lists the efa provider or says why not.
+ENV PATH=/opt/amazon/efa/bin:${PATH}
 
 COPY entrypoint.sh /usr/local/bin/lium-cluster-entrypoint
 COPY lium-rdma-runc.py /usr/local/bin/lium-rdma-runc

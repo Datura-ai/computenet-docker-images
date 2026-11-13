@@ -224,4 +224,101 @@ def test_a_pod_with_no_active_port_is_refused() -> None:
     """The script is the gate: the entrypoint turns its non-zero exit into a refused pod."""
     down_only = SOFT_ROCE.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)")
 
-    assert not any(port.is_active for port in _ports_from(down_only))
+    assert lium_fabric_env.fabric_gate_error(_ports_from(down_only))
+
+
+# DAH-6113: an AWS p5en EFA device as ibv_devinfo prints it (Amazon vendor id, no Ethernet/IB layer).
+EFA = """hca_id:\trdmap79s0
+\ttransport:\t\t\tunspecified (4)
+\tvendor_id:\t\t\t0x1d0f
+\t\tport:\t1
+\t\t\tstate:\t\t\tPORT_ACTIVE (4)
+\t\t\tport_lid:\t\t0
+\t\t\tlink_layer:\t\tUnspecified
+"""
+
+# A dual-port prod B300 host's mlx5 port: the subnet manager sits at LID 1, i.e. on this host only.
+SELF_MANAGED_INFINIBAND = """hca_id:\tmlx5_0
+\tvendor_id:\t\t\t0x02c9
+\t\tport:\t1
+\t\t\tstate:\t\t\tPORT_ACTIVE (4)
+\t\t\tsm_lid:\t\t\t1
+\t\t\tport_lid:\t\t1
+\t\t\tlink_layer:\t\tInfiniBand
+"""
+
+SWITCH_MANAGED_INFINIBAND = SELF_MANAGED_INFINIBAND.replace("sm_lid:\t\t\t1", "sm_lid:\t\t\t14")
+
+
+def test_an_efa_pod_points_nccl_at_the_ofi_plugin(devinfo) -> None:
+    devinfo(EFA)
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {
+        "NCCL_NET_PLUGIN": "ofi",
+        "FI_PROVIDER": "efa",
+    }
+
+
+def test_an_efa_device_printed_as_infiniband_is_still_efa(devinfo) -> None:
+    devinfo(EFA.replace("Unspecified", "InfiniBand"))
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports())["FI_PROVIDER"] == "efa"
+
+
+def test_a_self_managed_infiniband_port_does_not_hide_efa(devinfo) -> None:
+    devinfo(SELF_MANAGED_INFINIBAND + EFA)
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports())["NCCL_NET_PLUGIN"] == "ofi"
+
+
+def test_a_self_managed_infiniband_port_beside_roce_pins_nothing(devinfo) -> None:
+    # without EFA the self-managed exemption must not apply: master printed nothing for any live IB port
+    devinfo(SELF_MANAGED_INFINIBAND + MLX5_ROCE.replace("mlx5_0", "mlx5_4").replace("mlx5_1", "mlx5_5"))
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
+
+
+def test_a_switch_managed_infiniband_port_still_wins_over_efa(devinfo) -> None:
+    devinfo(SWITCH_MANAGED_INFINIBAND + EFA)
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
+
+
+def test_a_real_switch_whose_subnet_manager_holds_lid_1_still_wins_over_efa(devinfo) -> None:
+    devinfo(SELF_MANAGED_INFINIBAND.replace("port_lid:\t\t1", "port_lid:\t\t9") + EFA)
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
+
+
+def test_an_own_lid_from_another_subnet_does_not_make_a_shared_rail_self_managed(devinfo) -> None:
+    # LIDs repeat across subnets: rail A (LID 7) has its SM at 9, rail B (LID 9) has its SM at 7
+    rail_a = SELF_MANAGED_INFINIBAND.replace("sm_lid:\t\t\t1", "sm_lid:\t\t\t9").replace(
+        "port_lid:\t\t1", "port_lid:\t\t7"
+    )
+    rail_b = rail_a.replace("mlx5_0", "mlx5_1").replace("sm_lid:\t\t\t9", "sm_lid:\t\t\t7").replace(
+        "port_lid:\t\t7", "port_lid:\t\t9"
+    )
+    devinfo(rail_a + rail_b + EFA)
+
+    assert lium_fabric_env.fabric_environment(lium_fabric_env.read_ports()) == {}
+
+
+def test_an_active_efa_port_passes_the_fabric_gate(devinfo) -> None:
+    devinfo(EFA)
+
+    assert lium_fabric_env.fabric_gate_error(lium_fabric_env.read_ports()) is None
+
+
+def test_a_down_efa_port_beside_a_self_managed_infiniband_port_is_refused(devinfo) -> None:
+    # cdi#93 review: the self-managed port joins no fabric, so the pod would start with no inter-node link
+    devinfo(SELF_MANAGED_INFINIBAND + EFA.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)"))
+
+    assert lium_fabric_env.fabric_gate_error(lium_fabric_env.read_ports()) == (
+        "lium-cluster: the EFA port is not ACTIVE in this pod"
+    )
+
+
+def test_a_down_efa_port_beside_a_switch_managed_infiniband_port_passes(devinfo) -> None:
+    devinfo(SWITCH_MANAGED_INFINIBAND + EFA.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)"))
+
+    assert lium_fabric_env.fabric_gate_error(lium_fabric_env.read_ports()) is None
