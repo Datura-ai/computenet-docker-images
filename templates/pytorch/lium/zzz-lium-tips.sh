@@ -15,7 +15,7 @@ PY
       unset _lium_tips
     fi
     cat <<'EOF'
-tips   : /workspace is the fast disk (/root is an encrypted FUSE mount) - HF_HOME=/workspace/hf is preset
+tips   : keep notebooks and results in /root, the pod volume: /workspace (the fast disk, HF_HOME=/workspace/hf) is wiped on reboot
          pip installs into the system python (PEP 668 handled); torch is pinned via /etc/pip/constraints.txt,
          bypass once with PIP_CONSTRAINT=/dev/null pip install ...   |  uv, ffmpeg, tesseract, rsync, nvcc included
          background jobs: nohup setsid CMD > log 2>&1 < /dev/null &   |  lium-gpu-check prints GPU/torch/arch status

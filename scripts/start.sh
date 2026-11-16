@@ -132,7 +132,7 @@ start_jupyter() {
         # its runtime dir under /root: every kernel start would then fail.
         mkdir -p /workspace && \
         cd / && \
-        JUPYTER_RUNTIME_DIR=/run/jupyter nohup jupyter lab --allow-root --no-browser --port=8888 --ip=* --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings='{"shell_command":["/bin/bash"]}' --ServerApp.token=$JUPYTER_PASSWORD --ServerApp.allow_origin=* --ServerApp.preferred_dir=/workspace &> /jupyter.log &
+        JUPYTER_RUNTIME_DIR=/run/jupyter nohup jupyter lab --allow-root --no-browser --port=8888 --ip=* --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings='{"shell_command":["/bin/bash"]}' --ServerApp.token=$JUPYTER_PASSWORD --ServerApp.allow_origin=* --ServerApp.preferred_dir=/root &> /jupyter.log &
         echo "Jupyter Lab started"
     fi
 }
