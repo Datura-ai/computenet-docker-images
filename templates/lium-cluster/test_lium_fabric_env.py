@@ -322,3 +322,12 @@ def test_a_down_efa_port_beside_a_switch_managed_infiniband_port_passes(devinfo)
     devinfo(SWITCH_MANAGED_INFINIBAND + EFA.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)"))
 
     assert lium_fabric_env.fabric_gate_error(lium_fabric_env.read_ports()) is None
+
+
+def test_a_down_efa_port_beside_an_active_roce_port_is_refused(devinfo) -> None:
+    # Deliberate: an EFA host is sold on its EFA card, so a dead EFA port refuses the pod rather than fall back to RoCE
+    devinfo(SOFT_ROCE + EFA.replace("PORT_ACTIVE (4)", "PORT_DOWN (1)"))
+
+    assert lium_fabric_env.fabric_gate_error(lium_fabric_env.read_ports()) == (
+        "lium-cluster: the EFA port is not ACTIVE in this pod"
+    )
