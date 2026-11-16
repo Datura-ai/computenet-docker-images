@@ -53,6 +53,10 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Where the dolphinpod-worker binary and its self-updates live.
 ENV DOLPHIN_HOME=/opt/dolphinpod
+# Our own scripts, outside DOLPHIN_HOME: the validator mounts a cache volume there that outlives image
+# releases (DAH-6482), and Docker fills a named volume from the image only while it is empty, so a copy
+# under DOLPHIN_HOME would stay at the first release that created the volume.
+ENV DOLPHIN_SCRIPTS_DIR=/opt/dolphin-scripts
 
 WORKDIR ${DOLPHIN_HOME}
 
@@ -61,12 +65,12 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Metrics sidecar (DAH-2468): proxies vLLM's unix-socket /metrics onto :9101 so the
 # platform's published-port machinery can expose per-machine token counters.
-COPY metrics_sidecar.py ${DOLPHIN_HOME}/metrics_sidecar.py
+COPY metrics_sidecar.py ${DOLPHIN_SCRIPTS_DIR}/metrics_sidecar.py
 
 # Engine watchdog: restarts a vLLM engine that wedged inside a CUDA kernel (token counters
 # frozen while requests are in flight). Imports the sidecar's unix-socket client, so both
 # files must live in the same directory.
-COPY watchdog.py ${DOLPHIN_HOME}/watchdog.py
+COPY watchdog.py ${DOLPHIN_SCRIPTS_DIR}/watchdog.py
 
 # entrypoint.sh renders worker.json from env, ensures the binary is present, then supervises
 # `dolphinpod-worker update && dolphinpod-worker start` in a restart loop: when the worker exits

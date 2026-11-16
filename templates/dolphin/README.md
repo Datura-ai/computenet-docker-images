@@ -137,6 +137,10 @@ v2.dphn.ai dashboard.
 
 ## Metrics sidecar
 
+`metrics_sidecar.py` and `watchdog.py` live in `/opt/dolphin-scripts` (`DOLPHIN_SCRIPTS_DIR`), outside
+`DOLPHIN_HOME`: the validator mounts a cache volume on `DOLPHIN_HOME` that is kept across image releases, and
+Docker fills a named volume from the image only while it is empty, so a copy there would never update.
+
 `metrics_sidecar.py` (stdlib python, supervised by `entrypoint.sh` in its own
 restart loop) proxies the vLLM engine's unix-socket `/metrics` onto `:9101` so
 the platform's published-port machinery can expose per-machine token counters

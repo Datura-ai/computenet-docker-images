@@ -455,7 +455,9 @@ test_split_sidecar_and_watchdog_wiring() {
     mkdir -p "${DOLPHIN_HOME}"
     mock_nvidia_smi "0:97887" "1:97887"
     mock_curl
-    touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
+    export DOLPHIN_SCRIPTS_DIR="${SANDBOX}/scripts"
+    mkdir -p "${DOLPHIN_SCRIPTS_DIR}"
+    touch "${DOLPHIN_SCRIPTS_DIR}/metrics_sidecar.py" "${DOLPHIN_SCRIPTS_DIR}/watchdog.py"
     # Record which helper was launched and what engine count it was told about.
     cat >"${SANDBOX}/bin/python3" <<EOF
 #!/usr/bin/env bash
@@ -497,7 +499,9 @@ test_per_engine_watchdog_in_split_mode() {
     mkdir -p "${DOLPHIN_HOME}"
     mock_nvidia_smi "0:97887" "1:97887"
     mock_curl
-    touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
+    export DOLPHIN_SCRIPTS_DIR="${SANDBOX}/scripts"
+    mkdir -p "${DOLPHIN_SCRIPTS_DIR}"
+    touch "${DOLPHIN_SCRIPTS_DIR}/metrics_sidecar.py" "${DOLPHIN_SCRIPTS_DIR}/watchdog.py"
     cat >"${SANDBOX}/bin/python3" <<EOF
 #!/usr/bin/env bash
 echo "\$(basename "\$1") gpus=\${DOLPHIN_WATCHDOG_GPU_SET:-none} home=\$(basename "\${DOLPHIN_WATCHDOG_INSTANCE_HOME:-none}") state=\$(basename "\${DOLPHIN_WATCHDOG_STATE:-none}")" >>"${SANDBOX}/python.log"
@@ -541,7 +545,9 @@ test_single_engine_watchdog() {
     mkdir -p "${DOLPHIN_HOME}"
     mock_nvidia_smi "0:97887"
     mock_curl
-    touch "${DOLPHIN_HOME}/metrics_sidecar.py" "${DOLPHIN_HOME}/watchdog.py"
+    export DOLPHIN_SCRIPTS_DIR="${SANDBOX}/scripts"
+    mkdir -p "${DOLPHIN_SCRIPTS_DIR}"
+    touch "${DOLPHIN_SCRIPTS_DIR}/metrics_sidecar.py" "${DOLPHIN_SCRIPTS_DIR}/watchdog.py"
     # A restarted container keeps its /tmp, so a previous run's split leaves state files
     # behind. They would publish as dead watchdogs for bundles that no longer exist.
     echo '{}' >"${DOLPHIN_WATCHDOG_STATE_DIR}/dolphin_watchdog_state_gpu7.json"
