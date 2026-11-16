@@ -7,13 +7,15 @@ jupyter_answers() { python3 -c 'import urllib.request; urllib.request.urlopen("h
 for _ in $(seq 1 60); do jupyter_answers && break; sleep 0.5; done
 jupyter_answers || { echo "Jupyter does not answer on port 8888"; exit 1; }
 echo "Jupyter answers"
-# Jupyter must open in /root, the pod volume: /workspace is wiped on reboot and notebooks saved there are lost.
+# Jupyter must open in the pod volume (smoke.env names /workspace): anywhere else is wiped on reboot.
 python3 -c '
 import os, re, urllib.request as u
+want = os.environ.get("LIUM_VOLUME_PATH", "/root").lstrip("/")
 page = u.urlopen(u.Request("http://127.0.0.1:8888/lab", headers={"Authorization": "token " + os.environ["JUPYTER_PASSWORD"]}), timeout=30).read().decode()
-assert re.search(r"\"preferredPath\": *\"root\"", page), re.findall(r"\"preferredPath\": *\"[^\"]*\"", page)
-' || { echo "Jupyter does not open in /root"; exit 1; }
-echo "Jupyter opens in /root"
+assert re.search(r"\"preferredPath\": *\"%s\"" % re.escape(want), page), (want, re.findall(r"\"preferredPath\": *\"[^\"]*\"", page))
+' || { echo "Jupyter does not open in the pod volume"; exit 1; }
+[ "$(cat /etc/lium-volume-path)" = "${LIUM_VOLUME_PATH:-/root}" ] || { echo "/etc/lium-volume-path does not name the pod volume"; exit 1; }
+echo "Jupyter and the login tip use the pod volume"
 # /root is the renter's volume: Docker copies what the image keeps there into it, so the Dockerfile's cleanup must hold.
 for leftover in /root/.cache /root/.launchpadlib /root/.wget-hsts /root/.local/share/jupyter/nbextensions /root/.jupyter/nbconfig; do
     [ ! -e "$leftover" ] || { echo "image leaves $leftover in /root"; exit 1; }

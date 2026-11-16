@@ -14,8 +14,10 @@ PY
       printf '%s\n' "$_lium_tips"
       unset _lium_tips
     fi
+    _lium_vol="$(cat /etc/lium-volume-path 2>/dev/null || echo /root)"
+    echo "tips   : keep notebooks and results in ${_lium_vol:-/root}, the pod volume: everything outside it is wiped on reboot (HF_HOME=/workspace/hf)"
+    unset _lium_vol
     cat <<'EOF'
-tips   : keep notebooks and results in /root, the pod volume: /workspace (the fast disk, HF_HOME=/workspace/hf) is wiped on reboot
          pip installs into the system python (PEP 668 handled); torch is pinned via /etc/pip/constraints.txt,
          bypass once with PIP_CONSTRAINT=/dev/null pip install ...   |  uv, ffmpeg, tesseract, rsync, nvcc included
          background jobs: nohup setsid CMD > log 2>&1 < /dev/null &   |  lium-gpu-check prints GPU/torch/arch status
