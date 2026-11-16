@@ -30,6 +30,9 @@ set -euo pipefail
 
 DOLPHIN_HOME="${DOLPHIN_HOME:-/opt/dolphinpod}"
 WORKER_BIN="${DOLPHIN_HOME}/dolphinpod-worker"
+# The metrics sidecar and the watchdog ship with the image, outside DOLPHIN_HOME: that is a cache volume kept
+# across image releases (DAH-6482), and Docker copies image files into a named volume only while it is empty.
+DOLPHIN_SCRIPTS_DIR="${DOLPHIN_SCRIPTS_DIR:-/opt/dolphin-scripts}"
 # Where the per-instance watchdogs write their state. The container's own filesystem, so the
 # names below stay private to this container; the sidecar globs the same directory.
 WATCHDOG_STATE_DIR="${DOLPHIN_WATCHDOG_STATE_DIR:-/tmp}"
@@ -519,10 +522,10 @@ plan_worker_instances() {
 start_metrics_sidecar() {
     export DOLPHIN_ENGINES_EXPECTED="${#GPU_SETS[@]}"
     SIDECAR_PID=""
-    [[ -f "${DOLPHIN_HOME}/metrics_sidecar.py" ]] || return 0
+    [[ -f "${DOLPHIN_SCRIPTS_DIR}/metrics_sidecar.py" ]] || return 0
     (
         while true; do
-            python3 "${DOLPHIN_HOME}/metrics_sidecar.py" || true
+            python3 "${DOLPHIN_SCRIPTS_DIR}/metrics_sidecar.py" || true
             sleep 5
         done
     ) &
@@ -550,7 +553,7 @@ start_metrics_sidecar() {
 # instances that no longer exist.
 start_engine_watchdogs() {
     WATCHDOG_PIDS=()
-    [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_HOME}/watchdog.py" ]] || return 0
+    [[ "${DOLPHIN_WATCHDOG_ENABLED:-1}" != "0" && -f "${DOLPHIN_SCRIPTS_DIR}/watchdog.py" ]] || return 0
     rm -f "${WATCHDOG_STATE_DIR}"/dolphin_watchdog_state*.json
     local i watchdog_gpu_set watchdog_instance_home watchdog_state
     for i in "${!GPU_SETS[@]}"; do
@@ -569,7 +572,7 @@ start_engine_watchdogs() {
                 DOLPHIN_WATCHDOG_GPU_SET="${watchdog_gpu_set}" \
                 DOLPHIN_WATCHDOG_INSTANCE_HOME="${watchdog_instance_home}" \
                 DOLPHIN_WATCHDOG_STATE="${watchdog_state}" \
-                    python3 "${DOLPHIN_HOME}/watchdog.py" || true
+                    python3 "${DOLPHIN_SCRIPTS_DIR}/watchdog.py" || true
                 sleep 5
             done
         ) &

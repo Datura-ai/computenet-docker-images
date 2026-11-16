@@ -13,15 +13,15 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 echo "== [1/5] sidecar tests inside ${IMAGE} =="
 docker run --rm --entrypoint python3 \
     -v "${HERE}:/tests:ro" \
-    -e SIDECAR_PATH=/opt/dolphinpod/metrics_sidecar.py \
+    -e SIDECAR_PATH=/opt/dolphin-scripts/metrics_sidecar.py \
     "${IMAGE}" /tests/test_sidecar.py
 
 echo "== [2/5] watchdog tests inside ${IMAGE} (they kill real processes, hence a container) =="
 docker run --rm --entrypoint python3 \
     -v "${HERE}:/tests:ro" \
-    -e SIDECAR_PATH=/opt/dolphinpod/metrics_sidecar.py \
-    -e WATCHDOG_PATH=/opt/dolphinpod/watchdog.py \
-    -e PYTHONPATH=/opt/dolphinpod \
+    -e SIDECAR_PATH=/opt/dolphin-scripts/metrics_sidecar.py \
+    -e WATCHDOG_PATH=/opt/dolphin-scripts/watchdog.py \
+    -e PYTHONPATH=/opt/dolphin-scripts \
     "${IMAGE}" /tests/test_watchdog.py
 
 echo "== [3/5] entrypoint integration: sidecar + watchdog up, clean docker stop =="
