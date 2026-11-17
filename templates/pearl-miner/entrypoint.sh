@@ -44,9 +44,21 @@ start_sshd || echo "[pearl] sshd did not start; the validator's SSH bootstrap wi
 
 WORKER="${PEARL_POOL_WORKER:-$(hostname)}"
 
-# `|| true` inside AND outside: nvidia-smi may be absent (no driver) and grep -c exits 1 on zero
-# matches — either would kill the script via errexit/pipefail before the readable error below.
-GPU_COUNT=$( (nvidia-smi -L 2>/dev/null || true) | grep -c . || true)
+LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
+mkdir -p "${LOG_DIR}"
+
+# Count GPUs by UUID, not by output lines: counting lines made a one-line NVML error read as one
+# GPU. `|| true` everywhere: nvidia-smi may be absent (no driver) and grep -c exits 1 on zero
+# matches, either of which would kill the script before the readable error below.
+GPU_LIST=$(nvidia-smi -L 2>&1 || true)
+GPU_QUERY=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1 || true)
+GPU_COUNT=$(grep -c '^GPU-' <<< "${GPU_QUERY}" || true)
+if [[ "${GPU_COUNT}" -eq 0 ]]; then
+    GPU_COUNT=$(grep -c '^GPU ' <<< "${GPU_LIST}" || true)
+fi
+# Also into the miner log, the one file the sidecar's /logs serves (docker logs are out of reach).
+printf '[pearl] nvidia-smi -L:\n%s\n[pearl] nvidia-smi --query-gpu=uuid:\n%s\n[pearl] GPU count: %s\n' \
+    "${GPU_LIST}" "${GPU_QUERY}" "${GPU_COUNT}" | tee -a "${LOG_DIR}/peakminer.log" >&2
 if [[ "${GPU_COUNT}" -eq 0 ]]; then
     echo "no NVIDIA GPUs visible" >&2
     exit 1
@@ -68,9 +80,6 @@ fi
 # runs instead.
 "$(dirname "${BASH_SOURCE[0]}")/update_miner.sh" || true
 export PATH="${PEARL_MINER_DIR:-/var/lib/pearl/bin}:${PATH}"
-
-LOG_DIR="${PEARL_LOG_DIR:-/var/log/pearl}"
-mkdir -p "${LOG_DIR}"
 
 # One process for every GPU: PeakMiner drives them all itself and reports each card separately in
 # its stats API, so there is nothing left for per-GPU processes to buy. The flip side is that one
