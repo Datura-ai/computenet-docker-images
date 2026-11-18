@@ -14,7 +14,9 @@ PY
       printf '%s\n' "$_lium_tips"
       unset _lium_tips
     fi
-    _lium_vol="$(cat /etc/lium-volume-path 2>/dev/null || echo /root)"
+    # start.sh writes the path; a startup command that skips start.sh still has it in the container env (PID 1)
+    _lium_vol="$(cat /etc/lium-volume-path 2>/dev/null \
+      || tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^LIUM_VOLUME_PATH=//p')"
     echo "tips   : keep notebooks and results in ${_lium_vol:-/root}, the pod volume: everything outside it is wiped on reboot (HF_HOME=/workspace/hf)"
     unset _lium_vol
     cat <<'EOF'

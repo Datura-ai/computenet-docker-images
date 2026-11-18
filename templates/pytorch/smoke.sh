@@ -10,9 +10,9 @@ echo "Jupyter answers"
 # Jupyter must open in the pod volume (smoke.env names /workspace): anywhere else is wiped on reboot.
 python3 -c '
 import os, re, urllib.request as u
-want = os.environ.get("LIUM_VOLUME_PATH", "/root").lstrip("/")
+expected_preferred_path = os.environ.get("LIUM_VOLUME_PATH", "/root").lstrip("/")
 page = u.urlopen(u.Request("http://127.0.0.1:8888/lab", headers={"Authorization": "token " + os.environ["JUPYTER_PASSWORD"]}), timeout=30).read().decode()
-assert re.search(r"\"preferredPath\": *\"%s\"" % re.escape(want), page), (want, re.findall(r"\"preferredPath\": *\"[^\"]*\"", page))
+assert re.search(r"\"preferredPath\": *\"%s\"" % re.escape(expected_preferred_path), page), (expected_preferred_path, re.findall(r"\"preferredPath\": *\"[^\"]*\"", page))
 ' || { echo "Jupyter does not open in the pod volume"; exit 1; }
 [ "$(cat /etc/lium-volume-path)" = "${LIUM_VOLUME_PATH:-/root}" ] || { echo "/etc/lium-volume-path does not name the pod volume"; exit 1; }
 echo "Jupyter and the login tip use the pod volume"
