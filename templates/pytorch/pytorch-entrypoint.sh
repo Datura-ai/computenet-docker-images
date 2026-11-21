@@ -38,7 +38,7 @@ start_docker() {
     # containers running meanwhile.
     # The address is in /etc/docker/daemon.json ("containerd"), not a flag, so every
     # dockerd uses this containerd: one started by hand otherwise starts a second
-    # containerd on the same root, which blocks on the metadata DB lock (F-1869).
+    # containerd on the same root, which blocks on the metadata DB lock (DAH-6895).
     while :; do containerd >> /var/log/containerd.log 2>&1; sleep 1; done &
     dockerd --host=unix:///var/run/docker.sock > /var/log/dockerd.log 2>&1 &
     dockerd_pid=$!
@@ -73,7 +73,7 @@ fi
 
 # A dockerd that exits after it answered (a full /var/lib/docker volume kills
 # it) is started again, as containerd is, so Docker comes back by itself once
-# space is freed; nothing else restarts it (F-1869). A failed first start still
+# space is freed; nothing else restarts it (DAH-6895). A failed first start still
 # ends the pod (start_docker returns non-zero before this runs).
 # Alive and not a zombie: once the entrypoint execs the caller's command, that
 # command is dockerd's parent and may never reap it, so kill -0 alone would

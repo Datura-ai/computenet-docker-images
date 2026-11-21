@@ -8,7 +8,7 @@
 #   - the wait for dockerd ends after its deadline when dockerd accepts but never answers (cut from 30 s to 3 s);
 #   - a containerd that exits is started again, whatever its exit code;
 #   - a dockerd that exits after it answered is started again, with no --containerd flag (the address is in
-#     daemon.json, so a dockerd started by hand uses the same containerd, F-1869).
+#     daemon.json, so a dockerd started by hand uses the same containerd, DAH-6895).
 #
 # Usage: templates/pytorch/tests/test-entrypoint.sh
 #        ENTRYPOINT=<file> templates/pytorch/tests/test-entrypoint.sh   (another revision of the entrypoint)
