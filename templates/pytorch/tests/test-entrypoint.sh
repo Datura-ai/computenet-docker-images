@@ -6,7 +6,9 @@
 #   - the default /start.sh starts before dockerd answers (sshd does not wait for Docker), and the pod ends
 #     when dockerd or the NVIDIA setup fails;
 #   - the wait for dockerd ends after its deadline when dockerd accepts but never answers (cut from 30 s to 3 s);
-#   - a containerd that exits is started again, whatever its exit code.
+#   - a containerd that exits is started again, whatever its exit code;
+#   - a dockerd that exits after it answered is started again, with no --containerd flag (the address is in
+#     daemon.json, so a dockerd started by hand uses the same containerd, F-1869).
 #
 # Usage: templates/pytorch/tests/test-entrypoint.sh
 #        ENTRYPOINT=<file> templates/pytorch/tests/test-entrypoint.sh   (another revision of the entrypoint)
@@ -29,11 +31,18 @@ fi
 [ -e "$CASE_DIR/containerd-exited" ] && touch "$CASE_DIR/containerd-restarted"
 echo $$ >> "$CASE_DIR/pids"; exec sleep 30
 STUB
-# STUB_DOCKERD: ready:<seconds> answers after a delay; fail exits at once, like dockerd with a broken daemon.json.
+# STUB_DOCKERD: ready:<seconds> answers after a delay; fail exits at once, like dockerd with a broken daemon.json;
+# dies-once answers, then exits (a full /var/lib/docker), and the next run stays up.
 cat > "$work/bin/dockerd" <<'STUB'
 #!/usr/bin/env bash
+case "$*" in *--containerd*) echo "flag given: the address belongs in daemon.json" >&2; exit 1 ;; esac
 case "$STUB_DOCKERD" in
   fail) echo "failed to start daemon: invalid daemon.json" >&2; exit 1 ;;
+  dies-once)
+    if [ ! -e "$CASE_DIR/dockerd-died" ]; then
+      touch "$CASE_DIR/docker-ready"; sleep 0.5; touch "$CASE_DIR/dockerd-died"; exit 1
+    fi
+    touch "$CASE_DIR/dockerd-restarted"; echo $$ >> "$CASE_DIR/pids"; exec sleep 30 ;;
   ready:*) echo $$ >> "$CASE_DIR/pids"; sleep "${STUB_DOCKERD#ready:}"; touch "$CASE_DIR/docker-ready"; exec sleep 30 ;;
 esac
 STUB
@@ -135,5 +144,18 @@ else flunk "dockerd that never answers: exit $rc (124 = still waiting), command 
 STUB_CONTAINERD=exit-once:0 STUB_DOCKERD=ready:0 run_entrypoint 3 "$work/start.sh"; rc=$?
 if [ $rc -eq 124 ] && [ -e "$dir/containerd-restarted" ]; then pass "a containerd that exits 0 is restarted"
 else flunk "containerd exited 0: exit $rc (124 = still up), restarted: $([ -e "$dir/containerd-restarted" ] && echo yes || echo no)"; fi
+
+# 10. dockerd answers, then dies (a full /var/lib/docker) → it is started again, the pod stays up; also with an
+#     overridden CMD, which the entrypoint execs.
+for cmd in "$work/start.sh" "sleep 30"; do
+  STUB_DOCKERD=dies-once run_entrypoint 5 $cmd; rc=$?
+  if [ $rc -eq 124 ] && [ -e "$dir/dockerd-restarted" ]; then pass "a dockerd that dies after it answered is restarted ($cmd)"
+  else flunk "dockerd died after it answered ($cmd): exit $rc (124 = still up), restarted: $([ -e "$dir/dockerd-restarted" ] && echo yes || echo no)"; fi
+done
+
+# 11. daemon.json names the containerd the entrypoint runs (no second containerd from a hand-started dockerd).
+if python3 -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("containerd") != "/var/run/docker/containerd/containerd.sock")' "$here/../daemon.json"; then
+  pass "daemon.json points dockerd at the entrypoint's containerd"
+else flunk "daemon.json has no containerd address of the entrypoint's containerd"; fi
 
 exit "$fail"

@@ -31,14 +31,17 @@ start_docker() {
     echo "Starting Docker daemon..."
     # containerd is started here rather than by dockerd: dockerd dials the
     # containerd it starts itself before its socket exists and retries after
-    # gRPC's 1 s backoff, while with --containerd a missing socket is retried
-    # every 10 ms. Config: /etc/containerd/config.toml, same paths as before.
+    # gRPC's 1 s backoff, while with a containerd address a missing socket is
+    # retried every 10 ms. Config: /etc/containerd/config.toml, same paths as before.
     # dockerd restarts a containerd it started itself, so an exited one is restarted
     # here whatever its exit code (SIGTERM gives 0); the shims keep the nested
     # containers running meanwhile.
+    # The address is in /etc/docker/daemon.json ("containerd"), not a flag, so every
+    # dockerd uses this containerd: one started by hand otherwise starts a second
+    # containerd on the same root, which blocks on the metadata DB lock (F-1869).
     while :; do containerd >> /var/log/containerd.log 2>&1; sleep 1; done &
-    dockerd --host=unix:///var/run/docker.sock --containerd="$CONTAINERD_SOCKET" > /var/log/dockerd.log 2>&1 &
-    local dockerd_pid=$!
+    dockerd --host=unix:///var/run/docker.sock > /var/log/dockerd.log 2>&1 &
+    dockerd_pid=$!
 
     # dockerd needs ~0.5 s before it can run a GPU container, so the links are ready first
     echo "Preparing NVIDIA device paths for nested Docker..."
@@ -68,12 +71,36 @@ if [[ "${ENABLE_DIND}" != "true" ]]; then
     exec "$@"
 fi
 
+# A dockerd that exits after it answered (a full /var/lib/docker volume kills
+# it) is started again, as containerd is, so Docker comes back by itself once
+# space is freed; nothing else restarts it (F-1869). A failed first start still
+# ends the pod (start_docker returns non-zero before this runs).
+# Alive and not a zombie: once the entrypoint execs the caller's command, that
+# command is dockerd's parent and may never reap it, so kill -0 alone would
+# still see a dead dockerd.
+running() {
+    kill -0 "$1" 2>/dev/null && [ "$(sed -E 's/.*\) ([A-Z]).*/\1/' "/proc/$1/stat" 2>/dev/null)" != Z ]
+}
+
+supervise_dockerd() {
+    local pid=$1
+    while :; do
+        while running "$pid"; do sleep 1; done
+        echo "dockerd exited; starting it again" >> /var/log/dockerd.log 2>/dev/null
+        rm -f /var/run/docker.pid
+        sleep 2
+        dockerd --host=unix:///var/run/docker.sock >> /var/log/dockerd.log 2>&1 &
+        pid=$!
+    done
+}
+
 # Because dockerd is started from this ENTRYPOINT rather than CMD, the nested
 # daemon comes up even when the caller overrides CMD (lium's validator passes
 # the renter's startup command as CMD). That command may call docker at once,
 # so it runs only after the daemon answers.
 if [[ "$*" != "/start.sh" ]]; then
     start_docker || exit 1
+    supervise_dockerd "$dockerd_pid" &
     exec "$@"
 fi
 
@@ -88,4 +115,5 @@ if ! start_docker; then
     kill "$start_sh_pid" 2>/dev/null || true
     exit 1
 fi
+supervise_dockerd "$dockerd_pid" &
 wait "$start_sh_pid"
