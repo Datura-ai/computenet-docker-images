@@ -176,12 +176,18 @@ test_plan() {
     mock_nvidia_smi "0:97887" "1:97887" "2:97887"
     assert_eq "3x96GB gives each card its own worker" "0|1|2" "$(plan_as_line)"
 
-    # DAH-5697: DeepSeek V4.1 Flash is one worker on the whole node, with its own disk floor
+    # DAH-5697: DeepSeek V4.1 Flash splits by its own 340 GB VRAM floor, with its own disk floor
+    read -r MODEL_SPLIT_MIN_VRAM_MB MODEL_WEIGHTS_GB < <(model_floors "deepseek-ai/DeepSeek-V4.1-Flash")
     mock_nvidia_smi "0:184320" "1:184320" "2:184320" "3:184320" "4:184320" "5:184320" "6:184320" "7:184320"
-    read -r MODEL_RUNS_ONE_WORKER_PER_NODE MODEL_WEIGHTS_GB < <(model_floors "deepseek-ai/DeepSeek-V4.1-Flash")
-    assert_eq "8xB200 on DeepSeek V4.1 Flash keeps one all-GPUs worker" "all" "$(plan_as_line)"
+    assert_eq "8xB200 on DeepSeek V4.1 Flash runs one worker per pair" "0,1|2,3|4,5|6,7" "$(plan_as_line)"
+    mock_nvidia_smi "0:97887" "1:97887" "2:97887" "3:97887" "4:97887" "5:97887" "6:97887" "7:97887"
+    assert_eq "8xRTX PRO 6000 on DeepSeek V4.1 Flash runs one worker per four cards" \
+        "0,1,2,3|4,5,6,7" "$(plan_as_line)"
+    mock_nvidia_smi "0:81559" "1:81559" "2:81559" "3:81559" "4:81559" "5:81559" "6:81559" "7:81559"
+    assert_eq "8xH100 on DeepSeek V4.1 Flash keeps one all-GPUs worker" "all" "$(plan_as_line)"
     assert_eq "DeepSeek V4.1 Flash weights size" "510" "${MODEL_WEIGHTS_GB}"
-    read -r MODEL_RUNS_ONE_WORKER_PER_NODE MODEL_WEIGHTS_GB < <(model_floors "auto")
+    mock_nvidia_smi "0:184320" "1:184320" "2:184320" "3:184320" "4:184320" "5:184320" "6:184320" "7:184320"
+    read -r MODEL_SPLIT_MIN_VRAM_MB MODEL_WEIGHTS_GB < <(model_floors "auto")
     assert_eq "auto keeps the split" "0|1|2|3|4|5|6|7" "$(plan_as_line)"
     assert_eq "auto has no known weights size" "0" "${MODEL_WEIGHTS_GB}"
 
