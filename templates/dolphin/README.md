@@ -45,7 +45,7 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_WORKER_URL`  | no       | `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` | Worker-binary download URL (stable, public). Override only if Dolphin moves it. |
 | `DOLPHIN_UPDATE_CHECK_SECONDS` | no | `3600`                    | How often to poll `DOLPHIN_WORKER_URL` for a new binary while the worker runs. |
 | `DOLPHIN_WORKER_PER_GPU` | no    | `1`                              | `0` forces the single all-GPUs worker — the exact pre-split behavior. |
-| `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `40960`                        | VRAM floor one worker's bundle must clear (40 GB; Gemma-4 fits one 48 GB card). Each worker gets the smallest card group above it. |
+| `DOLPHIN_SPLIT_MIN_VRAM_MB` | no | `40960`, or `348160` for DeepSeek V4.1 Flash | VRAM floor one worker's bundle must clear (40 GB; Gemma-4 fits one 48 GB card). Each worker gets the smallest card group above it. |
 | `DOLPHIN_DOWNLOAD_FLOOR_GB` | no | `60`, or for DeepSeek V4.1 Flash the GB still missing + `60` | Free disk below which no worker starts while the model cache is incomplete. |
 | `DOLPHIN_SPLIT_STAGGER_SECONDS` | no | `30`                      | Delay between initial worker spawns, once the shared cache is seeded. |
 | `DOLPHIN_SEED_WAIT_SECONDS` | no | `5400`                         | How long the second instance waits for the first one's engine socket before starting anyway, so the runtime and the weights are downloaded once instead of N times. `0` = no wait, plain stagger. |
@@ -64,7 +64,7 @@ the worker cleanly: SIGTERM is forwarded and the container exits.
 | `DOLPHIN_WATCHDOG_STATE_DIR` | no | `/tmp` | Directory the entrypoint names those files in, one per worker instance. |
 | `DOLPHIN_WATCHDOG_STATE_GLOB` | no | `/tmp/dolphin_watchdog_state*.json` | Where the sidecar looks for those files, so it exports the series below for every instance. It must match the names the entrypoint hands out. |
 
-The floors follow `DOLPHIN_MODEL`. `deepseek-ai/DeepSeek-V4.1-Flash` needs about 600 GB of VRAM, so it runs as one worker on the whole node and never splits. `auto` and every other model keep the split above.
+The floors follow `DOLPHIN_MODEL`. `deepseek-ai/DeepSeek-V4.1-Flash` needs 340 GB of VRAM per worker, so 8x RTX PRO 6000 runs two workers, 8x B200 four, and 8x H100 one. `auto` and every other model keep the 40 GB floor.
 
 The worker authenticates with `DOLPHIN_API_KEY` alone (no per-node bootstrap needed — verified
 live), so one key drives the whole fleet. `worker.json` is written `0600`; the worker refuses a

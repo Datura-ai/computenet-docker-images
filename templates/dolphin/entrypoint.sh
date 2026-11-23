@@ -138,16 +138,16 @@ WORKER_SPAWN_STATE="${DOLPHIN_WORKER_SPAWN_STATE:-/tmp/dolphin_worker_spawns.jso
 # EXECUTORS_FILTER_MIN_GB, which is 50 in prod and 15 on staging — so DPHN is admitted at 130 GB free
 # in prod and 95 GB on staging, NOT the 180 the code default suggests. 60 clears the ~40 GB the pull
 # needs and still stops a node that genuinely cannot take it.
-# DAH-5697: the floors follow the model. DeepSeek V4.1 Flash (~510 GB weights, ~600 GB VRAM) runs as
-# ONE worker on the whole node, as Dolphin asks; a split bundle cannot hold it and would crash-loop.
-# Prints "<one worker per node 0|1> <weights GB, 0 = unknown>". "auto" (Dolphin picks) keeps the split.
+# DAH-5697: the floors follow the model. DeepSeek V4.1 Flash (~510 GB weights) needs 340 GB of VRAM
+# per worker (Dolphin's own floor), so it splits like any model, only in bigger card groups.
+# Prints "<VRAM per worker MB, 0 = default> <weights GB, 0 = unknown>". "auto" (Dolphin picks) keeps the default.
 model_floors() {
     case "${1,,}" in
-        *deepseek-v4.1-flash*) echo "1 510" ;;
+        *deepseek-v4.1-flash*) echo "$(( 340 * 1024 )) 510" ;;
         *) echo "0 0" ;;
     esac
 }
-read -r MODEL_RUNS_ONE_WORKER_PER_NODE MODEL_WEIGHTS_GB < <(model_floors "${MODEL}")
+read -r MODEL_SPLIT_MIN_VRAM_MB MODEL_WEIGHTS_GB < <(model_floors "${MODEL}")
 DOWNLOAD_FLOOR_MARGIN_GB=60
 
 # The free disk a download still needs. For a model of known size that is the bytes not yet on disk
@@ -242,8 +242,12 @@ plan_worker_gpu_sets() {
         return
     fi
     local worker_per_gpu="${DOLPHIN_WORKER_PER_GPU:-1}"
-    local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-40960}"
-    if [[ "${worker_per_gpu}" != "1" || "${MODEL_RUNS_ONE_WORKER_PER_NODE}" == "1" ]]; then
+    local default_split_min_vram_mb=40960
+    if (( MODEL_SPLIT_MIN_VRAM_MB > 0 )); then
+        default_split_min_vram_mb=${MODEL_SPLIT_MIN_VRAM_MB}
+    fi
+    local split_min_vram_mb="${DOLPHIN_SPLIT_MIN_VRAM_MB:-${default_split_min_vram_mb}}"
+    if [[ "${worker_per_gpu}" != "1" ]]; then
         echo "all"
         return
     fi
