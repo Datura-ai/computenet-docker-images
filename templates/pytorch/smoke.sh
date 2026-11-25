@@ -7,7 +7,7 @@ jupyter_answers() { python3 -c 'import urllib.request; urllib.request.urlopen("h
 for _ in $(seq 1 60); do jupyter_answers && break; sleep 0.5; done
 jupyter_answers || { echo "Jupyter does not answer on port 8888"; exit 1; }
 echo "Jupyter answers"
-# Jupyter must open in the pod volume (smoke.env names /workspace): anywhere else is wiped on reboot.
+# Jupyter must open in the pod volume (smoke.env names a path that is neither /root nor /workspace): anywhere else is wiped on reboot.
 python3 -c '
 import os, re, urllib.request as u
 expected_preferred_path = os.environ.get("LIUM_VOLUME_PATH", "/root").lstrip("/")
