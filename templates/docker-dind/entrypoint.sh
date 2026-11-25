@@ -69,9 +69,10 @@ setup_ssh() {
 start_jupyter() {
     if [[ $JUPYTER_PASSWORD ]]; then
         echo "Starting Jupyter Lab..."
-        mkdir -p /workspace && \
+        # Jupyter opens in the pod volume, which survives a reboot; the validator names its path (default /root).
+        mkdir -p /workspace "$LIUM_VOLUME_DIR" && \
         cd / && \
-        nohup jupyter lab --allow-root --no-browser --port=8888 --ip=* --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings='{"shell_command":["/bin/bash"]}' --ServerApp.token=$JUPYTER_PASSWORD --ServerApp.allow_origin=* --ServerApp.preferred_dir=/workspace &> /jupyter.log &
+        nohup jupyter lab --allow-root --no-browser --port=8888 --ip=* --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings='{"shell_command":["/bin/bash"]}' --ServerApp.token=$JUPYTER_PASSWORD --ServerApp.allow_origin=* --ServerApp.preferred_dir="$LIUM_VOLUME_DIR" &> /jupyter.log &
         echo "Jupyter Lab started"
     fi
 }
@@ -87,6 +88,9 @@ execute_script "/pre_start.sh" "Running pre-start script..."
 echo "Pod Started"
 
 setup_ssh
+LIUM_VOLUME_DIR="${LIUM_VOLUME_PATH:-/root}"
+# login shells do not get the container env: the tip reads the path from here
+echo "$LIUM_VOLUME_DIR" > /etc/lium-volume-path || true
 start_jupyter
 
 execute_script "/post_start.sh" "Running post-start script..."

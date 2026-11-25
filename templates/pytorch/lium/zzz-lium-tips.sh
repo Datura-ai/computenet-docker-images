@@ -14,8 +14,12 @@ PY
       printf '%s\n' "$_lium_tips"
       unset _lium_tips
     fi
+    # start.sh writes the path; a startup command that skips start.sh still has it in the container env (PID 1)
+    _lium_vol="$(cat /etc/lium-volume-path 2>/dev/null \
+      || tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^LIUM_VOLUME_PATH=//p')"
+    echo "tips   : keep notebooks and results in ${_lium_vol:-/root}, the pod volume: everything outside it is wiped on reboot (HF_HOME=/workspace/hf)"
+    unset _lium_vol
     cat <<'EOF'
-tips   : /workspace is the fast disk (/root is an encrypted FUSE mount) - HF_HOME=/workspace/hf is preset
          pip installs into the system python (PEP 668 handled); torch is pinned via /etc/pip/constraints.txt,
          bypass once with PIP_CONSTRAINT=/dev/null pip install ...   |  uv, ffmpeg, tesseract, rsync, nvcc included
          background jobs: nohup setsid CMD > log 2>&1 < /dev/null &   |  lium-gpu-check prints GPU/torch/arch status
