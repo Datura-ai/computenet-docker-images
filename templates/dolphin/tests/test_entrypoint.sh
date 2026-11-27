@@ -319,6 +319,38 @@ STUB
         "$(grep -o '"spawns":[0-9]*' "${DOLPHIN_WORKER_SPAWN_STATE}" 2>/dev/null | head -1)"
 }
 
+# ------------------------------------- DAH-7053: a refusal of the cards reaches the container log too
+test_worker_refusal_reaches_container_log() {
+    make_sandbox
+    export DOLPHIN_HOME="${SANDBOX}/dolphinpod"
+    export DOLPHIN_WORKER_SPAWN_STATE="${SANDBOX}/spawns.json"
+    mkdir -p "${DOLPHIN_HOME}"
+    cat >"${DOLPHIN_HOME}/dolphinpod-worker" <<'STUB'
+#!/usr/bin/env bash
+echo "loading runtime"
+echo "error: model org/m does not support the selected GPUs: 8x L40S"
+exit 1
+STUB
+    chmod +x "${DOLPHIN_HOME}/dolphinpod-worker"
+    load_entrypoint
+
+    GPU_SETS=("0,1")
+    INSTANCE_HOMES=("${SANDBOX}/home")
+    spawn_instance 0 2>"${SANDBOX}/stderr"
+    wait "${WORKER_PIDS[0]}" 2>/dev/null
+    local i
+    for i in $(seq 50); do
+        grep -q "does not support" "${SANDBOX}/stderr" 2>/dev/null && break
+        sleep 0.1
+    done
+
+    assert_eq "the refusal is copied to the container log" \
+        "error: model org/m does not support the selected GPUs: 8x L40S" \
+        "$(grep -v '^\[dolphin\]' "${SANDBOX}/stderr")"
+    assert_eq "the worker log still keeps every line" "2" \
+        "$(wc -l <"${WORKER_LOG_DIR}/worker-0.log" | tr -d ' ')"
+}
+
 # ------------------------------------- DAH-2843: a respawn is spaced out like a cold start
 test_respawns_are_staggered() {
     make_sandbox
@@ -774,9 +806,10 @@ test_enable_hf_offline() {
 
     # The supervisor calls this every 30 s. It must not rewrite the file each time.
     local before after
-    before=$(stat -f %m "${site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null || stat -c %Y "${site_packages}/zz-dolphin-hf-offline.pth")
+    # GNU stat first: on Linux `stat -f` reads the filesystem (free blocks move), not the file's mtime
+    before=$(stat -c %Y "${site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null || stat -f %m "${site_packages}/zz-dolphin-hf-offline.pth")
     enable_hf_offline
-    after=$(stat -f %m "${site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null || stat -c %Y "${site_packages}/zz-dolphin-hf-offline.pth")
+    after=$(stat -c %Y "${site_packages}/zz-dolphin-hf-offline.pth" 2>/dev/null || stat -f %m "${site_packages}/zz-dolphin-hf-offline.pth")
     assert_eq "a second call leaves the file alone" "${before}" "${after}"
 
     # A worker that updates its runtime brings a new site-packages. The next call must arm it too.
@@ -1812,6 +1845,7 @@ test_the_seed_wait_drives_the_fetch_and_docker_stop_ends_it
 test_a_throttled_node_reaches_serving_through_the_background_fetch
 test_hf_offline_arms_on_a_cache_the_worker_pinned_by_revision
 test_worker_log_and_spawn_counters
+test_worker_refusal_reaches_container_log
 test_backoff_counts_a_long_dead_download_as_failed
 test_respawns_are_staggered
 test_worker_logs_are_per_container_and_pruned

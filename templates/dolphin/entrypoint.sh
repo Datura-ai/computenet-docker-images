@@ -116,6 +116,8 @@ WEIGHTS_FETCH_ENABLED="${DOLPHIN_WEIGHTS_FETCH_ENABLED:-1}"
 # each one's cap_worker_logs truncating the other mid-write.
 WORKER_LOG_DIR="${DOLPHIN_WORKER_LOG_DIR:-${DOLPHIN_HOME}/logs/${HOSTNAME:-$(hostname)}}"
 WORKER_LOG_MAX_BYTES="${DOLPHIN_WORKER_LOG_MAX_BYTES:-52428800}"
+# The worker's line for a model it will not run on the node's cards ("model X does not support the selected GPUs: 8x L40S").
+WORKER_REFUSED_GPUS_LINE="does not support the selected GPUs"
 # Per-container directories accumulate on a volume that outlives them, so a node that recreates
 # fillers for weeks would keep every generation. Old ones are pruned at boot.
 WORKER_LOG_RETENTION_DAYS="${DOLPHIN_WORKER_LOG_RETENTION_DAYS:-7}"
@@ -1247,7 +1249,10 @@ spawn_instance() {
     WORKER_SERVED[idx]=0
     write_spawn_state
     echo "[dolphin] worker [${GPU_SETS[$idx]}] spawn #${WORKER_SPAWNS[$idx]}, log ${log}" >&2
-    (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) >>"${log}" 2>&1 &
+    # DAH-7053: the worker's refusal of the model on these cards is also copied to the container log, the one
+    # log the platform reads (the executor serves it); the worker retries that refusal forever and never serves.
+    (cd "${DOLPHIN_HOME}" && HOME="${INSTANCE_HOMES[$idx]}" exec "${WORKER_BIN}" start) \
+        > >(tee -a "${log}" | grep --line-buffered -F "${WORKER_REFUSED_GPUS_LINE}" >&2) 2>&1 &
     WORKER_PIDS[idx]=$!
     LAST_SPAWN_AT=${SECONDS}
 }
